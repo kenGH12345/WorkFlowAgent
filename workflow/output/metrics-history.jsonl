@@ -1,0 +1,1 @@
+{"sessionId":"test-proj-1773571533096","projectId":"test-proj","startedAt":"2026-03-15T10:45:33.096Z","totalDurationMs":1,"llmCalls":1,"tokensEst":1200,"errorCount":0,"testPassed":5,"testFailed":0,"entropyViolations":2,"ciStatus":"success","codeGraphSymbols":517}

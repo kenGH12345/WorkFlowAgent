@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Large generated output files
+workflow/output/code-graph.json
+workflow/output/experiences.json
+
+# Environment & config secrets
+.env
+.env.local
+*.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*

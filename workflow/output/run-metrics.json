@@ -1,0 +1,49 @@
+{
+  "sessionId": "test-proj-1773571533096",
+  "projectId": "test-proj",
+  "startedAt": "2026-03-15T10:45:33.096Z",
+  "finishedAt": "2026-03-15T10:45:33.098Z",
+  "totalDurationMs": 1,
+  "stages": [
+    {
+      "name": "INITANALYSE",
+      "start": 1773571533096,
+      "end": 1773571533096,
+      "status": "ok",
+      "durationMs": 0
+    }
+  ],
+  "llm": {
+    "totalCalls": 1,
+    "totalTokensEst": 1200,
+    "callsByRole": {
+      "analyst": 1
+    }
+  },
+  "errors": {
+    "count": 0,
+    "details": []
+  },
+  "testResult": {
+    "passed": 5,
+    "failed": 0,
+    "skipped": 0,
+    "rounds": 1
+  },
+  "entropyResult": {
+    "violations": 2,
+    "filesScanned": 43,
+    "reportPath": "output/entropy-report.md"
+  },
+  "ciResult": {
+    "status": "success",
+    "provider": "local",
+    "steps": [],
+    "durationMs": 3000
+  },
+  "codeGraphResult": {
+    "symbolCount": 517,
+    "fileCount": 43,
+    "edgeCount": 13292
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "codebuddy-multi-agent-workflow",
+  "version": "1.0.0",
+  "description": "AI-driven multi-agent automated software development workflow",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node tests/e2e.test.js && node tests/unit.test.js",
+    "test:e2e": "node tests/e2e.test.js",
+    "test:unit": "node tests/unit.test.js",
+    "init": "node init-project.js",
+    "init:validate": "node init-project.js --validate",
+    "gen-agents": "node gen-agents.js",
+    "gen-agents:help": "node gen-agents.js --help",
+    "setup:git": "node setup-git.js"
+  },
+  "dependencies": {
+    "fs-extra": "^11.2.0",
+    "chalk": "^4.1.2",
+    "inquirer": "^8.2.6",
+    "glob": "^10.3.10"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "license": "MIT"
+}

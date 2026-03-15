@@ -1,0 +1,41 @@
+{
+  "generatedAt": "2026-03-15T09:40:38.656Z",
+  "filesScanned": 39,
+  "violations": [
+    {
+      "type": "FILE_TOO_LARGE",
+      "severity": "medium",
+      "file": "core\\architecture-review-agent.js",
+      "detail": "743 lines (limit: 600)",
+      "suggestion": "Split into smaller modules. Consider extracting helpers or sub-components."
+    },
+    {
+      "type": "FILE_TOO_LARGE",
+      "severity": "medium",
+      "file": "core\\clarification-engine.js",
+      "detail": "624 lines (limit: 600)",
+      "suggestion": "Split into smaller modules. Consider extracting helpers or sub-components."
+    },
+    {
+      "type": "FILE_TOO_LARGE",
+      "severity": "medium",
+      "file": "core\\code-review-agent.js",
+      "detail": "668 lines (limit: 600)",
+      "suggestion": "Split into smaller modules. Consider extracting helpers or sub-components."
+    },
+    {
+      "type": "FILE_TOO_LARGE",
+      "severity": "high",
+      "file": "index.js",
+      "detail": "1257 lines (limit: 600)",
+      "suggestion": "Split into smaller modules. Consider extracting helpers or sub-components."
+    },
+    {
+      "type": "FILE_TOO_LARGE",
+      "severity": "high",
+      "file": "init-project.js",
+      "detail": "1221 lines (limit: 600)",
+      "suggestion": "Split into smaller modules. Consider extracting helpers or sub-components."
+    }
+  ]
+}
