@@ -15,6 +15,7 @@ const { TestRunner } = require('./test-runner');
 const { TestCaseGenerator } = require('./test-case-generator');
 const { TestCaseExecutor } = require('./test-case-executor');
 const { DECISION_QUESTIONS } = require('./socratic-engine');
+const { StageContextStore } = require('./stage-context-store');
 
 /**
  * Stage runner methods for Orchestrator.
@@ -23,6 +24,18 @@ const { DECISION_QUESTIONS } = require('./socratic-engine');
 
 async function _runAnalyst(rawRequirement) {
   console.log(`\n[Orchestrator] Stage: ANALYSE (AnalystAgent)`);
+
+  // ── Cross-stage context: init store on first stage ────────────────────────
+  // StageContextStore is lazily initialised here (first stage) and reused
+  // across all stages via this.stageCtx. Each stage deposits a summary of
+  // its key decisions so downstream agents can read the full upstream context.
+  if (!this.stageCtx) {
+    this.stageCtx = new StageContextStore({
+      outputDir: PATHS.OUTPUT_DIR,
+      verbose: false,
+    });
+    console.log(`[Orchestrator] 🔗 StageContextStore initialised for cross-stage context propagation.`);
+  }
 
   const clarifier = new RequirementClarifier({
     askUser: this.askUser,
@@ -56,11 +69,28 @@ async function _runAnalyst(rawRequirement) {
   }
 
   const outputPath = await this.agents[AgentRole.ANALYST].run(null, clarResult.enrichedRequirement);
+
+  // ── Store ANALYSE stage context for downstream stages ─────────────────────
+  const analyseCtx = StageContextStore.extractFromFile(outputPath, 'ANALYSE');
+  this.stageCtx.set('ANALYSE', {
+    summary:      analyseCtx.summary,
+    keyDecisions: analyseCtx.keyDecisions,
+    artifacts:    [outputPath],
+    risks:        clarResult.riskNotes ?? [],
+    meta: {
+      clarificationRounds: clarResult.rounds ?? 0,
+      signalCount:         clarResult.allSignals?.length ?? 0,
+      skipped:             clarResult.skipped ?? false,
+    },
+  });
+  console.log(`[Orchestrator] 🔗 ANALYSE context stored: ${analyseCtx.keyDecisions.length} key decision(s).`);
+
   this.bus.publish(AgentRole.ANALYST, AgentRole.ARCHITECT, outputPath, {
     clarificationRounds: clarResult.rounds ?? 0,
     signalCount:         clarResult.allSignals?.length ?? 0,
     riskNotes:           clarResult.riskNotes ?? [],
     skipped:             clarResult.skipped ?? false,
+    contextSummary:      analyseCtx.summary,
   });
   return outputPath;
 }
@@ -68,6 +98,14 @@ async function _runAnalyst(rawRequirement) {
 async function _runArchitect() {
   console.log(`\n[Orchestrator] Stage: ARCHITECT (ArchitectAgent)`);
   const inputPath = this.bus.consume(AgentRole.ARCHITECT);
+
+  // ── Inject upstream cross-stage context ───────────────────────────────────
+  // Architect now sees a structured summary of what the Analyst decided,
+  // including key requirement sections and flagged risks.
+  const upstreamCtxForArch = this.stageCtx ? this.stageCtx.getAll(['ARCHITECT'], 1500) : '';
+  if (upstreamCtxForArch) {
+    console.log(`[Orchestrator] 🔗 Cross-stage context injected into ArchitectAgent (${upstreamCtxForArch.length} chars). Upstream: ${this.stageCtx.getLogLine()}`);
+  }
 
   let techStackPrefix = '';
   try {
@@ -103,6 +141,7 @@ async function _runArchitect() {
   const archExpContextWithComplaints = [
     techStackPrefix ? techStackPrefix.trim() : '',
     agentsMdForArch ? `## Project Context (AGENTS.md)\n${agentsMdForArch}` : '',
+    upstreamCtxForArch,
     archExpContext,
     archComplaintBlock,
   ].filter(Boolean).join('\n\n');
@@ -196,10 +235,26 @@ async function _runArchitect() {
     console.log(`[Orchestrator] ℹ️  ${archReviewResult.failed} minor architecture issue(s) remain. Proceeding automatically.`);
   }
 
+  // ── Store ARCHITECT stage context for downstream stages ──────────────────
+  const archOutputCtx = StageContextStore.extractFromFile(outputPath, 'ARCHITECT');
+  this.stageCtx.set('ARCHITECT', {
+    summary:      archOutputCtx.summary,
+    keyDecisions: archOutputCtx.keyDecisions,
+    artifacts:    [outputPath],
+    risks:        archReviewResult.riskNotes ?? [],
+    meta: {
+      reviewRounds: archReviewResult.rounds ?? 0,
+      failedItems:  archReviewResult.failed ?? 0,
+      coverageRate: coverageResult.coverageRate ?? null,
+    },
+  });
+  console.log(`[Orchestrator] 🔗 ARCHITECT context stored: ${archOutputCtx.keyDecisions.length} key decision(s), ${archReviewResult.riskNotes?.length ?? 0} risk(s).`);
+
   this.bus.publish(AgentRole.ARCHITECT, AgentRole.DEVELOPER, outputPath, {
-    reviewRounds: archReviewResult.rounds ?? 0,
-    failedItems:  archReviewResult.failed ?? 0,
-    riskNotes:    archReviewResult.riskNotes ?? [],
+    reviewRounds:   archReviewResult.rounds ?? 0,
+    failedItems:    archReviewResult.failed ?? 0,
+    riskNotes:      archReviewResult.riskNotes ?? [],
+    contextSummary: archOutputCtx.summary,
   });
   return outputPath;
 }
@@ -207,6 +262,16 @@ async function _runArchitect() {
 async function _runDeveloper() {
   console.log(`\n[Orchestrator] Stage: CODE (DeveloperAgent)`);
   const inputPath = this.bus.consume(AgentRole.DEVELOPER);
+
+  // ── Inject upstream cross-stage context ───────────────────────────────────
+  // Developer now sees summaries from ANALYSE + ARCHITECT stages:
+  // - What requirements were clarified
+  // - What architecture decisions were made (tech stack, module structure, APIs)
+  // - What risks were flagged upstream
+  const upstreamCtxForDev = this.stageCtx ? this.stageCtx.getAll(['CODE'], 1800) : '';
+  if (upstreamCtxForDev) {
+    console.log(`[Orchestrator] 🔗 Cross-stage context injected into DeveloperAgent (${upstreamCtxForDev.length} chars). Upstream: ${this.stageCtx.getLogLine()}`);
+  }
 
   const archMeta = this.bus.getMeta(AgentRole.DEVELOPER);
   if (archMeta && archMeta.reviewRounds > 0) {
@@ -249,6 +314,7 @@ async function _runDeveloper() {
     : '';
   const devExpContextWithComplaints = [
     agentsMdForDev ? `## Project Context (AGENTS.md)\n${agentsMdForDev}` : '',
+    upstreamCtxForDev,
     devExpContext,
     devComplaintBlock,
     codeGraphContext ? `\n\n${codeGraphContext}` : '',
@@ -329,10 +395,25 @@ async function _runDeveloper() {
     console.warn(`[Orchestrator] Early EntropyGC scan failed (non-fatal): ${err.message}`);
   }
 
+  // ── Store CODE stage context for downstream stages ────────────────────────
+  const codeOutputCtx = StageContextStore.extractFromFile(outputPath, 'CODE');
+  this.stageCtx.set('CODE', {
+    summary:      codeOutputCtx.summary,
+    keyDecisions: codeOutputCtx.keyDecisions,
+    artifacts:    [outputPath],
+    risks:        reviewResult.riskNotes ?? [],
+    meta: {
+      reviewRounds: reviewResult.rounds ?? 0,
+      failedItems:  reviewResult.failed ?? 0,
+    },
+  });
+  console.log(`[Orchestrator] 🔗 CODE context stored: ${codeOutputCtx.keyDecisions.length} key decision(s), ${reviewResult.riskNotes?.length ?? 0} risk(s).`);
+
   this.bus.publish(AgentRole.DEVELOPER, AgentRole.TESTER, outputPath, {
-    reviewRounds: reviewResult.rounds ?? 0,
-    failedItems:  reviewResult.failed ?? 0,
-    riskNotes:    reviewResult.riskNotes ?? [],
+    reviewRounds:   reviewResult.rounds ?? 0,
+    failedItems:    reviewResult.failed ?? 0,
+    riskNotes:      reviewResult.riskNotes ?? [],
+    contextSummary: codeOutputCtx.summary,
   });
   return outputPath;
 }
@@ -340,6 +421,17 @@ async function _runDeveloper() {
 async function _runTester() {
   console.log(`\n[Orchestrator] Stage: TEST (TesterAgent)`);
   const inputPath = this.bus.consume(AgentRole.TESTER);
+
+  // ── Inject upstream cross-stage context ───────────────────────────────────
+  // Tester now sees summaries from ALL upstream stages:
+  // - ANALYSE: what requirements were clarified, what risks were flagged
+  // - ARCHITECT: what architecture was designed, what tech stack was chosen
+  // - CODE: what was implemented, what code review issues were found
+  // This gives the tester full visibility into the entire development history.
+  const upstreamCtxForTest = this.stageCtx ? this.stageCtx.getAll(['TEST'], 2000) : '';
+  if (upstreamCtxForTest) {
+    console.log(`[Orchestrator] 🔗 Cross-stage context injected into TesterAgent (${upstreamCtxForTest.length} chars). Upstream: ${this.stageCtx.getLogLine()}`);
+  }
 
   const devMeta = this.bus.getMeta(AgentRole.TESTER);
   if (devMeta && devMeta.reviewRounds > 0) {
@@ -430,6 +522,7 @@ async function _runTester() {
 
   const testExpContextWithComplaints = [
     agentsMdForTest ? `## Project Context (AGENTS.md)\n${agentsMdForTest}` : '',
+    upstreamCtxForTest,
     testExpContext,
     testComplaintBlock,
     realExecutionBlock,

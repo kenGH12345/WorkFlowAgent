@@ -21,28 +21,66 @@ function _buildInvestigationTools(stageLabel) {
       return self._investigationSourceCacheMap.get(stageLabel);
     }
 
-    const filesToRead = [
-      PATHS.AGENTS_MD,
-      path.join(PATHS.OUTPUT_DIR, 'requirements.md'),
-    ];
+    // ── Dynamic upstream file discovery (Defect #9 fix) ──────────────────────
+    // Previously, the file list was hardcoded per stage label.
+    // Now we dynamically collect ALL upstream stage artifacts from StageContextStore
+    // plus a fixed set of well-known output files, so investigation tools always
+    // have full visibility into what upstream stages produced.
+    const filesToRead = new Set([PATHS.AGENTS_MD]);
+
+    // Always include requirements.md if it exists
+    filesToRead.add(path.join(PATHS.OUTPUT_DIR, 'requirements.md'));
+
+    // Dynamically add artifacts from all upstream stages (via StageContextStore)
+    if (self.stageCtx) {
+      const stageOrder = ['ANALYSE', 'ARCHITECT', 'CODE', 'TEST'];
+      const currentStageIdx = stageOrder.indexOf(
+        stageLabel === 'Architecture' ? 'ARCHITECT'
+        : stageLabel === 'Code'       ? 'CODE'
+        : stageLabel === 'TestReport' ? 'TEST'
+        : stageLabel.toUpperCase()
+      );
+      for (let i = 0; i < stageOrder.length; i++) {
+        if (currentStageIdx !== -1 && i >= currentStageIdx) break; // only upstream
+        const ctx = self.stageCtx.get(stageOrder[i]);
+        if (ctx && ctx.artifacts) {
+          ctx.artifacts.forEach(a => filesToRead.add(a));
+        }
+      }
+    }
+
+    // Fallback: always include well-known output files for each stage
     if (stageLabel === 'Code' || stageLabel === 'TestReport') {
-      filesToRead.push(path.join(PATHS.OUTPUT_DIR, 'architecture.md'));
+      filesToRead.add(path.join(PATHS.OUTPUT_DIR, 'architecture.md'));
     }
     if (stageLabel === 'TestReport') {
-      filesToRead.push(path.join(PATHS.OUTPUT_DIR, 'code.diff'));
+      filesToRead.add(path.join(PATHS.OUTPUT_DIR, 'code.diff'));
+      filesToRead.add(path.join(PATHS.OUTPUT_DIR, 'test-execution-report.md'));
     }
 
     const parts = [];
+
+    // Inject cross-stage context summary first (most important for investigation)
+    if (self.stageCtx) {
+      const crossCtx = self.stageCtx.getAll([], 1200);
+      if (crossCtx) {
+        parts.push(`**Cross-Stage Context Summary:**\n${crossCtx}`);
+        console.log(`  [Investigation:readSource] Cross-stage context injected (${crossCtx.length} chars).`);
+      }
+    }
+
     for (const filePath of filesToRead) {
-      if (fs.existsSync(filePath)) {
-        try {
-          const raw = fs.readFileSync(filePath, 'utf-8');
-          const excerpt = raw.slice(0, 800);
-          parts.push(`**${path.basename(filePath)}** (excerpt):\n${excerpt}`);
-          console.log(`  [Investigation:readSource] Read ${path.basename(filePath)} (${raw.length} chars).`);
-        } catch (err) {
-          console.warn(`  [Investigation:readSource] Failed to read ${filePath}: ${err.message}`);
-        }
+      if (!filePath || !fs.existsSync(filePath)) continue;
+      try {
+        const raw = fs.readFileSync(filePath, 'utf-8');
+        // Use larger excerpts for directly relevant files, smaller for context files
+        const isDirectInput = filePath.includes('architecture.md') || filePath.includes('code.diff');
+        const maxChars = isDirectInput ? 1200 : 600;
+        const excerpt = raw.slice(0, maxChars);
+        parts.push(`**${path.basename(filePath)}** (excerpt):\n${excerpt}`);
+        console.log(`  [Investigation:readSource] Read ${path.basename(filePath)} (${raw.length} chars, showing ${excerpt.length}).`);
+      } catch (err) {
+        console.warn(`  [Investigation:readSource] Failed to read ${filePath}: ${err.message}`);
       }
     }
     const result = parts.length > 0 ? parts.join('\n\n---\n\n') : null;

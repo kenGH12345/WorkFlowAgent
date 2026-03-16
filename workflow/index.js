@@ -56,6 +56,7 @@ const { DryRunSandbox } = require('./core/sandbox');
 const _git     = require('./core/orchestrator-git');
 const _stages  = require('./core/orchestrator-stages');
 const _helpers = require('./core/orchestrator-helpers');
+const { StageContextStore } = require('./core/stage-context-store');
 
 class Orchestrator {
   /**
@@ -166,6 +167,12 @@ class Orchestrator {
     this.experienceStore.purgeExpired();
     this.complaintWall = new ComplaintWall();
     this.skillEvolution = new SkillEvolutionEngine();
+
+    // ── StageContextStore: cross-stage semantic context propagation ──────────
+    // Lazily initialised in _runAnalyst (first stage) so it's always fresh
+    // for each workflow run. Exposed here so _buildInvestigationTools can
+    // access it via this.stageCtx.
+    this.stageCtx = null;
 
     // Register built-in skills
     this._registerBuiltinSkills();
@@ -880,9 +887,14 @@ class Orchestrator {
       }
     }
 
-    // Build unified dynamic input: skill + experience + AGENTS.md + task
+    // Build unified dynamic input: skill + experience + AGENTS.md + cross-stage context + task
     // Use the cached content from _initWorkflow() — do NOT re-read the file here.
     const agentsMdContent = this._agentsMdContent ?? '';
+
+    // ── Cross-stage context injection (Defect #9 fix) ─────────────────────────
+    // Task-based workers also benefit from upstream stage summaries.
+    // If stageCtx is available (e.g. after a sequential pre-pass), inject it.
+    const crossStageCtx = this.stageCtx ? this.stageCtx.getAll([], 1200) : '';
 
     // ── CodeGraph: on-demand symbol lookup for ARCHITECT and DEVELOPER tasks ──
     // Mirrors the logic in _runDeveloper() so task-based paths also benefit from
@@ -910,9 +922,10 @@ class Orchestrator {
     }
 
     const dynamicInput = [
-      skillContent   ? `## Skill Context\n${skillContent}` : '',
-      expContext     ? `## Experience Context\n${expContext}` : '',
+      skillContent    ? `## Skill Context\n${skillContent}` : '',
+      expContext      ? `## Experience Context\n${expContext}` : '',
       agentsMdContent ? `## Project Context (AGENTS.md)\n${agentsMdContent}` : '',
+      crossStageCtx   ? crossStageCtx : '',
       codeGraphContext ? `## Code Graph Context\n${codeGraphContext}` : '',
       `## Task\n**${task.title}**\n\n${task.description}`,
     ].filter(Boolean).join('\n\n');
