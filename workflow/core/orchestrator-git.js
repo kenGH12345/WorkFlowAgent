@@ -1,0 +1,139 @@
+'use strict';
+
+const fs   = require('fs');
+const path = require('path');
+const { PATHS, HOOK_EVENTS } = require('./constants');
+
+/**
+ * Mixin: Git PR workflow methods for Orchestrator.
+ * Attach to Orchestrator.prototype after class definition.
+ */
+
+/**
+ * Executes the Git PR workflow after a successful run.
+ * @this {Orchestrator}
+ */
+async function _runGitPRWorkflow(mode, extra = {}) {
+  console.log(`\n[Orchestrator] 🔀 Git PR workflow starting...`);
+
+  if (!this.git.isGitRepo()) {
+    console.warn(`[Orchestrator] ⚠️  Git PR workflow skipped: not a git repository.`);
+    return;
+  }
+
+  const opts = this._gitOptions;
+
+  try {
+    // ── 1. Determine branch name ─────────────────────────────────────────
+    const currentBranch = this.git.getCurrentBranch();
+    let featureBranch = currentBranch;
+
+    if (currentBranch === opts.baseBranch || currentBranch === 'main' || currentBranch === 'master') {
+      const branchTitle = extra.requirement || extra.goal || `workflow-${this.projectId}`;
+      featureBranch = this.git.generateBranchName(branchTitle, opts.branchType);
+      const branchResult = this.git.createBranch(featureBranch, opts.baseBranch);
+      if (branchResult.success) {
+        console.log(`[Orchestrator] ✅ Feature branch created: ${featureBranch}`);
+        await this.hooks.emit(HOOK_EVENTS.GIT_BRANCH_CREATED, { branch: featureBranch, base: opts.baseBranch });
+      } else {
+        console.warn(`[Orchestrator] ⚠️  Could not create branch: ${branchResult.message}. Using current branch.`);
+        featureBranch = currentBranch;
+      }
+    } else {
+      console.log(`[Orchestrator] ℹ️  Already on feature branch: ${currentBranch}`);
+    }
+
+    // ── 2. Commit all workflow artifacts ─────────────────────────────────
+    const commitResult = this.git.commitProgress({
+      summary: `feat(workflow): complete ${mode} workflow run for ${this.projectId}`,
+      type: 'feat',
+      scope: this.projectId,
+      sessionId: this.projectId,
+      verificationNote: `Workflow mode: ${mode}. Tasks: ${extra.taskCount || 1}.`,
+    });
+    if (commitResult.success && commitResult.commitHash) {
+      console.log(`[Orchestrator] ✅ Committed: ${commitResult.commitHash}`);
+    }
+
+    // ── 3. Push branch to remote ──────────────────────────────────────────
+    if (opts.autoPush) {
+      const pushResult = this.git.pushBranch(featureBranch);
+      if (pushResult.success) {
+        console.log(`[Orchestrator] ✅ Branch pushed: ${featureBranch}`);
+        await this.hooks.emit(HOOK_EVENTS.GIT_BRANCH_PUSHED, { branch: featureBranch });
+      } else {
+        console.warn(`[Orchestrator] ⚠️  Push failed: ${pushResult.message}`);
+      }
+    }
+
+    // ── 4. Create PR description ──────────────────────────────────────────
+    const prTitle = `[WorkFlowAgent] ${extra.requirement || extra.goal || `${mode} workflow: ${this.projectId}`}`;
+    const prBody = _buildPRBody.call(this, mode, extra);
+
+    const prResult = this.git.createPR({
+      title: prTitle,
+      body: prBody,
+      baseBranch: opts.baseBranch,
+      headBranch: featureBranch,
+      labels: opts.labels,
+      reviewers: opts.reviewers,
+      draft: opts.draft,
+      outputDir: PATHS.OUTPUT_DIR,
+    });
+
+    await this.hooks.emit(HOOK_EVENTS.GIT_PR_CREATED, {
+      title: prTitle,
+      branch: featureBranch,
+      base: opts.baseBranch,
+      prUrl: prResult.prUrl,
+      prFile: prResult.prFile,
+    });
+
+    console.log(`[Orchestrator] ✅ Git PR workflow complete.`);
+    if (prResult.prUrl) {
+      console.log(`[Orchestrator]    PR URL: ${prResult.prUrl}`);
+    } else {
+      console.log(`[Orchestrator]    PR description: ${prResult.prFile}`);
+    }
+
+  } catch (err) {
+    console.warn(`[Orchestrator] ⚠️  Git PR workflow failed (non-fatal): ${err.message}`);
+  }
+}
+
+/**
+ * Builds the PR body markdown from workflow artifacts.
+ * @this {Orchestrator}
+ */
+function _buildPRBody(mode, extra = {}) {
+  const lines = [
+    `## Workflow Summary`,
+    '',
+    `- **Mode:** ${mode}`,
+    `- **Project:** ${this.projectId}`,
+    `- **Timestamp:** ${new Date().toISOString()}`,
+  ];
+
+  if (extra.taskCount) {
+    lines.push(`- **Tasks:** ${extra.taskCount}`);
+  }
+
+  const reqPath = path.join(PATHS.OUTPUT_DIR, 'requirement.md');
+  if (fs.existsSync(reqPath)) {
+    const reqContent = fs.readFileSync(reqPath, 'utf-8');
+    const firstSection = reqContent.split('\n').slice(0, 20).join('\n');
+    lines.push('', '## Requirement (excerpt)', '', '```markdown', firstSection, '```');
+  }
+
+  const archPath = path.join(PATHS.OUTPUT_DIR, 'architecture.md');
+  if (fs.existsSync(archPath)) {
+    const archContent = fs.readFileSync(archPath, 'utf-8');
+    const firstSection = archContent.split('\n').slice(0, 20).join('\n');
+    lines.push('', '## Architecture (excerpt)', '', '```markdown', firstSection, '```');
+  }
+
+  lines.push('', '---', '*Generated by WorkFlowAgent*');
+  return lines.join('\n');
+}
+
+module.exports = { _runGitPRWorkflow, _buildPRBody };

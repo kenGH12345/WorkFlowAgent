@@ -1,0 +1,229 @@
+'use strict';
+
+const fs   = require('fs');
+const path = require('path');
+const { PATHS } = require('./constants');
+
+/**
+ * Helper methods for Orchestrator.
+ * All functions use `this` bound to the Orchestrator instance.
+ */
+
+/**
+ * Builds investigation tools for SelfCorrectionEngine deep investigation.
+ * @this {Orchestrator}
+ */
+function _buildInvestigationTools(stageLabel) {
+  const self = this;
+
+  const _getSourceCache = () => {
+    if (self._investigationSourceCacheMap.has(stageLabel)) {
+      return self._investigationSourceCacheMap.get(stageLabel);
+    }
+
+    const filesToRead = [
+      PATHS.AGENTS_MD,
+      path.join(PATHS.OUTPUT_DIR, 'requirements.md'),
+    ];
+    if (stageLabel === 'Code' || stageLabel === 'TestReport') {
+      filesToRead.push(path.join(PATHS.OUTPUT_DIR, 'architecture.md'));
+    }
+    if (stageLabel === 'TestReport') {
+      filesToRead.push(path.join(PATHS.OUTPUT_DIR, 'code.diff'));
+    }
+
+    const parts = [];
+    for (const filePath of filesToRead) {
+      if (fs.existsSync(filePath)) {
+        try {
+          const raw = fs.readFileSync(filePath, 'utf-8');
+          const excerpt = raw.slice(0, 800);
+          parts.push(`**${path.basename(filePath)}** (excerpt):\n${excerpt}`);
+          console.log(`  [Investigation:readSource] Read ${path.basename(filePath)} (${raw.length} chars).`);
+        } catch (err) {
+          console.warn(`  [Investigation:readSource] Failed to read ${filePath}: ${err.message}`);
+        }
+      }
+    }
+    const result = parts.length > 0 ? parts.join('\n\n---\n\n') : null;
+    self._investigationSourceCacheMap.set(stageLabel, result);
+    return result;
+  };
+
+  return {
+    search: async (query) => {
+      console.log(`  [Investigation:search] Querying experience store for: "${query}"`);
+      const results = self.experienceStore.search({ keyword: query, limit: 5, scoreSort: true });
+      if (!results || results.length === 0) {
+        console.log(`  [Investigation:search] No experience records found.`);
+        return null;
+      }
+      const snippets = results.slice(0, 5).map((r, i) =>
+        `${i + 1}. [${r.type}] ${r.title}\n   ${r.content?.slice(0, 200) ?? ''}`
+      ).join('\n\n');
+      console.log(`  [Investigation:search] Found ${results.length} record(s). Using top ${Math.min(results.length, 5)}.`);
+      return snippets;
+    },
+
+    readSource: async (signalType, _content) => {
+      const cached = _getSourceCache();
+      if (!cached) {
+        console.log(`  [Investigation:readSource] No source files found.`);
+      }
+      return cached;
+    },
+
+    queryExperience: async (signalType) => {
+      const skillName = stageLabel === 'Architecture' ? 'architecture-design'
+                      : stageLabel === 'Code'         ? 'code-development'
+                      : 'test-report';
+      const contextBlock = self.experienceStore.getContextBlock(skillName);
+      if (!contextBlock) {
+        console.log(`  [Investigation:queryExperience] No experience context for signal type "${signalType}".`);
+        return null;
+      }
+      console.log(`  [Investigation:queryExperience] Retrieved experience context (${contextBlock.length} chars).`);
+      return contextBlock;
+    },
+
+    queryGraph: async (symbolName) => {
+      if (stageLabel !== 'Code' && stageLabel !== 'TestReport') return null;
+      console.log(`  [Investigation:queryGraph] Looking up symbol: "${symbolName}"`);
+      try {
+        const md = self.codeGraph.querySymbolsAsMarkdown([symbolName]);
+        if (!md || md.includes('_No matching') || md.includes('_Code graph not')) return null;
+        console.log(`  [Investigation:queryGraph] Found symbol info for "${symbolName}".`);
+        return md;
+      } catch (err) {
+        console.warn(`  [Investigation:queryGraph] Failed: ${err.message}`);
+        return null;
+      }
+    },
+  };
+}
+
+/**
+ * Registers built-in skills for common development domains.
+ * @this {Orchestrator}
+ */
+function _registerBuiltinSkills() {
+  const configSkills = (this._config && this._config.builtinSkills) || [];
+  const builtins = configSkills.length > 0 ? configSkills : [
+    { name: 'workflow-orchestration', description: 'Multi-agent workflow orchestration SOP', domains: ['workflow', 'orchestration'] },
+    { name: 'architecture-design',    description: 'Architecture design patterns, principles and best practices', domains: ['architecture', 'design'] },
+    { name: 'code-development',       description: 'Code development patterns, coding standards and best practices', domains: ['development', 'coding'] },
+    { name: 'code-review',            description: 'Code review checklist and best practices', domains: ['quality', 'review'] },
+    { name: 'api-design',             description: 'REST/RPC API design rules and patterns', domains: ['backend', 'api'] },
+    { name: 'test-report',            description: 'Test report writing standards and quality assurance patterns', domains: ['testing', 'qa'] },
+  ];
+
+  if (configSkills.length > 0) {
+    console.log(`[Orchestrator] Registering ${builtins.length} skills from workflow.config.js`);
+  } else {
+    console.log(`[Orchestrator] No workflow.config.js found. Using minimal built-in skills.`);
+  }
+
+  for (const skill of builtins) {
+    try {
+      this.skillEvolution.registerSkill(skill);
+    } catch (err) {
+      if (!err.message.includes('already registered') && !err.message.includes('already exists')) {
+        console.warn(`[Orchestrator] Failed to register built-in skill "${skill.name}": ${err.message}`);
+      }
+    }
+  }
+}
+
+/**
+ * Parses and applies [REPLACE_IN_FILE] blocks from an LLM response.
+ * @this {Orchestrator}
+ */
+function _applyFileReplacements(llmResponse) {
+  let applied = 0;
+  let failed = 0;
+  const errors = [];
+
+  const blockRegex = /\[REPLACE_IN_FILE\]([\s\S]*?)\[\/REPLACE_IN_FILE\]/g;
+  let match;
+
+  while ((match = blockRegex.exec(llmResponse)) !== null) {
+    const blockContent = match[1];
+
+    try {
+      const fileMatch = blockContent.match(/^[ \t]*file:\s*(.+)$/m);
+      if (!fileMatch) {
+        errors.push(`Block missing "file:" field`);
+        failed++;
+        continue;
+      }
+      const relPath = fileMatch[1].trim();
+      const absPath = path.isAbsolute(relPath)
+        ? relPath
+        : path.join(this.projectRoot, relPath);
+
+      if (!fs.existsSync(absPath)) {
+        errors.push(`File not found: ${absPath}`);
+        failed++;
+        continue;
+      }
+
+      const findMatch = blockContent.match(/^[ \t]*find:\s*\|\s*\n([\s\S]*?)^[ \t]*replace:\s*\|/m);
+      if (!findMatch) {
+        errors.push(`Block for "${relPath}" missing "find: |" section`);
+        failed++;
+        continue;
+      }
+
+      const replaceMatch = blockContent.match(/^[ \t]*replace:\s*\|\s*\n([\s\S]*)$/m);
+      if (!replaceMatch) {
+        errors.push(`Block for "${relPath}" missing "replace: |" section`);
+        failed++;
+        continue;
+      }
+
+      const stripIndent = (text) => {
+        const lines = text.split('\n');
+        const nonEmpty = lines.filter(l => l.trim().length > 0);
+        if (nonEmpty.length === 0) return text;
+        const minIndent = Math.min(...nonEmpty.map(l => l.match(/^(\s*)/)[1].length));
+        return lines.map(l => l.slice(minIndent)).join('\n');
+      };
+
+      const findStr  = stripIndent(findMatch[1]).replace(/\n$/, '');
+      const replaceStr = stripIndent(replaceMatch[1]).replace(/\n$/, '');
+
+      const original = this.dryRun
+        ? (this.sandbox.readFile(absPath) || fs.readFileSync(absPath, 'utf-8'))
+        : fs.readFileSync(absPath, 'utf-8');
+
+      if (!original.includes(findStr)) {
+        errors.push(`"find:" text not found in ${relPath}. First 80 chars: "${findStr.slice(0, 80).replace(/\n/g, '↵')}"`);
+        failed++;
+        continue;
+      }
+
+      if (this.dryRun) {
+        this.sandbox.patchFile(absPath, findStr, replaceStr);
+        console.log(`[Orchestrator] 🧪 [DryRun] Would patch: ${relPath}`);
+      } else {
+        const updated = original.replace(findStr, replaceStr);
+        fs.writeFileSync(absPath, updated, 'utf-8');
+        console.log(`[Orchestrator] ✏️  Patched: ${relPath}`);
+      }
+      applied++;
+
+    } catch (err) {
+      errors.push(`Error processing block: ${err.message}`);
+      failed++;
+    }
+  }
+
+  if (applied === 0 && failed === 0) {
+    errors.push('No [REPLACE_IN_FILE] blocks found in LLM response');
+    failed++;
+  }
+
+  return { applied, failed, errors };
+}
+
+module.exports = { _buildInvestigationTools, _registerBuiltinSkills, _applyFileReplacements };
