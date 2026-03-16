@@ -65,11 +65,11 @@ class TesterAgent extends BaseAgent {
       ? fs.readFileSync(testCasesPath, 'utf-8')
       : null;
     const testCasesSection = testCasesContent
-      ? `\n## Pre-Planned Test Cases (Execute ALL of these)\n> These test cases were designed from the requirements BEFORE you started.\n> You MUST execute every test case listed here and report its result.\n\n${testCasesContent}\n`
+      ? `\n## Pre-Planned Test Cases (Execute ALL of these)\n> These test cases were designed from the requirements BEFORE testing began.\n> The JSON array below contains automation-ready test cases with concrete test data.\n> You MUST execute every test case and report its result using the same \`case_id\`.\n\n${testCasesContent}\n`
       : '';
 
     const testCasesInstruction = testCasesContent
-      ? `\n**IMPORTANT**: A pre-planned test suite is provided above. You MUST:\n1. Execute every test case in the "Pre-Planned Test Cases" section.\n2. Report each test case result in the "Test Cases Executed" table using the same TC-XXX IDs.\n3. Add any additional test cases you discover beyond the pre-planned ones.\n4. The Coverage Analysis must reference the pre-planned test case IDs.\n`
+      ? `\n**IMPORTANT**: A pre-planned test suite (JSON format) is provided in the "Pre-Planned Test Cases" section. You MUST:\n1. Execute EVERY test case in the JSON array – use the \`case_id\` as the ID column in your report table.\n2. For each case: verify the \`steps\` against the code diff, check if \`expected\` result is satisfied.\n3. Report results in the "Test Cases Executed" table with columns: case_id | title | expected | actual | status (PASS/FAIL/BLOCKED).\n4. Add any additional test cases you discover beyond the pre-planned ones (use IDs like TC_EXTRA_001).\n5. The Coverage Analysis must reference the pre-planned \`case_id\` values.\n`
       : '';
 
     return `You are a **Quality Testing Agent** – an independent auditor.
