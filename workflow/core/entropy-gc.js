@@ -23,6 +23,7 @@
 const fs   = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
+const { translateMdFile } = require('./i18n-translator');
 
 // ─── Default Rules ────────────────────────────────────────────────────────────
 
@@ -48,6 +49,7 @@ class EntropyGC {
     maxLines    = DEFAULT_MAX_LINES,
     docPaths    = [],
     lintCommand = null,
+    llmCall     = null,
   } = {}) {
     this._root       = projectRoot;
     this._outputDir  = outputDir;
@@ -56,6 +58,7 @@ class EntropyGC {
     this._maxLines   = maxLines;
     this._docPaths   = docPaths;
     this._lintCmd    = lintCommand !== undefined ? lintCommand : this._detectLintCommand();
+    this._llmCall    = llmCall;
   }
 
   // ─── Public API ───────────────────────────────────────────────────────────
@@ -391,6 +394,10 @@ class EntropyGC {
       }
       const reportPath = path.join(this._outputDir, 'entropy-report.md');
       fs.writeFileSync(reportPath, lines.join('\n'), 'utf-8');
+
+      // Auto-generate Chinese translation (non-blocking)
+      translateMdFile(reportPath, this._llmCall).catch(() => {});
+
       return reportPath;
     } catch (err) {
       console.warn(`[EntropyGC] Failed to write entropy-report.md: ${err.message}`);

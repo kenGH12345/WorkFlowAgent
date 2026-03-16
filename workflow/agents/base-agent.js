@@ -16,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const { AGENT_CONTRACTS, AgentRole } = require('../core/types');
 const { PATHS, HOOK_EVENTS } = require('../core/constants');
+const { translateMdFile } = require('../core/i18n-translator');
 
 class BaseAgent {
   /**
@@ -143,6 +144,11 @@ class BaseAgent {
     const tempFilePath = `${outputFilePath}.tmp.${Date.now()}`;
     fs.writeFileSync(tempFilePath, content, 'utf-8');
     fs.renameSync(tempFilePath, outputFilePath);
+
+    // Auto-generate Chinese translation for .md files (non-blocking)
+    if (outputFilePath.endsWith('.md')) {
+      translateMdFile(outputFilePath, this.llmCall).catch(() => {});
+    }
     
     return outputFilePath;
   }

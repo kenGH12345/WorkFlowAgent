@@ -197,6 +197,7 @@ class Orchestrator {
       maxLines:     cfg.maxLines,
       docPaths:     cfg.docPaths || [],
       lintCommand:  cfg.lintCommand || null,
+      llmCall:      this._rawLlmCall,
     });
 
     // ── CIIntegration: pipeline validation bridge ───────────────────────────
@@ -212,6 +213,7 @@ class Orchestrator {
       outputDir:    PATHS.OUTPUT_DIR,
       extensions:   cfg.sourceExtensions,
       ignoreDirs:   cfg.ignoreDirs,
+      llmCall:      this._rawLlmCall,
     });
 
     // Create agents with hook emitter

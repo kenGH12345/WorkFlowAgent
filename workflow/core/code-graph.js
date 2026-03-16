@@ -23,6 +23,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { translateMdFile } = require('./i18n-translator');
 
 // ─── Symbol Types ─────────────────────────────────────────────────────────────
 
@@ -53,12 +54,14 @@ class CodeGraph {
     extensions = ['.js', '.ts', '.cs', '.lua', '.go', '.py', '.dart'],
     ignoreDirs = ['node_modules', '.git', 'build', 'dist', 'output', 'Library', 'Temp', 'obj', 'Packages', '.dart_tool'],
     maxFiles   = 200,
+    llmCall    = null,
   } = {}) {
     this._root       = projectRoot;
     this._outputDir  = outputDir;
     this._extensions = new Set(extensions);
     this._ignoreDirs = new Set(ignoreDirs);
     this._maxFiles   = maxFiles;
+    this._llmCall    = llmCall;
 
     /** @type {Map<string, SymbolEntry>} symbolId → entry */
     this._symbols = new Map();
@@ -636,6 +639,9 @@ class CodeGraph {
       // Write Markdown summary
       const mdPath = path.join(this._outputDir, 'code-graph.md');
       fs.writeFileSync(mdPath, this.toMarkdown(), 'utf-8');
+
+      // Auto-generate Chinese translation (non-blocking)
+      translateMdFile(mdPath, this._llmCall).catch(() => {});
 
       console.log(`[CodeGraph] 📄 Written: ${jsonPath}`);
       return jsonPath;
