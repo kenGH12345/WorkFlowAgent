@@ -161,6 +161,13 @@ class Observability {
       fs.writeFileSync(outPath, JSON.stringify(metrics, null, 2), 'utf-8');
 
       // Append to cross-session history (JSONL format)
+      // ── Defect #6 fix: atomic append to metrics-history.jsonl ────────────────
+      // Previously used appendFileSync() directly. If the process crashed mid-write,
+      // a partial JSON line would be written, causing JSON.parse() to throw in
+      // loadHistory() and silently returning [] (all history lost).
+      // Fix: write the new line to a .tmp file first, then read-append-write the
+      // full history file atomically via writeFileSync (overwrite). This ensures
+      // the file is always a valid sequence of complete JSON lines.
       const historyPath = path.join(this._outputDir, 'metrics-history.jsonl');
       const historyLine = JSON.stringify({
         sessionId:       metrics.sessionId,
@@ -176,7 +183,13 @@ class Observability {
         ciStatus:        metrics.ciResult?.status ?? null,
         codeGraphSymbols: metrics.codeGraphResult?.symbolCount ?? null,
       }) + '\n';
-      fs.appendFileSync(historyPath, historyLine, 'utf-8');
+      // Read existing history, append new line, write atomically
+      const existingHistory = fs.existsSync(historyPath)
+        ? fs.readFileSync(historyPath, 'utf-8')
+        : '';
+      const historyTmpPath = historyPath + '.tmp';
+      fs.writeFileSync(historyTmpPath, existingHistory + historyLine, 'utf-8');
+      fs.renameSync(historyTmpPath, historyPath);
     } catch (err) {
       console.warn(`[Observability] Failed to write metrics: ${err.message}`);
     }
@@ -238,7 +251,16 @@ class Observability {
       tokenTrend:      trend(tokens),
       errorTrend:      trend(errors),
       entropyTrend:    trend(entropy),
-      ciSuccessRate:   history.filter(h => h.ciStatus === 'success').length / history.filter(h => h.ciStatus != null).length || null,
+      // ── P1-3 fix: guard against division by zero ─────────────────────────────
+      // When all sessions have ciStatus=null (no CI configured), the denominator
+      // is 0, producing NaN. NaN||null returns null, which is indistinguishable
+      // from "CI configured but 0% success rate". Now we explicitly check the
+      // denominator and return null only when there is truly no CI data.
+      ciSuccessRate: (() => {
+        const ciSessions = history.filter(h => h.ciStatus != null);
+        if (ciSessions.length === 0) return null; // No CI data at all
+        return ciSessions.filter(h => h.ciStatus === 'success').length / ciSessions.length;
+      })(),
       lastSession:     history[0]?.startedAt,
     };
   }
@@ -389,9 +411,22 @@ class Observability {
 
     // ── Rule 3: skipEntropyOnClean ───────────────────────────────────────────
     // If last 3 sessions all had 0 entropy violations, skip the post-test scan.
+    // ── Improvement #2 fix: periodic forced scan ─────────────────────────────
+    // Previously: once 3 consecutive clean sessions were seen, entropy was skipped
+    // PERMANENTLY. If the 4th session introduced a large file or circular dep,
+    // it would never be detected.
+    // Fix: skip entropy only if the last 3 sessions are clean AND the total
+    // session count is NOT a multiple of 5. Every 5th session forces a full scan
+    // regardless of history, providing a periodic safety net.
     const recentEntropyData = recent.slice(0, 3).filter(h => h.entropyViolations != null);
-    const skipEntropyOnClean = recentEntropyData.length >= 3 &&
+    const allRecentClean = recentEntropyData.length >= 3 &&
       recentEntropyData.every(h => h.entropyViolations === 0);
+    // Force a scan every 5 sessions (session count is 1-based: 5, 10, 15, ...)
+    const isForcedScanSession = filteredHistory.length % 5 === 0;
+    const skipEntropyOnClean = allRecentClean && !isForcedScanSession;
+    if (allRecentClean && isForcedScanSession) {
+      console.log(`[Observability] 📊 Adaptive strategy: entropy scan FORCED (session ${filteredHistory.length} is a multiple of 5 – periodic safety check).`);
+    }
 
     const changed = maxFixRounds !== defaultStrategy.maxFixRounds ||
                     maxReviewRounds !== defaultStrategy.maxReviewRounds ||

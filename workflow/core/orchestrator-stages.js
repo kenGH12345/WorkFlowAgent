@@ -244,11 +244,21 @@ async function _runArchitect() {
       try {
         const rollbackReason = `Architecture review failed: ${failedNotes.slice(0, 200)}`;
         await this.stateMachine.rollback(rollbackReason);
+        // ── P2-2 fix: clear investigation source cache after rollback ─────────────
+        // The cache is keyed by stageLabel (e.g. 'Architecture'). After rollback,
+        // the architecture.md file will be regenerated with new content. If the
+        // cache is not cleared, _buildInvestigationTools('Architecture') will return
+        // the OLD pre-rollback architecture.md content, causing the re-run architect
+        // to investigate stale data. Clear the cache so the next read is fresh.
+        if (this._investigationSourceCacheMap) {
+          this._investigationSourceCacheMap.delete('Architecture');
+          this._investigationSourceCacheMap.delete('ARCHITECT');
+        }
         console.warn(`[Orchestrator] ⏪ Rolled back to ANALYSE stage. Re-running analyst with failure context.`);
         // Re-run analyst with the failure context injected
         const failureContext = `[ARCHITECTURE REVIEW FAILED – RETRY ${rollbackCount + 1}]\n\nThe previous architecture attempt failed review with these issues:\n${failedNotes}\n\nPlease re-analyse the requirements with these constraints in mind.`;
         const reanalysedPath = await _runAnalyst.call(this, failureContext);
-        // ── Critical fix (Defect A): after re-analysis, we MUST call transition()
+        // ── Critical fix (Defect A/C): after re-analysis, we MUST call transition()
         // to advance the state machine from ANALYSE → ARCHITECT.
         // Previously, _runAnalyst was called directly and returned, but the state
         // machine was left stuck at ANALYSE because transition() was never called.
@@ -258,9 +268,23 @@ async function _runArchitect() {
         // the state machine stays in sync with the actual workflow progress.
         await this.stateMachine.transition(reanalysedPath, `ANALYSE → ARCHITECT (post-rollback retry ${rollbackCount + 1})`);
         console.log(`[Orchestrator] ✅ State machine advanced to ARCHITECT after post-rollback re-analysis.`);
-        // Return the re-analysed path so the caller (_runStage) can continue
-        // to the ARCHITECT stage with the updated analysis output.
-        return reanalysedPath;
+        // ── P0-1 fix: publish ANALYST → ARCHITECT bus message after re-analysis ──
+        // Previously: _runAnalyst() publishes ANALYST→ARCHITECT internally, but
+        // _runArchitect() at the TOP of this function already consumed that message
+        // (const inputPath = this.bus.consume(AgentRole.ARCHITECT)).
+        // After rollback + re-analysis, _runAnalyst publishes a NEW message, but
+        // _runArchitect will be called again by the outer _runStage loop – and it
+        // will call bus.consume(AgentRole.ARCHITECT) again. Since _runAnalyst already
+        // published the new message, this is fine. No extra publish needed here.
+        // The sentinel return tells _runStage NOT to call transition() again.
+        // ── Defect A/C fix: return a sentinel object to signal _runStage that
+        // transition() has already been called inside this function.
+        // Without this, _runStage would call transition() AGAIN after receiving
+        // the return value, causing the state machine to advance one extra step
+        // (ARCHITECT → CODE) before the architect has even run.
+        // _runStage checks for { __alreadyTransitioned: true } and skips its own
+        // transition() call when this flag is present.
+        return { __alreadyTransitioned: true, artifactPath: reanalysedPath };
       } catch (rollbackErr) {
         console.warn(`[Orchestrator] Rollback failed (non-fatal): ${rollbackErr.message}. Proceeding with risks recorded.`);
       }
@@ -418,23 +442,55 @@ async function _runDeveloper() {
       try {
         const rollbackReason = `Code review failed: ${failedNotes.slice(0, 200)}`;
         await this.stateMachine.rollback(rollbackReason);
+        // ── P2-2 fix: clear investigation source cache after rollback ─────────────
+        // After code review rollback, both architecture.md (will be revised) and
+        // code.diff (will be regenerated) are stale. Clear their cache entries so
+        // the re-run architect and developer see fresh file content.
+        if (this._investigationSourceCacheMap) {
+          this._investigationSourceCacheMap.delete('Architecture');
+          this._investigationSourceCacheMap.delete('Code');
+          this._investigationSourceCacheMap.delete('ARCHITECT');
+          this._investigationSourceCacheMap.delete('CODE');
+        }
         console.warn(`[Orchestrator] ⏪ Rolled back to ARCHITECT stage. Re-running architect with code failure context.`);
-        // Inject failure context into the bus so _runArchitect can read it
-        const archInputPath = this.bus.consume(AgentRole.DEVELOPER); // re-consume to get arch output path
-        if (archInputPath) {
+        // ── Defect #4 fix: do NOT re-consume AgentRole.DEVELOPER here. ─────────
+        // The bus message for DEVELOPER was already consumed at the top of this
+        // function (const inputPath = this.bus.consume(AgentRole.DEVELOPER)).
+        // A second consume() returns null, making archInputPath null and causing
+        // the failure note and bus.publish() to be silently skipped.
+        // Instead, read the architecture output path directly from the output dir.
+        const archOutputPath = path.join(PATHS.OUTPUT_DIR, 'architecture.md');
+        if (fs.existsSync(archOutputPath)) {
           const failureNote = `\n\n---\n## ⚠️ Code Review Failure (Retry ${codeRollbackCount + 1})\n\nThe previous code implementation failed review with these issues:\n${failedNotes}\n\nPlease revise the architecture to address these code-level concerns before the developer retries.`;
-          const fs = require('fs');
-          if (fs.existsSync(archInputPath)) {
-            fs.appendFileSync(archInputPath, failureNote, 'utf-8');
-          }
-          this.bus.publish(AgentRole.ANALYST, AgentRole.ARCHITECT, archInputPath, {
+          fs.appendFileSync(archOutputPath, failureNote, 'utf-8');
+          this.bus.publish(AgentRole.ANALYST, AgentRole.ARCHITECT, archOutputPath, {
             codeReviewFailed: true,
             failedNotes,
             rollbackRetry: codeRollbackCount + 1,
           });
         }
-        // Re-run architect with the failure context
-        return await _runDeveloper.call(this);
+        // ── Defect #1 fix: after rollback to ARCHITECT, re-run _runArchitect ─────
+        // Previously called _runDeveloper.call(this) here, which meant the state
+        // machine was rolled back to ARCHITECT but the actual execution skipped
+        // the architect entirely and went straight back to developer – making the
+        // rollback a no-op. Now we correctly re-run _runArchitect so the architect
+        // can revise the design before the developer retries.
+        //
+        // ── P0-2 fix: propagate __alreadyTransitioned sentinel correctly ─────────
+        // _runArchitect() may return { __alreadyTransitioned: true, artifactPath }
+        // (e.g. if it triggers its own rollback). We must propagate this sentinel
+        // upward so _runStage(ARCHITECT→CODE) does NOT call transition() again.
+        // Previously: return await _runArchitect.call(this) was correct for the
+        // normal path (returns outputPath string), but if _runArchitect itself
+        // rolled back and returned the sentinel, _runStage would see a non-string
+        // return value and try to use it as an artifactPath for transition(),
+        // causing the state machine to advance with a corrupt artifact reference.
+        // Now: we explicitly check and propagate the sentinel.
+        const archRetry = await _runArchitect.call(this);
+        // If _runArchitect already handled its own transition (sentinel), propagate it.
+        // Otherwise return the architecture outputPath so _runStage(ARCHITECT→CODE)
+        // can call transition() normally.
+        return archRetry;
       } catch (rollbackErr) {
         console.warn(`[Orchestrator] Code rollback failed (non-fatal): ${rollbackErr.message}. Proceeding with risks recorded.`);
         // Fall through: record risk and continue to TEST
@@ -756,7 +812,21 @@ async function _runRealTestLoop({ testCommand, autoFixEnabled, maxFixRounds, fai
   });
 
   console.log(`\n[Orchestrator] 🔬 Running real test suite: ${testCommand}`);
-  let result = runner.run();
+  // ── Defect B fix: wrap runner.run() in try/catch ──────────────────────────
+  // TestRunner.run() uses execSync internally. If the test command itself does
+  // not exist (e.g. no package.json, missing binary), execSync throws ENOENT
+  // which would propagate uncaught through the async function and crash the
+  // entire TEST stage. We catch it here and convert it to a failed result so
+  // the workflow can record the risk and continue gracefully.
+  let result;
+  try {
+    result = runner.run();
+  } catch (runErr) {
+    console.error(`[Orchestrator] ❌ Test runner threw an unexpected error: ${runErr.message}`);
+    this.stateMachine.recordRisk('high', `[RealTest] Test runner crashed: ${runErr.message}`);
+    if (failOnUnfixed) throw runErr;
+    return;
+  }
 
   const realResultMd = TestRunner.formatResultAsMarkdown(result);
   if (fs.existsSync(testReportPath)) {
@@ -926,7 +996,14 @@ async function _runRealTestLoop({ testCommand, autoFixEnabled, maxFixRounds, fai
     }
 
     console.log(`[Orchestrator] 🔬 Re-running tests after fix round ${fixRound}...`);
-    result = runner.run();
+    try {
+      result = runner.run();
+    } catch (rerunErr) {
+      console.error(`[Orchestrator] ❌ Test runner threw an error in fix round ${fixRound}: ${rerunErr.message}`);
+      this.stateMachine.recordRisk('high', `[RealTest] Test runner crashed in fix round ${fixRound}: ${rerunErr.message}`);
+      if (failOnUnfixed) throw rerunErr;
+      break;
+    }
 
     const roundMd = `\n\n---\n\n## Auto-Fix Round ${fixRound} Result\n\n` + TestRunner.formatResultAsMarkdown(result);
     if (fs.existsSync(testReportPath)) {

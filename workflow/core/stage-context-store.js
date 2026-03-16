@@ -103,6 +103,13 @@ class StageContextStore {
     ];
 
     let totalChars = lines.join('\n').length;
+    // ── Defect D fix: use an explicit counter instead of lines.filter(###) ───
+    // Previously: lines.filter(l => l.startsWith('###')).length was used to count
+    // rendered stages, but sectionText is pushed as a single multi-line string
+    // (not line-by-line), so filter() always returned 0 and the truncation notice
+    // always showed store.size stages truncated instead of the actual remainder.
+    // Now: we track rendered stages with a dedicated counter.
+    let renderedStageCount = 0;
 
     for (const [stageName, ctx] of this._store) {
       if (excludeStages.includes(stageName)) continue;
@@ -132,12 +139,14 @@ class StageContextStore {
 
       if (totalChars + sectionText.length > maxChars) {
         // Budget exceeded – add a truncation notice and stop
-        lines.push(`_... (${this._store.size - lines.filter(l => l.startsWith('###')).length} more stage(s) truncated due to token budget)_`);
+        const remaining = this._store.size - renderedStageCount;
+        lines.push(`_... (${remaining} more stage(s) truncated due to token budget)_`);
         break;
       }
 
       lines.push(sectionText);
       totalChars += sectionText.length;
+      renderedStageCount++;
     }
 
     const result = lines.join('\n');
@@ -162,6 +171,13 @@ class StageContextStore {
    * Extracts a structured context summary from a stage output file.
    * Uses simple heuristics (no LLM call) to keep it fast and free.
    *
+   * ── Improvement #3 fix: full-document intelligent extraction ─────────────
+   * Previously only scanned the first 1200 chars of the file. For long documents
+   * (e.g. architecture.md with 500+ lines), the first 1200 chars are often just
+   * the title and table of contents – the actual decisions are in the middle/end.
+   * Now: scan the FULL document for heading+content pairs, and pick the most
+   * informative paragraphs regardless of position.
+   *
    * @param {string} filePath   - Path to the stage output file (e.g. architecture.md)
    * @param {string} stageName  - Stage name for labelling
    * @returns {{ summary: string, keyDecisions: string[] }}
@@ -179,13 +195,24 @@ class StageContextStore {
     }
 
     // ── Key Decisions: extract CONTENT under decision-relevant headings ────────
-    // Previously we extracted heading titles (e.g. "## Technology Stack") which
-    // had zero information value. Now we extract the CONTENT under each heading
-    // (e.g. "Express.js + PostgreSQL chosen for..." under "## Technology Stack").
+    // Scan the FULL document (not just first 1200 chars) so decisions buried in
+    // the middle or end of long architecture/requirements docs are captured.
+    // Priority: headings that contain decision-signal keywords are ranked first.
+    const DECISION_KEYWORDS = /tech|stack|architect|design|decision|approach|pattern|module|component|api|database|framework|language|choice|select|use|adopt|implement/i;
+
     const keyDecisions = [];
-    const headingContentRegex = /^#{2,3}\s+(.+)$([\s\S]*?)(?=^#{1,3}\s|$(?!\n))/gm;
+    const allDecisions = []; // { priority: number, text: string }
+
+    // ── P1-4 fix: \Z is not a valid JS regex anchor (it's Python/Ruby syntax).
+    // In JS, \Z is treated as a literal 'Z', so the last heading's content is
+    // never captured (the regex fails to match to end-of-string).
+    // Fix: use (?=^#{1,3}\s|$(?![\s\S])) – match until the next heading OR
+    // the true end of string. Since JS multiline $ matches end-of-line (not
+    // end-of-string), we use a lookahead that checks for either a heading line
+    // OR the position where [\s\S] can no longer match (true end of input).
+    const headingContentRegex = /^#{2,3}\s+(.+)$([\s\S]*?)(?=^#{1,3}\s|(?![\s\S]))/gm;
     let hMatch;
-    while ((hMatch = headingContentRegex.exec(content)) !== null && keyDecisions.length < 6) {
+    while ((hMatch = headingContentRegex.exec(content)) !== null) {
       const heading = hMatch[1].trim();
       const body = (hMatch[2] || '')
         .split('\n')
@@ -193,23 +220,46 @@ class StageContextStore {
         .filter(l => l.length > 10 && !l.startsWith('```') && !l.startsWith('|') && !l.startsWith('#'))
         .slice(0, 2)
         .join(' ');
+
       if (body.length > 15) {
-        // Format: "Heading: first meaningful sentence"
-        keyDecisions.push(`${heading}: ${body.slice(0, 150)}`);
+        const text = `${heading}: ${body.slice(0, 150)}`;
+        const priority = DECISION_KEYWORDS.test(heading) ? 0 : 1;
+        allDecisions.push({ priority, text });
       } else if (heading.length > 3) {
-        // Fallback: heading only if no useful body found
-        keyDecisions.push(heading);
+        const priority = DECISION_KEYWORDS.test(heading) ? 1 : 2;
+        allDecisions.push({ priority, text: heading });
       }
     }
 
-    // ── Summary: first substantive paragraph (not a heading, not a code block) ─
+    // Sort by priority (decision-signal headings first), then take top 6
+    allDecisions.sort((a, b) => a.priority - b.priority);
+    for (const d of allDecisions.slice(0, 6)) {
+      keyDecisions.push(d.text);
+    }
+
+    // ── Summary: find the most informative paragraph in the document ──────────
+    // Previously: always used the first paragraph (often just a title/intro).
+    // Now: scan ALL paragraphs, score them by length and keyword density,
+    // and pick the most informative one. Fall back to first paragraph if none found.
     const paragraphs = content
       .split(/\n{2,}/)
       .map(p => p.replace(/^#+\s+/, '').trim())
-      .filter(p => p.length > 30 && !p.startsWith('```') && !p.startsWith('|') && !p.startsWith('-'));
+      .filter(p => p.length > 40 && !p.startsWith('```') && !p.startsWith('|') && !p.startsWith('-'));
 
-    const summary = paragraphs[0]
-      ? paragraphs[0].slice(0, 500).replace(/\n/g, ' ')
+    let bestParagraph = paragraphs[0] || '';
+    let bestScore = 0;
+    for (const p of paragraphs) {
+      // Score: length (capped) + keyword density bonus
+      const keywordMatches = (p.match(DECISION_KEYWORDS) || []).length;
+      const score = Math.min(p.length, 300) + keywordMatches * 20;
+      if (score > bestScore) {
+        bestScore = score;
+        bestParagraph = p;
+      }
+    }
+
+    const summary = bestParagraph
+      ? bestParagraph.slice(0, 500).replace(/\n/g, ' ')
       : `${stageName} stage completed.`;
 
     return { summary, keyDecisions };

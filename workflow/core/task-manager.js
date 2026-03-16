@@ -153,6 +153,24 @@ class TaskManager {
   }
 
   /**
+   * Immediately marks a task as exhausted (no retry), bypassing the normal
+   * retry counter. Use this for non-recoverable failures such as timeouts,
+   * where retrying would just hang again.
+   *
+   * @param {string} taskId
+   * @param {string} errorMessage
+   */
+  exhaustTask(taskId, errorMessage) {
+    const task = this._getTask(taskId);
+    task.status = TaskStatus.EXHAUSTED;
+    task.error = errorMessage;
+    task.nextRetryAt = null;
+    task.updatedAt = new Date().toISOString();
+    this._save();
+    console.warn(`[TaskManager] Task exhausted (no retry): ${taskId} – ${errorMessage.slice(0, 100)}`);
+  }
+
+  /**
    * Marks a task as failed.
    *
    * @param {string} taskId

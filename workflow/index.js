@@ -324,8 +324,24 @@ class Orchestrator {
     // Stop file watcher – no more changes expected
     this.memory.stopWatching();
 
+    // ── Defect #3 fix: flush metrics BEFORE printDashboard ──────────────────
+    // printDashboard() internally calls flush(), but if printDashboard() throws
+    // (e.g. due to a corrupt history file), metrics-history.jsonl would never be
+    // written. We now call flush() explicitly first so the JSONL record is always
+    // persisted, then call printDashboard() separately (which calls flush() again
+    // but that is idempotent – it just overwrites run-metrics.json with the same data).
+    try {
+      this.obs.flush();
+    } catch (flushErr) {
+      console.warn(`[Orchestrator] ⚠️  Observability flush failed (non-fatal): ${flushErr.message}`);
+    }
+
     // Print Observability dashboard (session metrics summary)
-    this.obs.printDashboard();
+    try {
+      this.obs.printDashboard();
+    } catch (dashErr) {
+      console.warn(`[Orchestrator] ⚠️  Observability dashboard failed (non-fatal): ${dashErr.message}`);
+    }
 
     // Print accumulated risk summary
     const risks = this.stateMachine.getRisks ? this.stateMachine.getRisks() : [];
@@ -790,7 +806,20 @@ class Orchestrator {
 
         // Execute task (in real usage, this calls the appropriate agent)
         console.log(`[AgentWorker:${agentId}] Executing task: ${task.id} – "${task.title}"`);
-        const result = await this._executeTask(task, expContext, skillContent);
+        // ── Defect G fix: wrap _executeTask with a timeout ────────────────────
+        // Without a timeout, a hung LLM call inside _executeTask keeps the task
+        // in 'running' status indefinitely. This causes hasRunning=true forever,
+        // idleCount never increments, and the worker loop never exits.
+        // We cap each task execution at 5 minutes (configurable via config).
+        const taskTimeoutMs = (this._config && this._config.taskTimeoutMs) || 5 * 60 * 1000;
+        const taskTimeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`Task execution timed out after ${taskTimeoutMs}ms`)), taskTimeoutMs)
+        );
+        const result = await Promise.race([
+          this._executeTask(task, expContext, skillContent),
+          taskTimeoutPromise,
+        ]);
+
 
         this.taskManager.completeTask(task.id, result);
         await this.hooks.emit(HOOK_EVENTS.TASK_COMPLETED, { agentId, taskId: task.id, result });
@@ -829,7 +858,19 @@ class Orchestrator {
 
       } catch (err) {
         console.error(`[AgentWorker:${agentId}] Task failed: ${task.id} – ${err.message}`);
-        this.taskManager.failTask(task.id, err.message);
+        // ── P1-2 fix: distinguish timeout errors from regular failures ────────────
+        // A timed-out task should NOT be retried – retrying would just hang again.
+        // Regular failTask() marks the task as 'failed' which may trigger a retry
+        // (depending on TaskManager's maxRetries config). For timeout errors, we
+        // call exhaustTask() (or failTask with a no-retry flag) so the task is
+        // permanently marked as 'exhausted' and never re-queued.
+        const isTimeout = err.message.includes('timed out after');
+        if (isTimeout && typeof this.taskManager.exhaustTask === 'function') {
+          this.taskManager.exhaustTask(task.id, err.message);
+          console.warn(`[AgentWorker:${agentId}] Task ${task.id} timed out – marked as exhausted (no retry).`);
+        } else {
+          this.taskManager.failTask(task.id, err.message);
+        }
         await this.hooks.emit(HOOK_EVENTS.TASK_FAILED, { agentId, taskId: task.id, error: err.message });
 
         // Architecture Risk Fix 1: record task failure into StateMachine so it appears
@@ -1007,9 +1048,9 @@ class Orchestrator {
     const experience = {
       title: `Task completed: ${(task.title ?? 'unknown').slice(0, 60)}`,
       content: `Task "${task.title}" completed successfully. Output summary: ${(output ?? '').slice(0, 300)}`,
-      category: role === AgentRole.ARCHITECT ? 'ARCHITECTURE'
-               : role === AgentRole.TESTER   ? 'STABLE_PATTERN'
-               : 'STABLE_PATTERN',
+      category: role === AgentRole.ARCHITECT ? ExperienceCategory.ARCHITECTURE
+               : role === AgentRole.TESTER   ? ExperienceCategory.STABLE_PATTERN
+               : ExperienceCategory.STABLE_PATTERN,
       tags: [role.toLowerCase(), 'task-based', 'completed'],
       codeExample: null,
     };
@@ -1115,8 +1156,19 @@ class Orchestrator {
     this.obs.stageStart(stageLabel);
     let stageStatus = 'ok';
     try {
-      const artifactPath = await stageRunner();
-      await this.stateMachine.transition(artifactPath, `Stage ${fromState} → ${toState} completed`);
+      const stageResult = await stageRunner();
+      // ── Defect A/C fix: check for __alreadyTransitioned sentinel ─────────────
+      // When a stage runner (e.g. _runArchitect rollback path) has already called
+      // stateMachine.transition() internally, it returns { __alreadyTransitioned: true }
+      // to signal that _runStage must NOT call transition() again.
+      // Without this check, _runStage would call transition() a second time,
+      // advancing the state machine one extra step (e.g. ARCHITECT → CODE before
+      // the architect has even run), causing permanent state divergence.
+      const alreadyTransitioned = stageResult && stageResult.__alreadyTransitioned === true;
+      const artifactPath = alreadyTransitioned ? stageResult.artifactPath : stageResult;
+      if (!alreadyTransitioned) {
+        await this.stateMachine.transition(artifactPath, `Stage ${fromState} → ${toState} completed`);
+      }
     } catch (err) {
       stageStatus = 'error';
       this.obs.recordError(stageLabel, err.message);
