@@ -73,8 +73,20 @@ class TesterAgent extends BaseAgent {
       ? `\n## Pre-Planned Test Cases (Execute ALL of these)\n> These test cases were designed from the requirements BEFORE testing began.\n> The JSON array below contains automation-ready test cases with concrete test data.\n> You MUST execute every test case and report its result using the same \`case_id\`.\n\n${testCasesContent}\n`
       : '';
 
+    // Check if real execution results are already available in the experience context
+    // (injected by orchestrator as "Real Test Execution Results" block)
+    const hasRealExecutionResults = expContext && expContext.includes('Real Test Execution Results');
+
     const testCasesInstruction = testCasesContent
-      ? `\n**IMPORTANT**: A pre-planned test suite (JSON format) is provided in the "Pre-Planned Test Cases" section. You MUST:\n1. Execute EVERY test case in the JSON array – use the \`case_id\` as the ID column in your report table.\n2. For each case: verify the \`steps\` against the code diff, check if \`expected\` result is satisfied.\n3. Report results in the "Test Cases Executed" table with columns: case_id | title | expected | actual | status (PASS/FAIL/BLOCKED).\n4. Add any additional test cases you discover beyond the pre-planned ones (use IDs like TC_EXTRA_001).\n5. The Coverage Analysis must reference the pre-planned \`case_id\` values.\n`
+      ? hasRealExecutionResults
+        ? `\n**IMPORTANT**: Real execution results are provided in the context above (marked with ⚡).\n` +
+          `These are ACTUAL test run results – not simulated. You MUST:\n` +
+          `1. Use the real PASS/FAIL/BLOCKED statuses as ground truth in your report.\n` +
+          `2. Do NOT contradict or override the real execution results.\n` +
+          `3. For BLOCKED cases (could not determine status), perform your own code-diff analysis.\n` +
+          `4. Add any additional test cases you discover beyond the pre-planned ones (use IDs like TC_EXTRA_001).\n` +
+          `5. The Coverage Analysis must reference the pre-planned \`case_id\` values.\n`
+        : `\n**IMPORTANT**: A pre-planned test suite (JSON format) is provided in the "Pre-Planned Test Cases" section. You MUST:\n1. Execute EVERY test case in the JSON array – use the \`case_id\` as the ID column in your report table.\n2. For each case: verify the \`steps\` against the code diff, check if \`expected\` result is satisfied.\n3. Report results in the "Test Cases Executed" table with columns: case_id | title | expected | actual | status (PASS/FAIL/BLOCKED).\n4. Add any additional test cases you discover beyond the pre-planned ones (use IDs like TC_EXTRA_001).\n5. The Coverage Analysis must reference the pre-planned \`case_id\` values.\n`
       : '';
 
     return `You are a **Quality Testing Agent** – an independent auditor.

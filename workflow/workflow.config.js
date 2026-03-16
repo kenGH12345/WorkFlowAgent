@@ -33,6 +33,16 @@ module.exports = {
   //
   testCommand: 'node tests/e2e.test.js',
 
+  // testFramework: Hint for TestCaseExecutor to generate the correct test script format.
+  //   'auto'   – auto-detect from package.json / project files (default)
+  //   'jest'   – Jest (Node.js)
+  //   'mocha'  – Mocha (Node.js)
+  //   'vitest' – Vitest (Node.js)
+  //   'pytest' – pytest (Python)
+  //   'go'     – go test (Go)
+  //
+  testFramework: 'auto',
+
   // autoFixLoop: When testCommand is set and tests fail, automatically invoke
   //   DeveloperAgent to fix the failures and re-run tests.
   //   maxFixRounds: maximum fix-and-retest cycles (default: 2)

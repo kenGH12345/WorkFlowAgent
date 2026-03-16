@@ -13,6 +13,7 @@ const { CodeReviewAgent } = require('./code-review-agent');
 const { ArchitectureReviewAgent } = require('./architecture-review-agent');
 const { TestRunner } = require('./test-runner');
 const { TestCaseGenerator } = require('./test-case-generator');
+const { TestCaseExecutor } = require('./test-case-executor');
 const { DECISION_QUESTIONS } = require('./socratic-engine');
 
 /**
@@ -350,19 +351,58 @@ async function _runTester() {
   // This forces explicit coverage planning and gives the tester a concrete
   // execution checklist, significantly improving test report quality.
   console.log(`\n[Orchestrator] 📋 Pre-generating test cases (test-first planning)...`);
+  let tcGenResult = { skipped: true, caseCount: 0 };
   try {
     const tcGen = new TestCaseGenerator(this._rawLlmCall, {
       verbose: true,
       outputDir: PATHS.OUTPUT_DIR,
     });
-    const tcResult = await tcGen.generate();
-    if (!tcResult.skipped) {
-      console.log(`[Orchestrator] ✅ Test cases generated: ${tcResult.caseCount} case(s) → output/test-cases.md`);
+    tcGenResult = await tcGen.generate();
+    if (!tcGenResult.skipped) {
+      console.log(`[Orchestrator] ✅ Test cases generated: ${tcGenResult.caseCount} case(s) → output/test-cases.md`);
     } else {
       console.log(`[Orchestrator] ⏭️  Test case generation skipped (no requirements.md found).`);
     }
   } catch (err) {
     console.warn(`[Orchestrator] ⚠️  Test case generation failed (non-fatal): ${err.message}`);
+  }
+
+  // ── Step 0.5: Execute generated test cases (close the plan→execution gap) ──
+  // Defect #4 fix: previously test-cases.md was only "simulated" by the LLM.
+  // Now we convert the JSON plan into a real executable test script and run it.
+  // The execution report is stored and later injected into TesterAgent's prompt
+  // so the AI sees REAL pass/fail results instead of imagined ones.
+  let tcExecutionReport = null;
+  if (!tcGenResult.skipped && tcGenResult.caseCount > 0) {
+    console.log(`\n[Orchestrator] 🔬 Executing generated test cases (real execution)...`);
+    try {
+      const tcExecutor = new TestCaseExecutor({
+        projectRoot: this.projectRoot,
+        testCommand: this._config.testCommand || null,
+        framework: this._config.testFramework || 'auto',
+        outputDir: PATHS.OUTPUT_DIR,
+        timeoutMs: 90_000,
+        verbose: true,
+      });
+      tcExecutionReport = await tcExecutor.execute();
+      if (!tcExecutionReport.skipped) {
+        console.log(`[Orchestrator] 📊 Test case execution: ${tcExecutionReport.passed}/${tcExecutionReport.total} passed, ${tcExecutionReport.failed} failed, ${tcExecutionReport.blocked} blocked`);
+        // Save execution report to output dir for traceability
+        const execReportPath = path.join(PATHS.OUTPUT_DIR, 'test-execution-report.md');
+        fs.writeFileSync(execReportPath, tcExecutionReport.summaryMd, 'utf-8');
+        console.log(`[Orchestrator] 📝 Execution report saved → output/test-execution-report.md`);
+        if (tcExecutionReport.failed > 0) {
+          this.stateMachine.recordRisk('medium',
+            `[TestCaseExecutor] ${tcExecutionReport.failed}/${tcExecutionReport.total} generated test case(s) failed real execution. See output/test-execution-report.md.`);
+        }
+      } else {
+        console.log(`[Orchestrator] ⏭️  Test case execution skipped: ${tcExecutionReport.skipReason}`);
+      }
+    } catch (err) {
+      console.warn(`[Orchestrator] ⚠️  Test case execution failed (non-fatal): ${err.message}`);
+    }
+  } else {
+    console.log(`[Orchestrator] ⏭️  Test case execution skipped (no cases generated).`);
   }
 
   const agentsMdForTest = this._agentsMdContent || '';
@@ -377,10 +417,22 @@ async function _runTester() {
   const testComplaintBlock = testComplaints.length > 0
     ? `\n\n## Known Issues (Open Complaints)\n${testComplaints.map(c => `- [${c.severity}] ${c.description}`).join('\n')}`
     : '';
+
+  // Inject real execution results into TesterAgent context (Defect #4 fix)
+  // This replaces the previous approach where TesterAgent only "imagined" test results.
+  // Now the agent sees actual PASS/FAIL/BLOCKED statuses from real script execution.
+  const realExecutionBlock = tcExecutionReport && !tcExecutionReport.skipped
+    ? `\n\n## ⚡ Real Test Execution Results (Pre-Run)\n> The following results come from ACTUALLY RUNNING the generated test script.\n> Use these as ground truth – do NOT contradict them in your report.\n\n${tcExecutionReport.summaryMd}`
+    : '';
+  if (realExecutionBlock) {
+    console.log(`[Orchestrator] ⚡ Real execution results injected into TesterAgent context (${tcExecutionReport.total} cases).`);
+  }
+
   const testExpContextWithComplaints = [
     agentsMdForTest ? `## Project Context (AGENTS.md)\n${agentsMdForTest}` : '',
     testExpContext,
     testComplaintBlock,
+    realExecutionBlock,
   ].filter(Boolean).join('\n\n');
   if (testComplaints.length > 0) {
     console.log(`[Orchestrator] ⚠️  ${testComplaints.length} open complaint(s) injected into TesterAgent context.`);

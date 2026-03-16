@@ -36,6 +36,16 @@ module.exports = {
   //
   testCommand: null,  // TODO: replace with your actual test command
 
+  // testFramework: Hint for TestCaseExecutor to generate the correct test script format.
+  //   'auto'   – auto-detect from package.json / project files (default, recommended)
+  //   'jest'   – Jest (Node.js)
+  //   'mocha'  – Mocha (Node.js)
+  //   'vitest' – Vitest (Node.js)
+  //   'pytest' – pytest (Python)
+  //   'go'     – go test (Go)
+  //
+  testFramework: 'auto',
+
   autoFixLoop: {
     enabled: true,       // Set to false to disable auto-fix (report only)
     maxFixRounds: 2,     // Max fix-and-retest cycles before giving up
