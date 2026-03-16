@@ -267,6 +267,15 @@ class ExperienceStore {
       // Push directly without saving on each record
       const { type, category, title, content, taskId = null, skill = null, tags = [], codeExample = null } = item;
       const id = `EXP-${Date.now()}-${String(batchSeq++).padStart(4, '0')}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+      // Apply the same TTL logic as record() so batch-imported experiences also expire.
+      // Previously batchRecord() skipped this, causing batch entries to never expire
+      // even when they were negative experiences (pitfalls, anti-patterns).
+      const ttlDays = item.ttlDays !== undefined
+        ? item.ttlDays
+        : (type === ExperienceType.NEGATIVE ? 90 : 365);
+      const expiresAt = ttlDays != null
+        ? new Date(Date.now() + ttlDays * 86400_000).toISOString()
+        : null;
       this.experiences.push({
         id, type, category, title, content, taskId, skill, tags, codeExample,
         sourceFile: item.sourceFile || null,
@@ -274,6 +283,7 @@ class ExperienceStore {
         hitCount: 0, evolutionCount: 0,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        expiresAt,
       });
       added++;
     }

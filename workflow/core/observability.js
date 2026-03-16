@@ -340,8 +340,29 @@ class Observability {
     // Need at least 3 sessions to derive meaningful strategy
     if (history.length < 3) return defaultStrategy;
 
-    const recent = history.slice(0, Math.min(5, history.length));
-    const trends = Observability.computeTrends(history);
+    // ── Project isolation: only use history from the SAME project ────────────
+    // Previously, all sessions from ALL projects were mixed together.
+    // This caused cross-project pollution: project A's 3 consecutive passes
+    // would reduce maxFixRounds to 1, leaving project B (a brand-new project
+    // with inevitable bugs) with only 1 fix attempt.
+    // Fix: filter history to the current projectId (passed via defaults.projectId).
+    // Fall back to global history only if no project-specific history exists.
+    const projectId = defaults.projectId || null;
+    let filteredHistory = history;
+    if (projectId) {
+      const projectHistory = history.filter(h => h.projectId === projectId);
+      if (projectHistory.length >= 3) {
+        filteredHistory = projectHistory;
+        console.log(`[Observability] 📊 Adaptive strategy: using ${projectHistory.length} session(s) for project "${projectId}" (isolated from global history).`);
+      } else {
+        console.log(`[Observability] 📊 Adaptive strategy: only ${projectHistory.length} session(s) for project "${projectId}" – using global history (${history.length} sessions) as fallback.`);
+      }
+    }
+
+    if (filteredHistory.length < 3) return defaultStrategy;
+
+    const recent = filteredHistory.slice(0, Math.min(5, filteredHistory.length));
+    const trends = Observability.computeTrends(filteredHistory);
 
     // ── Rule 1: maxFixRounds ─────────────────────────────────────────────────
     // If recent sessions had test failures (testFailed > 0), increase fix rounds.
@@ -380,12 +401,13 @@ class Observability {
       maxFixRounds,
       maxReviewRounds,
       skipEntropyOnClean,
-      source: changed ? `history(${history.length} sessions)` : 'defaults',
+      source: changed ? `history(${filteredHistory.length} sessions${projectId ? `, project:${projectId}` : ''})` : 'defaults',
       _debug: {
         testFailRate: Math.round(testFailRate * 100) + '%',
         errorTrend:   trends?.errorTrend ?? 'unknown',
         entropyClean: skipEntropyOnClean,
-        sessionCount: history.length,
+        sessionCount: filteredHistory.length,
+        projectIsolated: projectId ? filteredHistory.length !== history.length : false,
       },
     };
   }

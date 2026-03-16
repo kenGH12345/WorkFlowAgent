@@ -165,6 +165,19 @@ registerCommand(
       return `[Error] No orchestrator in context. Cannot start workflow.`;
     }
 
+    // ── Input length guard ────────────────────────────────────────────────
+    // Prevent excessively long requirements from blowing up the LLM token budget.
+    // 8000 chars ≈ ~2000 tokens, which is a reasonable upper bound for a requirement.
+    const MAX_REQUIREMENT_CHARS = 8000;
+    if (trimmedArgs.length > MAX_REQUIREMENT_CHARS) {
+      return [
+        `❌ Requirement too long (${trimmedArgs.length} chars, max ${MAX_REQUIREMENT_CHARS}).`,
+        ``,
+        `Please shorten your requirement to under ${MAX_REQUIREMENT_CHARS} characters.`,
+        `Tip: Focus on the core feature. Detailed specs can go in AGENTS.md or a separate file.`,
+      ].join('\n');
+    }
+
     // Support --sequential / --parallel flags to force a specific mode
     const forceSequential = trimmedArgs.includes('--sequential');
     const forceParallel   = trimmedArgs.includes('--parallel');

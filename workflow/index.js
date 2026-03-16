@@ -190,6 +190,7 @@ class Orchestrator {
     this._adaptiveStrategy = Observability.deriveStrategy(PATHS.OUTPUT_DIR, {
       maxFixRounds:    cfgAutoFix.maxFixRounds    ?? 2,
       maxReviewRounds: cfgAutoFix.maxReviewRounds ?? 2,
+      projectId:       projectId,
     });
     if (this._adaptiveStrategy.source !== 'defaults') {
       console.log(`[Orchestrator] 📈 Adaptive strategy loaded from ${this._adaptiveStrategy.source}:`);

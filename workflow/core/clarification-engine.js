@@ -50,10 +50,21 @@ const SIGNAL_PATTERNS = [
     label: '🚨 Unmitigated Risk',
     layer: 'What-if',
     severity: 'high',
-    // Negative lookahead: skip phrases where the risk is already mitigated or negated.
-    // e.g. "mitigates the risk", "no risk", "without risk", "addresses concerns",
-    //      "reduces potential issues", "risk is low/minimal/acceptable"
-    patterns: [/(?<!mitigat(?:es?|ed|ing)\s{0,20}(?:the\s)?)(?<!no\s)(?<!without\s)(?<!address(?:es?|ed|ing)\s{0,20}(?:the\s)?)(?<!reduc(?:es?|ed|ing)\s{0,20}(?:the\s)?)\b(might fail|could fail|risk|concern|potential issue|风险|隐患|警告)\b(?!\s+(?:is\s+)?(?:low|minimal|acceptable|mitigated|addressed|resolved|handled|managed))/i],
+    // Two-step detection to avoid variable-length lookbehind (not supported in Node.js < 16):
+    // Step 1: match the risk keyword with a simple forward-only lookahead (no lookbehind).
+    // Step 2: the custom `filter` function checks the surrounding context to exclude
+    //         already-mitigated risks (e.g. "mitigates the risk", "no risk", "risk is low").
+    // This approach is compatible with ALL Node.js versions (no lookbehind at all).
+    patterns: [/\b(might fail|could fail|risk|concern|potential issue|风险|隐患|警告)\b(?!\s+(?:is\s+)?(?:low|minimal|acceptable|mitigated|addressed|resolved|handled|managed))/i],
+    // Filter: returns false (skip signal) if the match is preceded by a mitigation phrase.
+    // Uses a simple substring search on the 40 chars before the match – no regex lookbehind.
+    filter: (match, fullText) => {
+      const idx = fullText.toLowerCase().indexOf(match.toLowerCase());
+      if (idx < 0) return true; // can't locate, keep signal
+      const prefix = fullText.slice(Math.max(0, idx - 40), idx).toLowerCase();
+      const mitigationPrefixes = ['mitigates ', 'mitigated ', 'mitigating ', 'no ', 'without ', 'addresses ', 'addressed ', 'reduces ', 'reduced '];
+      return !mitigationPrefixes.some(p => prefix.endsWith(p) || prefix.includes(p + 'the '));
+    },
     instruction: (match) => `The risk "${match}" is mentioned without a mitigation plan. Add a concrete mitigation strategy.`,
   },
   {
@@ -83,6 +94,12 @@ function detectSignals(text) {
     for (const pattern of detector.patterns) {
       const match = text.match(pattern);
       if (match && !seen.has(detector.type)) {
+        // Optional filter callback: allows detectors to exclude false positives
+        // using context-aware logic (e.g. checking prefix text for mitigation phrases)
+        // without relying on variable-length lookbehind assertions.
+        if (typeof detector.filter === 'function' && !detector.filter(match[0], text)) {
+          continue; // filtered out – skip this signal
+        }
         seen.add(detector.type);
         found.push({
           type: detector.type,

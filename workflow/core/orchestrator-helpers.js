@@ -244,9 +244,18 @@ function _applyFileReplacements(llmResponse) {
         this.sandbox.patchFile(absPath, findStr, replaceStr);
         console.log(`[Orchestrator] 🧪 [DryRun] Would patch: ${relPath}`);
       } else {
-        const updated = original.replace(findStr, replaceStr);
+        // Use replaceAll (via split+join) to fix ALL occurrences of the same bug pattern,
+        // not just the first one. String.replace() only replaces the first match, which
+        // means identical bug code appearing multiple times in a file would only be
+        // partially fixed, causing the test suite to still fail after the fix round.
+        const occurrences = original.split(findStr).length - 1;
+        const updated = original.split(findStr).join(replaceStr);
+        if (occurrences > 1) {
+          console.log(`[Orchestrator] ✏️  Patched: ${relPath} (${occurrences} occurrence(s) replaced)`);
+        } else {
+          console.log(`[Orchestrator] ✏️  Patched: ${relPath}`);
+        }
         fs.writeFileSync(absPath, updated, 'utf-8');
-        console.log(`[Orchestrator] ✏️  Patched: ${relPath}`);
       }
       applied++;
 

@@ -247,7 +247,20 @@ async function _runArchitect() {
         console.warn(`[Orchestrator] ⏪ Rolled back to ANALYSE stage. Re-running analyst with failure context.`);
         // Re-run analyst with the failure context injected
         const failureContext = `[ARCHITECTURE REVIEW FAILED – RETRY ${rollbackCount + 1}]\n\nThe previous architecture attempt failed review with these issues:\n${failedNotes}\n\nPlease re-analyse the requirements with these constraints in mind.`;
-        return await _runAnalyst.call(this, failureContext);
+        const reanalysedPath = await _runAnalyst.call(this, failureContext);
+        // ── Critical fix (Defect A): after re-analysis, we MUST call transition()
+        // to advance the state machine from ANALYSE → ARCHITECT.
+        // Previously, _runAnalyst was called directly and returned, but the state
+        // machine was left stuck at ANALYSE because transition() was never called.
+        // This caused the state machine to permanently diverge from the actual
+        // execution flow (CODE and TEST stages would run while state = ANALYSE).
+        // Now we explicitly transition ANALYSE → ARCHITECT after re-analysis so
+        // the state machine stays in sync with the actual workflow progress.
+        await this.stateMachine.transition(reanalysedPath, `ANALYSE → ARCHITECT (post-rollback retry ${rollbackCount + 1})`);
+        console.log(`[Orchestrator] ✅ State machine advanced to ARCHITECT after post-rollback re-analysis.`);
+        // Return the re-analysed path so the caller (_runStage) can continue
+        // to the ARCHITECT stage with the updated analysis output.
+        return reanalysedPath;
       } catch (rollbackErr) {
         console.warn(`[Orchestrator] Rollback failed (non-fatal): ${rollbackErr.message}. Proceeding with risks recorded.`);
       }
@@ -378,7 +391,7 @@ async function _runDeveloper() {
       tags: ['code-review', 'passed', 'stable'],
     });
   } else if (reviewResult.needsHumanReview) {
-    console.warn(`[Orchestrator] ⚠️  ${reviewResult.failed} high-severity code issue(s) remain. Recorded as risks.`);
+    console.warn(`[Orchestrator] ⚠️  ${reviewResult.failed} high-severity code issue(s) remain. Attempting rollback to ARCHITECT stage.`);
     const codeFailTitle = 'Code review: high-severity issues unresolved after self-correction';
     const failedNotes = reviewResult.riskNotes.slice(0, 3).join('; ');
     const failContent = `After ${reviewResult.rounds ?? 'N/A'} self-correction round(s), ${reviewResult.failed} high-severity issue(s) remained. Issues: ${failedNotes}`;
@@ -391,6 +404,45 @@ async function _runDeveloper() {
         skill: 'code-development',
         tags: ['code-review', 'failed', 'pitfall'],
       });
+    }
+    // ── Rollback to ARCHITECT stage (Defect G fix) ────────────────────────────
+    // Previously: code review failure only recorded a risk and continued to TEST.
+    // This was asymmetric with architecture review (which rolls back to ANALYSE).
+    // Now: when high-severity code issues remain after all review rounds, we roll
+    // back to ARCHITECT so the architect can revise the design before the developer
+    // tries again. Capped at 1 rollback to prevent infinite loops.
+    const codeRollbackKey = `_codeRollbackCount_${this.projectId}`;
+    const codeRollbackCount = (this[codeRollbackKey] || 0);
+    if (codeRollbackCount < 1) {
+      this[codeRollbackKey] = codeRollbackCount + 1;
+      try {
+        const rollbackReason = `Code review failed: ${failedNotes.slice(0, 200)}`;
+        await this.stateMachine.rollback(rollbackReason);
+        console.warn(`[Orchestrator] ⏪ Rolled back to ARCHITECT stage. Re-running architect with code failure context.`);
+        // Inject failure context into the bus so _runArchitect can read it
+        const archInputPath = this.bus.consume(AgentRole.DEVELOPER); // re-consume to get arch output path
+        if (archInputPath) {
+          const failureNote = `\n\n---\n## ⚠️ Code Review Failure (Retry ${codeRollbackCount + 1})\n\nThe previous code implementation failed review with these issues:\n${failedNotes}\n\nPlease revise the architecture to address these code-level concerns before the developer retries.`;
+          const fs = require('fs');
+          if (fs.existsSync(archInputPath)) {
+            fs.appendFileSync(archInputPath, failureNote, 'utf-8');
+          }
+          this.bus.publish(AgentRole.ANALYST, AgentRole.ARCHITECT, archInputPath, {
+            codeReviewFailed: true,
+            failedNotes,
+            rollbackRetry: codeRollbackCount + 1,
+          });
+        }
+        // Re-run architect with the failure context
+        return await _runDeveloper.call(this);
+      } catch (rollbackErr) {
+        console.warn(`[Orchestrator] Code rollback failed (non-fatal): ${rollbackErr.message}. Proceeding with risks recorded.`);
+        // Fall through: record risk and continue to TEST
+        this.stateMachine.recordRisk('high', `[CodeReview] ${reviewResult.failed} high-severity issue(s) unresolved. Rollback failed: ${rollbackErr.message}`);
+      }
+    } else {
+      console.warn(`[Orchestrator] ⚠️  Code rollback limit reached (max 1). Proceeding to TEST with ${reviewResult.failed} unresolved issue(s).`);
+      this.stateMachine.recordRisk('high', `[CodeReview] ${reviewResult.failed} high-severity issue(s) unresolved after rollback limit reached.`);
     }
   } else {
     console.log(`[Orchestrator] ℹ️  ${reviewResult.failed} minor code issue(s) remain. Proceeding automatically.`);
@@ -804,6 +856,18 @@ async function _runRealTestLoop({ testCommand, autoFixEnabled, maxFixRounds, fai
       `You are a **Code Fix Agent**. The project's test suite has failed.`,
       `Your task: produce REPLACE_IN_FILE blocks that fix ALL failing tests.`,
       ``,
+      `## Architecture Design`,
+      `> **[MANDATORY]** Before writing any fix, document your diagnosis:`,
+      `> - Root cause of each failing test (what is broken and why)`,
+      `> - Which files/functions need to change`,
+      `> - Why your proposed fix is correct (not just a workaround)`,
+      ``,
+      `## Execution Plan`,
+      `> **[MANDATORY]** List the fix steps in order:`,
+      `> 1. Fix #1: <file> – <what you're changing and why>`,
+      `> 2. Fix #2: <file> – <what you're changing and why>`,
+      `> (continue for each REPLACE_IN_FILE block below)`,
+      ``,
       `## Previous Diff (for reference)`,
       `\`\`\`diff`,
       existingDiff.slice(0, 2000),
@@ -813,7 +877,7 @@ async function _runRealTestLoop({ testCommand, autoFixEnabled, maxFixRounds, fai
       ``,
       failureContext,
       ``,
-      `## Output Format`,
+      `## Fix Blocks`,
       `For each file you need to change, output one or more blocks in this EXACT format:`,
       ``,
       `[REPLACE_IN_FILE]`,
@@ -826,7 +890,7 @@ async function _runRealTestLoop({ testCommand, autoFixEnabled, maxFixRounds, fai
       ``,
       `## Rules`,
       `1. Analyse the failure output above and identify the root cause of each failing test.`,
-      `2. Output ONLY [REPLACE_IN_FILE] blocks – no explanations, no markdown prose.`,
+      `2. Fill in the Architecture Design and Execution Plan sections FIRST, then output fix blocks.`,
       `3. The "find:" block MUST be an exact substring of the current file (copy-paste it from the source above).`,
       `4. Only change what is necessary to fix the failures.`,
       `5. Do NOT change test files unless the test itself is clearly wrong.`,

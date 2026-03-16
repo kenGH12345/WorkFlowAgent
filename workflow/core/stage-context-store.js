@@ -222,7 +222,12 @@ class StageContextStore {
       const data = {};
       for (const [k, v] of this._store) data[k] = v;
       const outPath = path.join(this._outputDir, 'stage-context.json');
-      fs.writeFileSync(outPath, JSON.stringify(data, null, 2), 'utf-8');
+      // Atomic write: write to .tmp first, then rename over the target.
+      // This prevents a corrupt stage-context.json if the process crashes mid-write.
+      // Consistent with StateMachine._writeManifest() and ExperienceStore._save().
+      const tmpPath = outPath + '.tmp';
+      fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf-8');
+      fs.renameSync(tmpPath, outPath);
     } catch { /* non-fatal */ }
   }
 
