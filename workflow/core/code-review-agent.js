@@ -58,6 +58,9 @@ const ITEM_TO_DIMENSION = {
   'REQ':    REVIEW_DIMENSIONS.SPEC_COMPLIANCE,
   'SYNTAX': REVIEW_DIMENSIONS.STANDARDS,
   'EDGE':   REVIEW_DIMENSIONS.ROBUSTNESS,
+  'INTF':   REVIEW_DIMENSIONS.SPEC_COMPLIANCE,
+  'EXPORT': REVIEW_DIMENSIONS.STANDARDS,
+  'CONST':  REVIEW_DIMENSIONS.STANDARDS,
 };
 
 /**
@@ -178,6 +181,37 @@ const DEFAULT_CHECKLIST = [
     id: 'EDGE-003', category: 'Edge Cases', severity: 'low',
     description: 'Numeric boundary values are handled (0, negative, MAX_SAFE_INTEGER)',
     hint: 'Off-by-one errors and integer overflow are common in boundary conditions.',
+  },
+
+  // ── Interface Contract ────────────────────────────────────────────────────
+  {
+    id: 'INTF-001', category: 'Interface Contract', severity: 'high',
+    description: 'Function return objects contain all fields expected by callers',
+    hint: 'Trace every property access on the return value in consuming modules. If a caller reads result.foo, the producing function must include foo in its return object.',
+  },
+  {
+    id: 'INTF-002', category: 'Interface Contract', severity: 'medium',
+    description: 'Enum/constant values used in comparisons match their definitions',
+    hint: 'When code checks value === "foo", verify that the producer actually emits "foo" (not "Foo" or "FOO"). Cross-reference the constant definition file.',
+  },
+
+  // ── Export Completeness ───────────────────────────────────────────────────
+  {
+    id: 'EXPORT-001', category: 'Export Completeness', severity: 'medium',
+    description: 'module.exports includes all symbols that are require()d by other modules',
+    hint: 'Search for require("./this-file") across the codebase. Every destructured symbol in those require() calls must be present in module.exports.',
+  },
+  {
+    id: 'EXPORT-002', category: 'Export Completeness', severity: 'low',
+    description: 'Re-export barrel files (index.js) include newly added symbols from source modules',
+    hint: 'When a new constant, class, or function is added to a module that is re-exported through index.js, the index.js import/export must be updated to include it.',
+  },
+
+  // ── Constant Consistency ──────────────────────────────────────────────────
+  {
+    id: 'CONST-001', category: 'Constant Consistency', severity: 'medium',
+    description: 'No hardcoded string literals that duplicate an existing constant value',
+    hint: 'If a file imports a Status/Type/Severity enum, all comparisons should use the constant (e.g. Status.RESOLVED), not a raw string ("resolved").',
   },
 ];
 

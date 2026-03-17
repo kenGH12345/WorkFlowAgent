@@ -122,6 +122,75 @@ function smokeTestModuleLoad() {
   }
 
   console.log('  ✅ Smoke test passed: all modules loaded successfully.\n');
+
+  // ── Phase 2: API Contract Verification ─────────────────────────────────────
+  // Validates that key exported symbols exist and have the correct types.
+  // This catches silent export omissions (e.g. new constants defined but not
+  // re-exported through index.js) and missing method implementations.
+  console.log('  🔍 API Contract Verification: checking key exports...\n');
+  let contractErrors = 0;
+
+  function verifyExport(modulePath, symbolName, expectedType, label) {
+    try {
+      const mod = require(modulePath);
+      const symbol = mod[symbolName];
+      if (symbol === undefined) {
+        console.error(`  💀 CONTRACT: ${label} → "${symbolName}" is undefined (not exported)`);
+        contractErrors++;
+        return;
+      }
+      if (expectedType && typeof symbol !== expectedType) {
+        console.error(`  💀 CONTRACT: ${label} → "${symbolName}" expected ${expectedType}, got ${typeof symbol}`);
+        contractErrors++;
+        return;
+      }
+    } catch (err) {
+      console.error(`  💀 CONTRACT: ${label} → Failed to verify "${symbolName}": ${err.message}`);
+      contractErrors++;
+    }
+  }
+
+  // index.js must re-export all key symbols
+  const indexPath = path.join(__dirname, '..', 'index');
+  verifyExport(indexPath, 'Orchestrator',        'function', 'index.js');
+  verifyExport(indexPath, 'ServiceContainer',    'function', 'index.js');
+  verifyExport(indexPath, 'StageRunner',         'function', 'index.js');
+  verifyExport(indexPath, 'StageRegistry',       'function', 'index.js');
+  verifyExport(indexPath, 'LlmRouter',           'function', 'index.js');
+
+  // Symbols that were previously missing (caught by deep audit)
+  const complaintWallPath = path.join(__dirname, '..', 'core', 'complaint-wall');
+  verifyExport(complaintWallPath, 'ComplaintWall',     'function', 'complaint-wall.js');
+  verifyExport(complaintWallPath, 'ComplaintSeverity', 'object',   'complaint-wall.js');
+  verifyExport(complaintWallPath, 'ComplaintTarget',   'object',   'complaint-wall.js');
+  verifyExport(complaintWallPath, 'ComplaintStatus',   'object',   'complaint-wall.js');
+  verifyExport(complaintWallPath, 'RootCause',         'object',   'complaint-wall.js');
+
+  const codeReviewPath = path.join(__dirname, '..', 'core', 'code-review-agent');
+  verifyExport(codeReviewPath, 'CodeReviewAgent',    'function', 'code-review-agent.js');
+  verifyExport(codeReviewPath, 'REVIEW_DIMENSIONS',  'object',   'code-review-agent.js');
+  verifyExport(codeReviewPath, 'ITEM_TO_DIMENSION',  'object',   'code-review-agent.js');
+
+  // ExperienceStore must have getAll() method
+  const expStorePath = path.join(__dirname, '..', 'core', 'experience-store');
+  const { ExperienceStore: _ES } = require(expStorePath);
+  if (typeof _ES.prototype.getAll !== 'function') {
+    console.error('  💀 CONTRACT: ExperienceStore.prototype.getAll is not a function');
+    contractErrors++;
+  }
+
+  // ReviewAgentBase.review() must return allResults (verified via instance method check)
+  const reviewBasePath = path.join(__dirname, '..', 'core', 'review-agent-base');
+  verifyExport(reviewBasePath, 'ReviewAgentBase',  'function', 'review-agent-base.js');
+  verifyExport(reviewBasePath, 'extractJsonArray', 'function', 'review-agent-base.js');
+
+  if (contractErrors > 0) {
+    console.error(`\n  ❌ API CONTRACT VERIFICATION FAILED: ${contractErrors} issue(s) found.`);
+    console.error('     Fix the export/symbol issues above before running tests.\n');
+    process.exit(3);
+  }
+
+  console.log(`  ✅ API contract verification passed: all key symbols verified.\n`);
 }
 
 async function runTests() {
