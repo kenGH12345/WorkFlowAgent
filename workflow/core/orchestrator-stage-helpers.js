@@ -20,6 +20,7 @@ const fs   = require('fs');
 const path = require('path');
 const { ComplaintTarget } = require('./complaint-wall');
 const { StageContextStore } = require('./stage-context-store');
+const { WorkflowState } = require('./types');
 // P1-B fix: import buildJsonBlockInstruction so each agent's context block
 // explicitly instructs the LLM to output a structured JSON header.
 // Without this injection, extractJsonBlock() in StageContextStore always returns
@@ -42,10 +43,10 @@ function buildArchitectUpstreamCtx(orch, taskHints = '') {
   // Defect D fix: use getRelevant() which dynamically scores and prioritises
   // upstream context based on stage proximity, risk density, correction history,
   // and keyword overlap with taskHints (e.g. rollback failure context).
-  const ctx = orch.stageCtx.getRelevant('ARCHITECT', {
+  const ctx = orch.stageCtx.getRelevant(WorkflowState.ARCHITECT, {
     taskHints,
     maxChars: 1500,
-    excludeStages: ['ARCHITECT'],
+    excludeStages: [WorkflowState.ARCHITECT],
   });
   if (ctx) {
     console.log(`[Orchestrator] 🔗 Cross-stage context injected into ArchitectAgent (${ctx.length} chars, dynamic selection). Upstream: ${orch.stageCtx.getLogLine()}`);
@@ -63,10 +64,10 @@ function buildArchitectUpstreamCtx(orch, taskHints = '') {
  */
 function buildDeveloperUpstreamCtx(orch, taskHints = '') {
   if (!orch.stageCtx) return '';
-  const ctx = orch.stageCtx.getRelevant('CODE', {
+  const ctx = orch.stageCtx.getRelevant(WorkflowState.CODE, {
     taskHints,
     maxChars: 1800,
-    excludeStages: ['CODE'],
+    excludeStages: [WorkflowState.CODE],
   });
   if (ctx) {
     console.log(`[Orchestrator] 🔗 Cross-stage context injected into DeveloperAgent (${ctx.length} chars, dynamic selection). Upstream: ${orch.stageCtx.getLogLine()}`);
@@ -84,10 +85,10 @@ function buildDeveloperUpstreamCtx(orch, taskHints = '') {
  */
 function buildTesterUpstreamCtx(orch, taskHints = '') {
   if (!orch.stageCtx) return '';
-  const ctx = orch.stageCtx.getRelevant('TEST', {
+  const ctx = orch.stageCtx.getRelevant(WorkflowState.TEST, {
     taskHints,
     maxChars: 2000,
-    excludeStages: ['TEST'],
+    excludeStages: [WorkflowState.TEST],
   });
   if (ctx) {
     console.log(`[Orchestrator] 🔗 Cross-stage context injected into TesterAgent (${ctx.length} chars, dynamic selection). Upstream: ${orch.stageCtx.getLogLine()}`);
@@ -106,7 +107,7 @@ function buildTesterUpstreamCtx(orch, taskHints = '') {
  * @param {string} upstreamCtx
  * @returns {string}
  */
-function buildArchitectContextBlock(orch, techStackPrefix, upstreamCtx) {
+async function buildArchitectContextBlock(orch, techStackPrefix, upstreamCtx) {
   const agentsMd = orch._agentsMdContent || '';
   if (agentsMd) console.log(`[Orchestrator] 📋 AGENTS.md injected into ArchitectAgent context.`);
 
@@ -116,7 +117,7 @@ function buildArchitectContextBlock(orch, techStackPrefix, upstreamCtx) {
   // Improvement 4: pass maxExpInjected from adaptive strategy so hit-rate feedback
   // can dynamically adjust how many experiences are injected into the prompt.
   const maxExpInjected = orch._adaptiveStrategy?.maxExpInjected ?? 5;
-  const { block: expCtx, ids: injectedExpIds } = orch.experienceStore.getContextBlockWithIds('architecture-design', orch._currentRequirement, maxExpInjected);
+  const { block: expCtx, ids: injectedExpIds } = await orch.experienceStore.getContextBlockWithIds('architecture-design', orch._currentRequirement, maxExpInjected);
   console.log(`[Orchestrator] 📚 Experience context injected for ArchitectAgent (${expCtx.length} chars, ${injectedExpIds.length} experience(s), limit=${maxExpInjected})`);
 
   const complaints = orch.complaintWall.getOpenComplaintsFor(ComplaintTarget.SKILL, 'architecture-design');
@@ -156,7 +157,7 @@ function buildArchitectContextBlock(orch, techStackPrefix, upstreamCtx) {
  * @param {string} upstreamCtx
  * @returns {string}
  */
-function buildDeveloperContextBlock(orch, upstreamCtx) {
+async function buildDeveloperContextBlock(orch, upstreamCtx) {
   const agentsMd = orch._agentsMdContent || '';
   if (agentsMd) console.log(`[Orchestrator] 📋 AGENTS.md injected into DeveloperAgent context.`);
 
@@ -166,7 +167,7 @@ function buildDeveloperContextBlock(orch, upstreamCtx) {
   // EvoMap fix: use getContextBlockWithIds() to enable feedback-loop marking.
   // Improvement 4: pass maxExpInjected from adaptive strategy.
   const devMaxExpInjected = orch._adaptiveStrategy?.maxExpInjected ?? 5;
-  const { block: expCtx, ids: injectedExpIds } = orch.experienceStore.getContextBlockWithIds('code-development', orch._currentRequirement, devMaxExpInjected);
+  const { block: expCtx, ids: injectedExpIds } = await orch.experienceStore.getContextBlockWithIds('code-development', orch._currentRequirement, devMaxExpInjected);
   console.log(`[Orchestrator] 📚 Experience context injected for DeveloperAgent (${expCtx.length} chars, ${injectedExpIds.length} experience(s), limit=${devMaxExpInjected})`);
 
   // Code graph context: query symbols from architecture.md
@@ -227,7 +228,7 @@ function buildDeveloperContextBlock(orch, upstreamCtx) {
  * @param {object|null} tcExecutionReport
  * @returns {string}
  */
-function buildTesterContextBlock(orch, upstreamCtx, tcExecutionReport) {
+async function buildTesterContextBlock(orch, upstreamCtx, tcExecutionReport) {
   const agentsMd = orch._agentsMdContent || '';
   if (agentsMd) console.log(`[Orchestrator] 📋 AGENTS.md injected into TesterAgent context.`);
 
@@ -237,7 +238,7 @@ function buildTesterContextBlock(orch, upstreamCtx, tcExecutionReport) {
   // EvoMap fix: use getContextBlockWithIds() to enable feedback-loop marking.
   // Improvement 4: pass maxExpInjected from adaptive strategy.
   const testMaxExpInjected = orch._adaptiveStrategy?.maxExpInjected ?? 5;
-  const { block: expCtx, ids: injectedExpIds } = orch.experienceStore.getContextBlockWithIds('test-report', orch._currentRequirement, testMaxExpInjected);
+  const { block: expCtx, ids: injectedExpIds } = await orch.experienceStore.getContextBlockWithIds('test-report', orch._currentRequirement, testMaxExpInjected);
   console.log(`[Orchestrator] 📚 Experience context injected for TesterAgent (${expCtx.length} chars, ${injectedExpIds.length} experience(s), limit=${testMaxExpInjected})`);
 
   const complaints = orch.complaintWall.getOpenComplaintsFor(ComplaintTarget.SKILL, 'test-report');
@@ -350,8 +351,8 @@ function storeAnalyseContext(orch, outputPath, clarResult) {
   // than silently skipping context storage (which would cause downstream agents
   // to see empty upstream context and produce lower-quality output).
   if (!orch.stageCtx) throw new Error('[storeAnalyseContext] orch.stageCtx is null – StageContextStore was not initialised.');
-  const ctx = StageContextStore.extractFromFile(outputPath, 'ANALYSE');
-  orch.stageCtx.set('ANALYSE', {
+  const ctx = StageContextStore.extractFromFile(outputPath, WorkflowState.ANALYSE);
+  orch.stageCtx.set(WorkflowState.ANALYSE, {
     summary:      ctx.summary,
     keyDecisions: ctx.keyDecisions,
     artifacts:    [outputPath],
@@ -378,7 +379,7 @@ function storeAnalyseContext(orch, outputPath, clarResult) {
 function storeArchitectContext(orch, outputPath, archReviewResult, coverageResult) {
   // P2-B fix: unified null guard (see storeAnalyseContext).
   if (!orch.stageCtx) throw new Error('[storeArchitectContext] orch.stageCtx is null – StageContextStore was not initialised.');
-  const ctx = StageContextStore.extractFromFile(outputPath, 'ARCHITECT');
+  const ctx = StageContextStore.extractFromFile(outputPath, WorkflowState.ARCHITECT);
 
   // Defect E fix: extract structured correction history from archReviewResult.history.
   // archReviewResult.history is populated by ArchitectureReviewAgent.review() and has
@@ -388,7 +389,7 @@ function storeArchitectContext(orch, outputPath, archReviewResult, coverageResul
   // preventing them from re-introducing already-fixed issues during implementation.
   const correctionHistory = _extractCorrectionHistory(archReviewResult.history);
 
-  orch.stageCtx.set('ARCHITECT', {
+  orch.stageCtx.set(WorkflowState.ARCHITECT, {
     summary:           ctx.summary,
     keyDecisions:      ctx.keyDecisions,
     artifacts:         [outputPath],
@@ -416,7 +417,7 @@ function storeArchitectContext(orch, outputPath, archReviewResult, coverageResul
 function storeCodeContext(orch, outputPath, reviewResult) {
   // P2-B fix: unified null guard (see storeAnalyseContext).
   if (!orch.stageCtx) throw new Error('[storeCodeContext] orch.stageCtx is null – StageContextStore was not initialised.');
-  const ctx = StageContextStore.extractFromFile(outputPath, 'CODE');
+  const ctx = StageContextStore.extractFromFile(outputPath, WorkflowState.CODE);
 
   // Defect E fix: extract structured correction history from reviewResult.history.
   // reviewResult.history is populated by CodeReviewAgent.review() and has the same
@@ -424,7 +425,7 @@ function storeCodeContext(orch, outputPath, reviewResult) {
   // what code issues were corrected, so it can focus test coverage on corrected areas.
   const correctionHistory = _extractCorrectionHistory(reviewResult.history);
 
-  orch.stageCtx.set('CODE', {
+  orch.stageCtx.set(WorkflowState.CODE, {
     summary:           ctx.summary,
     keyDecisions:      ctx.keyDecisions,
     artifacts:         [outputPath],
@@ -458,14 +459,14 @@ function storeTestContext(orch, outputPath, tcGenResult, tcExecutionReport, corr
   // stageCtx was non-null and would throw TypeError. Now all four are consistent:
   // null stageCtx is a bug that should surface immediately.
   if (!orch.stageCtx) throw new Error('[storeTestContext] orch.stageCtx is null – StageContextStore was not initialised.');
-  const ctx = StageContextStore.extractFromFile(outputPath, 'TEST');
+  const ctx = StageContextStore.extractFromFile(outputPath, WorkflowState.TEST);
   const pendingMeta = orch._pendingTestMeta || {};
 
   // Defect E fix: extract correction history from SelfCorrectionEngine result.
   // corrResult.history has shape: [{ round, signals, before, after, source? }].
   const correctionHistory = _extractCorrectionHistory(corrResult?.history || []);
 
-  orch.stageCtx.set('TEST', {
+  orch.stageCtx.set(WorkflowState.TEST, {
     summary:           ctx.summary,
     keyDecisions:      ctx.keyDecisions,
     artifacts:         [outputPath],

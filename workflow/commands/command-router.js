@@ -576,20 +576,37 @@ registerCommand(
 
 registerCommand(
   'experience-search',
-  'Search experiences: --keyword <text> [--category <cat>] [--skill <name>] [--type positive|negative]',
+  'Search experiences: --keyword <text> [--category <cat>] [--skill <name>] [--type positive|negative] [--expand]',
   async (args, context) => {
     if (!context.orchestrator) return `[Error] No orchestrator in context.`;
     const kwMatch  = args.match(/--keyword\s+"([^"]+)"/);
     const catMatch = args.match(/--category\s+(\S+)/);
     const skillMatch = args.match(/--skill\s+(\S+)/);
     const typeMatch  = args.match(/--type\s+(\S+)/);
+    const expandFlag = /--expand/.test(args);
 
     if (!kwMatch && !catMatch && !skillMatch && !typeMatch) {
-      return `Usage: /experience-search --keyword "event system" [--category event_system] [--skill unity-csharp] [--type positive]`;
+      return `Usage: /experience-search --keyword "event system" [--category event_system] [--skill unity-csharp] [--type positive] [--expand]`;
+    }
+
+    // Query Expansion: when --expand flag is set, expand the keyword using
+    // the persistent synonym table (instant) or LLM fallback (1-3s).
+    let searchKeyword = kwMatch ? kwMatch[1] : null;
+    let expandedTerms = null;
+    if (expandFlag && searchKeyword) {
+      const { extractKeywords } = require('../core/experience-store');
+      const baseKeywords = extractKeywords(searchKeyword, 10);
+      if (baseKeywords.length > 0) {
+        const expanded = await context.orchestrator.experienceStore._expandKeywordsWithLlm(
+          baseKeywords, skillMatch ? skillMatch[1] : null
+        );
+        expandedTerms = expanded.filter(t => !baseKeywords.includes(t));
+        searchKeyword = expanded.join(' ');
+      }
     }
 
     const results = context.orchestrator.experienceStore.search({
-      keyword:  kwMatch  ? kwMatch[1]  : null,
+      keyword:  searchKeyword,
       category: catMatch ? catMatch[1] : null,
       skill:    skillMatch ? skillMatch[1] : null,
       type:     typeMatch  ? typeMatch[1]  : null,
@@ -597,9 +614,17 @@ registerCommand(
       scoreSort: true,
     });
 
-    if (results.length === 0) return `No experiences found for your query.`;
+    if (results.length === 0) {
+      const expandInfo = expandedTerms && expandedTerms.length > 0
+        ? `\n🧠 Expanded terms: ${expandedTerms.join(', ')}`
+        : '';
+      return `No experiences found for your query.${expandInfo}`;
+    }
 
     const lines = [`## Search Results (${results.length} found)\n`];
+    if (expandedTerms && expandedTerms.length > 0) {
+      lines.push(`🧠 **Query Expansion**: +${expandedTerms.length} terms: [${expandedTerms.join(', ')}]\n`);
+    }
     for (const e of results) {
       const icon = e.type === 'positive' ? '✅' : '❌';
       lines.push(`${icon} **[${e.category}]** ${e.title}`);
@@ -608,6 +633,79 @@ registerCommand(
       lines.push('');
     }
     return lines.join('\n');
+  }
+);
+
+
+registerCommand(
+  'experience-synonyms',
+  'Manage synonym table: --stats | --import <path> | --list [--top N] | --clear',
+  async (args, context) => {
+    if (!context.orchestrator) return `[Error] No orchestrator in context.`;
+    const store = context.orchestrator.experienceStore;
+
+    // --stats: show synonym table statistics
+    if (/--stats/.test(args)) {
+      const stats = store.getSynonymStats();
+      const lines = [
+        `## 📖 Synonym Table Statistics\n`,
+        `| Metric | Value |`,
+        `|--------|-------|`,
+        `| Total Entries | ${stats.entryCount} |`,
+        `| Total Hits | ${stats.totalHits} |`,
+        `| Cold Start % | ${stats.coldStartPct}% (entries never reused) |`,
+        ``,
+      ];
+      if (stats.topEntries.length > 0) {
+        lines.push(`### Top ${stats.topEntries.length} Most-Used Expansions\n`);
+        for (const e of stats.topEntries) {
+          lines.push(`- **[${e.keywords.join(', ')}]** → [${e.expandedTerms.join(', ')}] (${e.hitCount} hits, skill: ${e.skill || 'any'})`);
+        }
+      }
+      return lines.join('\n');
+    }
+
+    // --import <path>: import synonym table from another project
+    const importMatch = args.match(/--import\s+(\S+)/);
+    if (importMatch) {
+      const fs = require('fs');
+      const importPath = importMatch[1];
+      try {
+        if (!fs.existsSync(importPath)) {
+          return `[Error] File not found: ${importPath}`;
+        }
+        const externalTable = JSON.parse(fs.readFileSync(importPath, 'utf-8'));
+        const result = store.importSynonymTable(externalTable);
+        return `✅ Synonym table import complete: ${result.imported} imported, ${result.skipped} skipped, ${result.total} total entries.`;
+      } catch (err) {
+        return `[Error] Failed to import synonym table: ${err.message}`;
+      }
+    }
+
+    // --list [--top N]: list synonym entries
+    const topMatch = args.match(/--top\s+(\d+)/);
+    const topN = topMatch ? parseInt(topMatch[1], 10) : 20;
+    if (/--list/.test(args)) {
+      const entries = Object.entries(store._synonymTable);
+      if (entries.length === 0) return `Synonym table is empty. Run workflows to auto-populate it.`;
+      const sorted = entries.sort((a, b) => (b[1].hitCount || 0) - (a[1].hitCount || 0)).slice(0, topN);
+      const lines = [`## 📖 Synonym Table (top ${topN} of ${entries.length})\n`];
+      for (const [key, val] of sorted) {
+        const keywords = key.split('|');
+        lines.push(`- **[${keywords.join(', ')}]** → [${val.expandedTerms.join(', ')}] (${val.hitCount || 0} hits)`);
+      }
+      return lines.join('\n');
+    }
+
+    // --clear: clear synonym table
+    if (/--clear/.test(args)) {
+      store._synonymTable = {};
+      store._synonymTableDirty = true;
+      store._saveSynonymTable();
+      return `✅ Synonym table cleared.`;
+    }
+
+    return `Usage: /experience-synonyms --stats | --import <path> | --list [--top N] | --clear`;
   }
 );
 

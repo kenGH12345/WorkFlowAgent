@@ -126,6 +126,33 @@ function _getRiskLevel(tokens) {
   return 'critical';
 }
 
+// ─── Cached ContextLoader instance (D1 optimisation) ─────────────────────────
+// buildAgentPrompt() is called once per LLM invocation. Previously, each call
+// created a brand-new ContextLoader, which meant scanning skill files from disk
+// every time. Now we cache the loader and only recreate it when options change.
+let _cachedLoader = null;
+let _cachedLoaderKey = '';
+
+/**
+ * Returns a (possibly cached) ContextLoader instance.
+ * Recreates only if the options fingerprint changes.
+ * @private
+ */
+function _getOrCreateLoader(options) {
+  const key = JSON.stringify([
+    options.workflowRoot,
+    options.projectRoot,
+    Object.keys(options.skillKeywords || {}),
+    options.alwaysLoadSkills,
+  ]);
+  if (_cachedLoader && _cachedLoaderKey === key) {
+    return _cachedLoader;
+  }
+  _cachedLoader = new ContextLoader(options);
+  _cachedLoaderKey = key;
+  return _cachedLoader;
+}
+
 // ─── Agent Prompt Templates ───────────────────────────────────────────────────
 
 /**
@@ -388,13 +415,15 @@ function buildAgentPrompt(role, dynamicInput, contextFiles = [], options = {}) {
   // This is the fix for "Agent won't read skills/ or decision-log.md unless prompted".
   // ContextLoader matches task keywords → relevant skill files + ADR entries,
   // then injects them into the dynamic suffix automatically.
+  // D1 optimisation: uses _getOrCreateLoader() to cache the ContextLoader instance
+  // across multiple buildAgentPrompt() calls, avoiding redundant disk I/O.
   const loaderOptions = {
     workflowRoot:     require('../core/constants').WORKFLOW_ROOT,
     projectRoot:      options && options.projectRoot ? options.projectRoot : null,
     skillKeywords:    options && options.skillKeywords ? options.skillKeywords : {},
     alwaysLoadSkills: options && options.alwaysLoadSkills ? options.alwaysLoadSkills : [],
   };
-  const loader = new ContextLoader(loaderOptions);
+  const loader = _getOrCreateLoader(loaderOptions);
   const { sections: autoSections } = loader.resolve(dynamicInput, role);
 
   // Load additional context files into the dynamic suffix
@@ -407,12 +436,67 @@ function buildAgentPrompt(role, dynamicInput, contextFiles = [], options = {}) {
   }
 
   // Build dynamic suffix: auto-injected context first, then explicit context, then input
-  const dynamicSuffix = [...autoSections, ...contextSections, `### Input\n${dynamicInput}`].join('\n\n');
-  const result = buildKVCacheFriendlyPrompt(fixedPrefix, dynamicSuffix);
+  let dynamicSuffix = [...autoSections, ...contextSections, `### Input\n${dynamicInput}`].join('\n\n');
+  let result = buildKVCacheFriendlyPrompt(fixedPrefix, dynamicSuffix);
 
-  // Run noise analysis
+  // Run noise analysis with automatic degradation strategy (D5 optimisation).
+  // When the total prompt exceeds the hallucination risk threshold, automatically
+  // drop the lowest-priority context sections (auto-injected skills/ADRs first,
+  // then explicit context files) until we're back under budget.
+  // This prevents the "warn but do nothing" anti-pattern where the system logs a
+  // ⚠️ warning but still sends an oversized prompt, leading to hallucination.
   const noiseAnalysis = analysePromptNoise(result.prompt);
-  result.meta.noiseAnalysis = noiseAnalysis;
+  if (noiseAnalysis.isHighRisk && (autoSections.length > 0 || contextSections.length > 0)) {
+    // Strategy: progressively drop sections from lowest to highest priority.
+    // Priority order (highest → lowest):
+    //   1. ### Input (NEVER drop – this is the actual task)
+    //   2. Explicit context files (high priority – caller explicitly requested these)
+    //   3. Auto-injected skills/ADRs (lowest – these are supplementary)
+    const degradedAutoSections = [];
+    const inputSection = `### Input\n${dynamicInput}`;
+
+    // Phase 1: try dropping all auto-injected sections
+    let degradedSuffix = [...contextSections, inputSection].join('\n\n');
+    let degradedResult = buildKVCacheFriendlyPrompt(fixedPrefix, degradedSuffix);
+    let degradedNoise = analysePromptNoise(degradedResult.prompt);
+
+    if (!degradedNoise.isHighRisk) {
+      // Dropping auto-sections was sufficient. Now try to add back as many as fit.
+      let restoredBudget = LLM.HALLUCINATION_RISK_THRESHOLD - degradedNoise.estimatedTokens;
+      for (const section of autoSections) {
+        const sectionTokens = estimateTokens(section);
+        if (sectionTokens <= restoredBudget) {
+          degradedAutoSections.push(section);
+          restoredBudget -= sectionTokens;
+        }
+      }
+      const droppedCount = autoSections.length - degradedAutoSections.length;
+      if (droppedCount > 0) {
+        console.log(`[PromptBuilder] 🔽 Context degradation: dropped ${droppedCount}/${autoSections.length} auto-injected section(s) to stay under hallucination threshold.`);
+      }
+      dynamicSuffix = [...degradedAutoSections, ...contextSections, inputSection].join('\n\n');
+      result = buildKVCacheFriendlyPrompt(fixedPrefix, dynamicSuffix);
+    } else {
+      // Phase 2: still over budget even without auto-sections.
+      // Drop explicit context files from the end (least relevant first).
+      const keptContextSections = [];
+      let contextBudget = LLM.HALLUCINATION_RISK_THRESHOLD - estimateTokens(fixedPrefix) - estimateTokens(inputSection) - 200; // 200 token safety margin
+      for (const section of contextSections) {
+        const sectionTokens = estimateTokens(section);
+        if (sectionTokens <= contextBudget) {
+          keptContextSections.push(section);
+          contextBudget -= sectionTokens;
+        }
+      }
+      const droppedContext = contextSections.length - keptContextSections.length;
+      console.log(`[PromptBuilder] 🔽 Context degradation (phase 2): dropped all auto-injected sections + ${droppedContext}/${contextSections.length} context file(s).`);
+      dynamicSuffix = [...keptContextSections, inputSection].join('\n\n');
+      result = buildKVCacheFriendlyPrompt(fixedPrefix, dynamicSuffix);
+    }
+    result.meta.contextDegraded = true;
+  }
+
+  result.meta.noiseAnalysis = analysePromptNoise(result.prompt);
   result.meta.agentRole = role;
 
   return result;

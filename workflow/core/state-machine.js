@@ -19,12 +19,25 @@ class StateMachine {
   /**
    * @param {string} projectId - Unique identifier for this workflow run
    * @param {Function} hookEmitter - async (event: string, payload: object) => void
+   * @param {object} [opts]
+   * @param {string[]} [opts.stateOrder] - P1-b: Custom state order. Defaults to the
+   *   built-in STATE_ORDER (INIT → ANALYSE → ARCHITECT → CODE → TEST → FINISHED).
+   *   When custom stages are registered via StageRegistry, pass
+   *   buildStateOrder(stageRegistry.getOrder()) to include them in transition validation.
    */
-  constructor(projectId, hookEmitter = async () => {}) {
+  constructor(projectId, hookEmitter = async () => {}, opts = {}) {
     this.projectId = projectId;
     this.hookEmitter = hookEmitter;
     this.manifest = null;
+    // P1-b: use custom state order if provided, otherwise use the default
+    this._stateOrder = opts.stateOrder || STATE_ORDER;
+    // P2-b: instance-level manifest path. When provided, the StateMachine
+    // reads/writes manifest.json from this path instead of the global PATHS.MANIFEST.
+    // This enables multiple Orchestrator instances to run in parallel without
+    this._manifestPath = opts.manifestPath || PATHS.MANIFEST;
   }
+
+  // ─── Initialisation  }
 
   // ─── Initialisation ──────────────────────────────────────────────────────────
 
@@ -34,9 +47,26 @@ class StateMachine {
    * Otherwise creates a fresh manifest and starts from INIT.
    */
   async init() {
-    if (fs.existsSync(PATHS.MANIFEST)) {
+    if (fs.existsSync(this._manifestPath)) {
       this.manifest = this._readManifest();
-      console.log(`[StateMachine] Resuming from state: ${this.manifest.currentState}`);
+      // Validate that the restored currentState is a legitimate state in _stateOrder.
+      // If the manifest is corrupted (e.g. currentState is undefined/null/invalid),
+      // reset to INIT and start fresh rather than propagating a bad state that will
+      // cause "Cannot transition: already in terminal state undefined" downstream.
+      const restoredState = this.manifest.currentState;
+      if (!restoredState || !this._stateOrder.includes(restoredState)) {
+        console.warn(`[StateMachine] ⚠️  Invalid currentState "${restoredState}" in manifest. Resetting to ${WorkflowState.INIT}.`);
+        this.manifest.currentState = WorkflowState.INIT;
+        this._writeManifest();
+      } else if (restoredState === WorkflowState.FINISHED) {
+        // Previous run completed successfully. Reset to INIT for a fresh run
+        // instead of resuming from FINISHED (which would immediately fail on transition).
+        console.log(`[StateMachine] Previous run completed (FINISHED). Resetting to ${WorkflowState.INIT} for new run.`);
+        this.manifest = createManifest(this.projectId);
+        this._writeManifest();
+      } else {
+        console.log(`[StateMachine] Resuming from state: ${this.manifest.currentState}`);
+      }
     } else {
       this.manifest = createManifest(this.projectId);
       this._writeManifest();
@@ -61,18 +91,18 @@ class StateMachine {
    * Returns the next state after the current one, or null if already FINISHED.
    */
   getNextState() {
-    const idx = STATE_ORDER.indexOf(this.getState());
-    if (idx === -1 || idx === STATE_ORDER.length - 1) return null;
-    return STATE_ORDER[idx + 1];
+    const idx = this._stateOrder.indexOf(this.getState());
+    if (idx === -1 || idx === this._stateOrder.length - 1) return null;
+    return this._stateOrder[idx + 1];
   }
 
   /**
    * Returns the previous state before the current one, or null if already at INIT.
    */
   getPreviousState() {
-    const idx = STATE_ORDER.indexOf(this.getState());
+    const idx = this._stateOrder.indexOf(this.getState());
     if (idx <= 0) return null;
-    return STATE_ORDER[idx - 1];
+    return this._stateOrder[idx - 1];
   }
   // ─── Transition ───────────────────────────────────────────────────────────────
 
@@ -165,8 +195,8 @@ class StateMachine {
    * @throws {Error} If targetState is not a valid WorkflowState
    */
   async jumpTo(targetState, reason = '') {
-    if (!STATE_ORDER.includes(targetState)) {
-      throw new Error(`[StateMachine] Invalid target state: "${targetState}". Valid states: ${STATE_ORDER.join(', ')}`);
+    if (!this._stateOrder.includes(targetState)) {
+      throw new Error(`[StateMachine] Invalid target state: "${targetState}". Valid states: ${this._stateOrder.join(', ')}`);
     }
 
     const fromState = this.getState();
@@ -175,7 +205,7 @@ class StateMachine {
       return targetState;
     }
 
-    const direction = STATE_ORDER.indexOf(targetState) < STATE_ORDER.indexOf(fromState) ? '⏪' : '⏩';
+    const direction = this._stateOrder.indexOf(targetState) < this._stateOrder.indexOf(fromState) ? '⏪' : '⏩';
     console.warn(`[StateMachine] ${direction} Jump: ${fromState} → ${targetState}${reason ? ` (reason: ${reason})` : ''}`);
 
     await this.hookEmitter(HOOK_EVENTS.BEFORE_STATE_TRANSITION, { fromState, toState: targetState, jump: true, reason });
@@ -321,6 +351,25 @@ class StateMachine {
     return this.manifest ? (this.manifest.risks || []) : [];
   }
 
+  /**
+   * P1-b: Updates the state order at runtime. Used when custom stages are registered
+   * after construction (via Orchestrator.registerStage()).
+   *
+   * @param {string[]} newStateOrder - Full state order including INIT and FINISHED
+   */
+  setStateOrder(newStateOrder) {
+    this._stateOrder = newStateOrder;
+  }
+
+  /**
+   * P1-b: Returns the current state order.
+   *
+   * @returns {string[]}
+   */
+  getStateOrder() {
+    return [...this._stateOrder];
+  }
+
   // ─── Artifact Helpers ─────────────────────────────────────────────────────────
 
   /** Returns the artifacts map from the current manifest */
@@ -331,20 +380,20 @@ class StateMachine {
   // ─── Private Helpers ──────────────────────────────────────────────────────────
 
   _readManifest() {
-    const raw = fs.readFileSync(PATHS.MANIFEST, 'utf-8');
+    const raw = fs.readFileSync(this._manifestPath, 'utf-8');
     return JSON.parse(raw);
   }
 
   _writeManifest() {
     // Ensure output directory exists
-    const dir = path.dirname(PATHS.MANIFEST);
+    const dir = path.dirname(this._manifestPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     // N33 fix: atomic write – write to a temp file first, then rename.
     // If the process crashes mid-write, the original manifest.json is untouched
     // and the next resume will still find a valid JSON file.
-    const tmpPath = PATHS.MANIFEST + '.tmp';
+    const tmpPath = this._manifestPath + '.tmp';
     fs.writeFileSync(tmpPath, JSON.stringify(this.manifest, null, 2), 'utf-8');
-    fs.renameSync(tmpPath, PATHS.MANIFEST);
+    fs.renameSync(tmpPath, this._manifestPath);
   }
 
   /**

@@ -138,7 +138,11 @@ class StageContextStore {
    * Intended for injection into downstream Agent prompts.
    *
    * @param {string[]} [excludeStages]    - Stage names to exclude (e.g. current stage)
-   * @param {number}   [maxChars=2000]    - Total character budget for the output
+   * @param {number}   [maxChars=2000]    - Total CHARACTER budget for the output.
+   *   ⚠️  Note: this is measured in characters, not tokens. For English text, divide
+   *   by ~4 to get approximate token count. For CJK text, divide by ~2.
+   *   Callers should set this value considering the token budget they want to allocate:
+   *   e.g. for a 500-token budget, pass maxChars=2000 (English) or maxChars=1000 (Chinese).
    * @param {string[]} [priorityStages]   - Stages to render first (most relevant to current stage).
    *   If provided, these stages are rendered before others, ensuring the most relevant
    *   upstream context is never truncated by the token budget.
@@ -532,18 +536,25 @@ module.exports = { StageContextStore };
 
 // ─── Module-level helpers (Defect D fix) ──────────────────────────────────────
 
+const { WorkflowState } = require('./types');
+
 /**
  * Defect D fix: Computes proximity between two stages in the pipeline.
  * Returns a normalised score [0, 1] where 1 = immediate upstream, 0 = distant.
  *
- * Stage order: ANALYSE(0) → ARCHITECT(1) → CODE(2) → TEST(3)
+ * P2-a: Uses WorkflowState enum instead of string literals.
  *
  * @param {string} sourceStageName  - The upstream stage
  * @param {string} targetStageName  - The current stage
  * @returns {number} 0-1 proximity score
  */
 function _stageProximity(sourceStageName, targetStageName) {
-  const ORDER = { ANALYSE: 0, ARCHITECT: 1, CODE: 2, TEST: 3 };
+  const ORDER = {
+    [WorkflowState.ANALYSE]: 0,
+    [WorkflowState.ARCHITECT]: 1,
+    [WorkflowState.CODE]: 2,
+    [WorkflowState.TEST]: 3,
+  };
   const srcIdx = ORDER[sourceStageName];
   const tgtIdx = ORDER[targetStageName];
 
@@ -559,12 +570,33 @@ function _stageProximity(sourceStageName, targetStageName) {
 
 /**
  * Defect D fix: Extracts meaningful keywords from free-text for relevance matching.
- * Filters out stop words and very short tokens to improve matching quality.
+ * D4 optimisation: delegates to the shared extractKeywords from experience-store.js
+ * which has a more refined stopword list and a technical short-word whitelist
+ * (API, JWT, SQL, etc.). This eliminates the duplicate keyword extraction logic
+ * that previously existed in both StageContextStore and ExperienceStore.
+ *
+ * Falls back to a local implementation if experience-store is not available
+ * (e.g. in unit tests that only import stage-context-store.js).
  *
  * @param {string} text
  * @returns {string[]} Lowercase keywords
  */
 function _extractKeywords(text) {
+  try {
+    const { extractKeywords } = require('./experience-store');
+    return extractKeywords(text, 30);
+  } catch {
+    // Fallback: local extraction (for isolated testing or circular dependency edge cases)
+    return _extractKeywordsFallback(text);
+  }
+}
+
+/**
+ * Fallback keyword extraction used when experience-store is not available.
+ * @param {string} text
+ * @returns {string[]}
+ */
+function _extractKeywordsFallback(text) {
   const STOP_WORDS = new Set([
     'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
     'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
@@ -576,7 +608,6 @@ function _extractKeywords(text) {
     'all', 'each', 'every', 'both', 'few', 'more', 'most', 'some', 'any',
     'after', 'before', 'during', 'about', 'above', 'below', 'between',
     'through', 'under', 'over', 'again', 'further', 'then', 'once',
-    // Chinese stop words
     '的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一', '一个',
     '上', '也', '很', '到', '说', '要', '去', '你', '会', '着', '没有', '看', '好',
   ]);
@@ -586,5 +617,5 @@ function _extractKeywords(text) {
     .replace(/[^a-z0-9\u4e00-\u9fff]+/g, ' ')
     .split(/\s+/)
     .filter(w => w.length >= 3 && !STOP_WORDS.has(w))
-    .slice(0, 30); // Limit to 30 keywords to prevent O(n²) blowup
+    .slice(0, 30);
 }

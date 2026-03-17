@@ -691,13 +691,25 @@ class GitIntegration {
    */
   generateBranchName(title, type = 'feat') {
     const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const slug = title
+
+    // Build slug: keep alphanumeric, CJK characters, hyphens, and spaces.
+    // CJK Unified Ideographs range: \u4e00-\u9fff (Chinese/Japanese/Korean)
+    // This ensures Chinese requirement titles produce meaningful branch names
+    // instead of empty slugs (which would cause git checkout -b failures).
+    let slug = title
       .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/[^a-z0-9\u4e00-\u9fff\s-]/g, '')
       .trim()
       .replace(/\s+/g, '-')
       .slice(0, 40)
       .replace(/-+$/, '');
+
+    // Fallback: if slug is empty after sanitization (shouldn't happen now with CJK
+    // support, but guard against edge cases like emoji-only titles)
+    if (!slug) {
+      slug = `workflow-${Date.now().toString(36)}`;
+    }
+
     return `${type}/${date}-${slug}`;
   }
 

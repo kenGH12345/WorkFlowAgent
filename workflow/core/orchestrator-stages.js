@@ -3,7 +3,7 @@
 const fs   = require('fs');
 const path = require('path');
 const { PATHS, HOOK_EVENTS } = require('./constants');
-const { AgentRole } = require('./types');
+const { AgentRole, WorkflowState } = require('./types');
 const { ExperienceType, ExperienceCategory } = require('./experience-store');
 const { ComplaintTarget } = require('./complaint-wall');  // still used in orchestrator-stage-helpers.js
 const { SelfCorrectionEngine, formatClarificationReport } = require('./clarification-engine');
@@ -186,7 +186,7 @@ async function _runArchitect() {
   }
 
   // P2-NEW-1: delegated to buildArchitectContextBlock helper
-  const archExpContextWithComplaints = buildArchitectContextBlock(this, techStackPrefix, upstreamCtxForArch);
+  const archExpContextWithComplaints = await buildArchitectContextBlock(this, techStackPrefix, upstreamCtxForArch);
   // Improvement 4: report injection count to Observability for hit-rate tracking
   this.obs.recordExpUsage({ injected: (archExpContextWithComplaints._injectedExpIds || []).length });
 
@@ -231,8 +231,8 @@ async function _runArchitect() {
   // If ArchReview fails quality gate but CoverageCheck succeeded, the next retry
   // can skip re-running CoverageCheck and reuse the cached result.
   const subtaskCoordinator = new RollbackCoordinator(this);
-  subtaskCoordinator.cacheSubtaskResult('ARCHITECT', 'CoverageCheck', coverageResult);
-  subtaskCoordinator.cacheSubtaskResult('ARCHITECT', 'ArchReview', archReviewResult);
+subtaskCoordinator.cacheSubtaskResult(WorkflowState.ARCHITECT, 'CoverageCheck', coverageResult);
+  subtaskCoordinator.cacheSubtaskResult(WorkflowState.ARCHITECT, 'ArchReview', archReviewResult);
 
   // Append coverage report to architecture doc AFTER both tasks complete
   // (ArchitectureReviewAgent has already finished reading outputPath at this point)
@@ -338,10 +338,10 @@ async function _runArchitect() {
 
   // ── Quality gate decision (P0-A: extracted to QualityGate) ───────────────
   const archGate = new QualityGate({ experienceStore: this.experienceStore, maxRollbacks: 1 });
-  const archCtxMeta = this.stageCtx?.get('ARCHITECT')?.meta || {};
+const archCtxMeta = this.stageCtx?.get(WorkflowState.ARCHITECT)?.meta || {};
   const rollbackCount = archCtxMeta._archRollbackCount || 0;
-  const archDecision = archGate.evaluate(archReviewResult, 'ARCHITECT', rollbackCount);
-  archGate.recordExperience(archDecision, 'ARCHITECT', archReviewResult, {
+const archDecision = archGate.evaluate(archReviewResult, WorkflowState.ARCHITECT, rollbackCount);
+    archGate.recordExperience(archDecision, WorkflowState.ARCHITECT, archReviewResult, {
     skill: 'architecture-design',
     category: ExperienceCategory.ARCHITECTURE,
   });
@@ -352,8 +352,8 @@ async function _runArchitect() {
 
     // Update rollback counter in stageCtx.meta. see CHANGELOG: Defect #1, P2-2
     if (this.stageCtx) {
-      const existing = this.stageCtx.get('ARCHITECT') || {};
-      this.stageCtx.set('ARCHITECT', {
+const existing = this.stageCtx.get(WorkflowState.ARCHITECT) || {};
+          this.stageCtx.set(WorkflowState.ARCHITECT, {
         ...existing,
         meta: { ...(existing.meta || {}), _archRollbackCount: rollbackCount + 1 },
       });
@@ -364,7 +364,7 @@ async function _runArchitect() {
       // we can retry just the review instead of re-running the entire ANALYSE stage.
       const coordinator = new RollbackCoordinator(this);
       const strategy = coordinator.analyseRollbackStrategy(
-        'ARCHITECT', `Architecture review failed: ${failedNotes}`, 'ArchReview'
+WorkflowState.ARCHITECT, `Architecture review failed: ${failedNotes}`, 'ArchReview'
       );
 
       if (strategy.type === 'SUBTASK_RETRY' && strategy.cachedResults) {
@@ -392,17 +392,17 @@ async function _runArchitect() {
         // Use cached CoverageCheck result from the first run
         const cachedCoverage = strategy.cachedResults.get('CoverageCheck');
         const retryGate = new QualityGate({ experienceStore: this.experienceStore, maxRollbacks: 1 });
-        const retryDecision = retryGate.evaluate(retryReviewResult, 'ARCHITECT', rollbackCount + 1);
+        const retryDecision = retryGate.evaluate(retryReviewResult, WorkflowState.ARCHITECT, rollbackCount + 1);
 
         if (retryDecision.pass) {
           console.log(`[Orchestrator] ✅ Subtask-level retry succeeded: ArchReview passed on retry.`);
           // Update subtask cache with new result
-          coordinator.cacheSubtaskResult('ARCHITECT', 'ArchReview', retryReviewResult);
+          coordinator.cacheSubtaskResult(WorkflowState.ARCHITECT, 'ArchReview', retryReviewResult);
 
           // Store updated ARCHITECT context with retry info
           if (this.stageCtx) {
-            const existingArch = this.stageCtx.get('ARCHITECT') || {};
-            this.stageCtx.set('ARCHITECT', {
+            const existingArch = this.stageCtx.get(WorkflowState.ARCHITECT) || {};
+            this.stageCtx.set(WorkflowState.ARCHITECT, {
               ...existingArch,
               summary: `Architecture review passed on subtask retry (attempt ${rollbackCount + 1}). Original issues: ${failedNotes.slice(0, 150)}`,
               keyDecisions: [`ArchReview subtask retry succeeded after ${retryReviewResult.rounds ?? 0} round(s)`],
@@ -429,20 +429,20 @@ async function _runArchitect() {
 
         // Subtask retry didn't help → fall through to full-stage rollback
         console.log(`[Orchestrator] ⚠️  Subtask-level retry failed. Falling through to full-stage rollback.`);
-        coordinator.invalidateSubtaskCache('ARCHITECT');
+        coordinator.invalidateSubtaskCache(WorkflowState.ARCHITECT);
       }
 
       // ── Full-stage rollback (original path) ──────────────────────────────────
       // Coordinated rollback (P0-A: RollbackCoordinator handles all cleanup)
-      await coordinator.rollback('ARCHITECT', `Architecture review failed: ${failedNotes.slice(0, 200)}`);
+      await coordinator.rollback(WorkflowState.ARCHITECT, `Architecture review failed: ${failedNotes.slice(0, 200)}`);
 
       const failureContext = `[ARCHITECTURE REVIEW FAILED – RETRY ${rollbackCount + 1}]\n\nThe previous architecture attempt failed review with these issues:\n${failedNotes}\n\nPlease re-analyse the requirements with these constraints in mind.`;
       const reanalysedPath = await _runAnalyst.call(this, failureContext);
       await this.stateMachine.transition(reanalysedPath, `ANALYSE → ARCHITECT (post-rollback retry ${rollbackCount + 1})`);
       console.log(`[Orchestrator] ✅ State machine advanced to ARCHITECT after post-rollback re-analysis.`);
       if (this.stageCtx) {
-        const existingArch = this.stageCtx.get('ARCHITECT') || {};
-        this.stageCtx.set('ARCHITECT', {
+        const existingArch = this.stageCtx.get(WorkflowState.ARCHITECT) || {};
+        this.stageCtx.set(WorkflowState.ARCHITECT, {
           ...existingArch,
           summary: `Architecture review failed (retry ${rollbackCount + 1}): ${failedNotes.slice(0, 200)}. Re-analysis triggered.`,
           keyDecisions: [`Rollback to ANALYSE triggered after ${archReviewResult.failed} high-severity issue(s)`],
@@ -488,20 +488,10 @@ async function _runArchitect() {
       // (injected count was already reported in buildArchitectContextBlock call above)
       this.obs.recordExpUsage({ hits: archMatchedCount });
       console.log(`[Orchestrator] 🎯 Experience hit-rate (ARCHITECT): ${archMatchedCount}/${archInjectedIds.length} matched`);
-      for (const expId of archEvolutionTriggers) {
-        const triggerExp = this.experienceStore.experiences.find(e => e.id === expId);
-        if (triggerExp && triggerExp.skill) {
-          this.skillEvolution.evolve(triggerExp.skill, {
-            section: 'Best Practices',
-            title: triggerExp.title,
-            content: triggerExp.content,
-            sourceExpId: expId,
-            reason: `High-frequency pattern (hitCount=${triggerExp.hitCount}) – validated by ARCHITECT stage success`,
-          });
-          await this.hooks.emit(HOOK_EVENTS.SKILL_EVOLVED, { skillName: triggerExp.skill, expId }).catch(() => {});
-        }
-      }
-      console.log(`[Orchestrator] 📊 Marked ${archMatchedCount}/${archInjectedIds.length} experience(s) as effective (ARCHITECT passed). Evolution triggers: ${archEvolutionTriggers.length}`);
+      // P1 fix: centralized evolution trigger via ExperienceStore.triggerEvolutions()
+      // Replaces the 10-line inline loop that was duplicated 4 times across this file.
+      const archEvolved = await this.experienceStore.triggerEvolutions(archEvolutionTriggers, this.skillEvolution, this.hooks, 'ARCHITECT');
+      console.log(`[Orchestrator] 📊 Marked ${archMatchedCount}/${archInjectedIds.length} experience(s) as effective (ARCHITECT passed). Evolution triggers: ${archEvolved}`);
     }
   }
 
@@ -536,7 +526,7 @@ async function _runDeveloper() {
   }
 
   // P2-NEW-1: delegated to buildDeveloperContextBlock helper
-  const devExpContextWithComplaints = buildDeveloperContextBlock(this, upstreamCtxForDev);
+  const devExpContextWithComplaints = await buildDeveloperContextBlock(this, upstreamCtxForDev);
   // Improvement 4: report injection count to Observability for hit-rate tracking
   this.obs.recordExpUsage({ injected: (devExpContextWithComplaints._injectedExpIds || []).length });
 
@@ -558,8 +548,8 @@ async function _runDeveloper() {
   // If CodeReview fails quality gate, the next retry can reuse the CodeGeneration
   // result (the agent's raw output) and only re-run the review, or vice versa.
   const codeSubtaskCoordinator = new RollbackCoordinator(this);
-  codeSubtaskCoordinator.cacheSubtaskResult('CODE', 'CodeGeneration', { outputPath });
-  codeSubtaskCoordinator.cacheSubtaskResult('CODE', 'CodeReview', reviewResult);
+  codeSubtaskCoordinator.cacheSubtaskResult(WorkflowState.CODE, 'CodeGeneration', { outputPath });
+  codeSubtaskCoordinator.cacheSubtaskResult(WorkflowState.CODE, 'CodeReview', reviewResult);
 
   for (const note of reviewResult.riskNotes) {
     const severity = note.includes('(high)') ? 'high' : 'medium';
@@ -571,9 +561,9 @@ async function _runDeveloper() {
   // Previously this was inline if/else logic, which violated DRY and made quality
   // policy impossible to configure uniformly across stages.
   const codeGate = new QualityGate({ experienceStore: this.experienceStore, maxRollbacks: 1 });
-  const codeRollbackCountForGate = this._rollbackCounters?.get('CODE') ?? 0;
-  const codeDecision = codeGate.evaluate(reviewResult, 'CODE', codeRollbackCountForGate);
-  codeGate.recordExperience(codeDecision, 'CODE', reviewResult, { skill: 'code-development', category: ExperienceCategory.STABLE_PATTERN });
+  const codeRollbackCountForGate = this._rollbackCounters?.get(WorkflowState.CODE) ?? 0;
+  const codeDecision = codeGate.evaluate(reviewResult, WorkflowState.CODE, codeRollbackCountForGate);
+  codeGate.recordExperience(codeDecision, WorkflowState.CODE, reviewResult, { skill: 'code-development', category: ExperienceCategory.STABLE_PATTERN });
 
   if (codeDecision.pass) {
     console.log(`[Orchestrator] ✅ Code review passed. Reason: ${codeDecision.reason}`);
@@ -593,15 +583,15 @@ async function _runDeveloper() {
     }
     // Roll back to ARCHITECT when high-severity code issues remain after all review rounds.
     // P1-NEW-3 fix: use this._rollbackCounters (instance-level Map) instead of stageCtx.meta.
-    // stageCtx.delete('CODE') is called by RollbackCoordinator during rollback, which would
+    // stageCtx.delete(WorkflowState.CODE) is called by RollbackCoordinator during rollback, which would
     // reset the counter to 0 and risk infinite recursion. The Map is never cleared by rollback.
-    const codeRollbackCount = this._rollbackCounters?.get('CODE') ?? 0;
+    const codeRollbackCount = this._rollbackCounters?.get(WorkflowState.CODE) ?? 0;
     // Increment the independent counter before entering the rollback path
-    if (this._rollbackCounters) this._rollbackCounters.set('CODE', codeRollbackCount + 1);
+    if (this._rollbackCounters) this._rollbackCounters.set(WorkflowState.CODE, codeRollbackCount + 1);
     // Also mirror into stageCtx.meta for observability (non-authoritative copy)
     if (this.stageCtx) {
-      const existingCode = this.stageCtx.get('CODE') || {};
-      this.stageCtx.set('CODE', {
+      const existingCode = this.stageCtx.get(WorkflowState.CODE) || {};
+      this.stageCtx.set(WorkflowState.CODE, {
         ...existingCode,
         meta: { ...(existingCode.meta || {}), _codeRollbackCount: codeRollbackCount + 1 },
       });
@@ -612,7 +602,7 @@ async function _runDeveloper() {
       // on the existing code output instead of re-running the entire ARCHITECT stage.
       const coordinator = new RollbackCoordinator(this);
       const codeStrategy = coordinator.analyseRollbackStrategy(
-        'CODE', `Code review failed: ${failedNotes}`, 'CodeReview'
+        WorkflowState.CODE, `Code review failed: ${failedNotes}`, 'CodeReview'
       );
 
       if (codeStrategy.type === 'SUBTASK_RETRY' && codeStrategy.cachedResults) {
@@ -637,11 +627,11 @@ async function _runDeveloper() {
         const retryReview = await retryCodeReviewer.review(outputPath, reqPath);
 
         const retryCodeGate = new QualityGate({ experienceStore: this.experienceStore, maxRollbacks: 1 });
-        const retryCodeDecision = retryCodeGate.evaluate(retryReview, 'CODE', codeRollbackCount + 1);
+        const retryCodeDecision = retryCodeGate.evaluate(retryReview, WorkflowState.CODE, codeRollbackCount + 1);
 
         if (retryCodeDecision.pass) {
           console.log(`[Orchestrator] ✅ Subtask-level retry succeeded: CodeReview passed on retry.`);
-          coordinator.cacheSubtaskResult('CODE', 'CodeReview', retryReview);
+          coordinator.cacheSubtaskResult(WorkflowState.CODE, 'CodeReview', retryReview);
 
           // Store CODE context and proceed
           const codeOutputCtx = storeCodeContext(this, outputPath, retryReview);
@@ -655,12 +645,12 @@ async function _runDeveloper() {
         }
 
         console.log(`[Orchestrator] ⚠️  Subtask-level retry failed for CODE. Falling through to full-stage rollback.`);
-        coordinator.invalidateSubtaskCache('CODE');
+        coordinator.invalidateSubtaskCache(WorkflowState.CODE);
       }
 
       // ── Full-stage rollback (original path) ──────────────────────────────────
       // Coordinated rollback (P0-A: RollbackCoordinator handles all cleanup)
-      await coordinator.rollback('CODE', `Code review failed: ${failedNotes.slice(0, 200)}`);
+      await coordinator.rollback(WorkflowState.CODE, `Code review failed: ${failedNotes.slice(0, 200)}`);
 
       // Read architecture path directly – bus message was already consumed. see CHANGELOG: Defect #4/_runDeveloper
       const archOutputPath = path.join(PATHS.OUTPUT_DIR, 'architecture.md');
@@ -674,8 +664,8 @@ async function _runDeveloper() {
         });
       }
       if (this.stageCtx) {
-        const existingCodeCtx = this.stageCtx.get('CODE') || {};
-        this.stageCtx.set('CODE', {
+        const existingCodeCtx = this.stageCtx.get(WorkflowState.CODE) || {};
+        this.stageCtx.set(WorkflowState.CODE, {
           ...existingCodeCtx,
           summary: `Code review failed (retry ${codeRollbackCount + 1}): ${failedNotes.slice(0, 200)}. Rollback to ARCHITECT triggered.`,
           keyDecisions: [`Rollback to ARCHITECT triggered after ${reviewResult.failed} high-severity issue(s)`],
@@ -751,20 +741,9 @@ async function _runDeveloper() {
       // (injected count was already reported in buildDeveloperContextBlock call above)
       this.obs.recordExpUsage({ hits: devMatchedCount });
       console.log(`[Orchestrator] 🎯 Experience hit-rate (CODE): ${devMatchedCount}/${devInjectedIds.length} matched`);
-      for (const expId of devEvolutionTriggers) {
-        const triggerExp = this.experienceStore.experiences.find(e => e.id === expId);
-        if (triggerExp && triggerExp.skill) {
-          this.skillEvolution.evolve(triggerExp.skill, {
-            section: 'Best Practices',
-            title: triggerExp.title,
-            content: triggerExp.content,
-            sourceExpId: expId,
-            reason: `High-frequency pattern (hitCount=${triggerExp.hitCount}) – validated by CODE stage success`,
-          });
-          await this.hooks.emit(HOOK_EVENTS.SKILL_EVOLVED, { skillName: triggerExp.skill, expId }).catch(() => {});
-        }
-      }
-      console.log(`[Orchestrator] 📊 Marked ${devMatchedCount}/${devInjectedIds.length} experience(s) as effective (CODE passed). Evolution triggers: ${devEvolutionTriggers.length}`);
+      // P1 fix: centralized evolution trigger
+      const devEvolved = await this.experienceStore.triggerEvolutions(devEvolutionTriggers, this.skillEvolution, this.hooks, 'CODE');
+      console.log(`[Orchestrator] 📊 Marked ${devMatchedCount}/${devInjectedIds.length} experience(s) as effective (CODE passed). Evolution triggers: ${devEvolved}`);
     }
   }
 
@@ -935,7 +914,7 @@ async function _runTesterOnce(testIteration, maxIterations, fixConversationHisto
   }
 
   // P2-NEW-1: delegated to buildTesterContextBlock helper
-  const testExpContextWithComplaints = buildTesterContextBlock(this, upstreamCtxForTest, tcExecutionReport);
+  const testExpContextWithComplaints = await buildTesterContextBlock(this, upstreamCtxForTest, tcExecutionReport);
   // Improvement 4: report injection count to Observability for hit-rate tracking
   this.obs.recordExpUsage({ injected: (testExpContextWithComplaints._injectedExpIds || []).length });
   const outputPath = await this.agents[AgentRole.TESTER].run(inputPath, null, testExpContextWithComplaints);
@@ -986,7 +965,7 @@ async function _runTesterOnce(testIteration, maxIterations, fixConversationHisto
       // P1-NEW-5 fix: use QualityGate for TEST stage decision (same pattern as ARCHITECT/CODE).
       // corrResult is adapted to the reviewResult shape QualityGate.evaluate() expects.
       const testGate = new QualityGate({ experienceStore: this.experienceStore, maxRollbacks: 1 });
-      const testRollbackCountForGate = this._rollbackCounters?.get('TEST') ?? 0;
+      const testRollbackCountForGate = this._rollbackCounters?.get(WorkflowState.TEST) ?? 0;
       const testGateInput = {
         failed: corrResult.signals.filter(s => s.severity === 'high').length,
         needsHumanReview: corrResult.needsHumanReview,
@@ -997,25 +976,25 @@ async function _runTesterOnce(testIteration, maxIterations, fixConversationHisto
         // diagnostic information ("what was fixed") instead of just "passed/failed".
         history: corrResult.history || [],
       };
-      const testDecision = testGate.evaluate(testGateInput, 'TEST', testRollbackCountForGate);
-      testGate.recordExperience(testDecision, 'TEST', testGateInput, { skill: 'test-report', category: ExperienceCategory.PITFALL });
+      const testDecision = testGate.evaluate(testGateInput, WorkflowState.TEST, testRollbackCountForGate);
+      testGate.recordExperience(testDecision, WorkflowState.TEST, testGateInput, { skill: 'test-report', category: ExperienceCategory.PITFALL });
 
       if (testDecision.rollback) {
         // Roll back to CODE when test report has high-severity issues.
         // P1-NEW-3 fix: use this._rollbackCounters (instance-level Map) instead of stageCtx.meta.
-        // RollbackCoordinator calls stageCtx.delete('TEST') during rollback, which would reset
+        // RollbackCoordinator calls stageCtx.delete(WorkflowState.TEST) during rollback, which would reset
         // the counter to 0 and cause infinite recursion (_runTester → rollback → _runTester).
         // see CHANGELOG: T-4, P2-2/_runTester, P0-2/counter-read
-        const testRollbackCount = this._rollbackCounters?.get('TEST') ?? 0;
+        const testRollbackCount = this._rollbackCounters?.get(WorkflowState.TEST) ?? 0;
         // Increment the independent counter before entering the rollback path
-        if (this._rollbackCounters) this._rollbackCounters.set('TEST', testRollbackCount + 1);
+        if (this._rollbackCounters) this._rollbackCounters.set(WorkflowState.TEST, testRollbackCount + 1);
         // P2-D: _pendingTestMeta lifecycle clarification.
         //
         // _pendingTestMeta is a "deferred write" pattern: it carries rollback metadata
         // (specifically _testRollbackCount) from the rollback path to the final
         // storeTestContext() call at the end of _runTesterOnce.
         //
-        // Why deferred? RollbackCoordinator.rollback('TEST') calls stageCtx.delete('TEST'),
+        // Why deferred? RollbackCoordinator.rollback(WorkflowState.TEST) calls stageCtx.delete(WorkflowState.TEST),
         // which wipes the TEST context entry. If we wrote _testRollbackCount into stageCtx
         // immediately, it would be erased by the rollback. Instead, we park it in
         // _pendingTestMeta and merge it in storeTestContext() AFTER the rollback completes.
@@ -1042,7 +1021,7 @@ async function _runTesterOnce(testIteration, maxIterations, fixConversationHisto
         try {
           // ── Coordinated rollback (P0-A: RollbackCoordinator handles all cleanup) ──
           const coordinator = new RollbackCoordinator(this);
-          await coordinator.rollback('TEST', `Test report failed: ${riskMsg.slice(0, 200)}`);
+          await coordinator.rollback(WorkflowState.TEST, `Test report failed: ${riskMsg.slice(0, 200)}`);
 
           // Append failure context to code.diff so developer knows what to fix
           const codeDiffPath = path.join(PATHS.OUTPUT_DIR, 'code.diff');
@@ -1094,7 +1073,7 @@ async function _runTesterOnce(testIteration, maxIterations, fixConversationHisto
             devOutputPath = devRetry;
           } else {
             // Try to read the actual CODE artifact path from stageCtx
-            const codeCtxArtifacts = this.stageCtx?.get('CODE')?.artifacts;
+            const codeCtxArtifacts = this.stageCtx?.get(WorkflowState.CODE)?.artifacts;
             const stageCtxCodePath = Array.isArray(codeCtxArtifacts) && codeCtxArtifacts.length > 0
               ? codeCtxArtifacts[0]
               : null;
@@ -1283,20 +1262,9 @@ async function _runRealTestLoop({ testCommand, autoFixEnabled, maxFixRounds, fai
       const firstRunTriggers = this.experienceStore.markUsedBatch(firstRunMatchedIds);
       // Improvement 4: report only confirmed matched hits to Observability
       this.obs.recordExpUsage({ hits: firstRunMatchedCount });
-      for (const expId of firstRunTriggers) {
-        const triggerExp = this.experienceStore.experiences.find(e => e.id === expId);
-        if (triggerExp && triggerExp.skill) {
-          this.skillEvolution.evolve(triggerExp.skill, {
-            section: 'Best Practices',
-            title: triggerExp.title,
-            content: triggerExp.content,
-            sourceExpId: expId,
-            reason: `High-frequency pattern (hitCount=${triggerExp.hitCount}) – validated by TEST first-run pass`,
-          });
-          await this.hooks.emit(HOOK_EVENTS.SKILL_EVOLVED, { skillName: triggerExp.skill, expId }).catch(() => {});
-        }
-      }
-      console.log(`[Orchestrator] 📊 Marked ${firstRunMatchedCount}/${injectedExpIds.length} experience(s) as effective (TEST first-run pass). Evolution triggers: ${firstRunTriggers.length}`);
+      // P1 fix: centralized evolution trigger
+      const firstRunEvolved = await this.experienceStore.triggerEvolutions(firstRunTriggers, this.skillEvolution, this.hooks, 'TEST');
+      console.log(`[Orchestrator] 📊 Marked ${firstRunMatchedCount}/${injectedExpIds.length} experience(s) as effective (TEST first-run pass). Evolution triggers: ${firstRunEvolved}`);
     }
     this.experienceStore.record({
       type: ExperienceType.POSITIVE,
@@ -1602,20 +1570,9 @@ async function _runRealTestLoop({ testCommand, autoFixEnabled, maxFixRounds, fai
         // Improvement 4: report only confirmed matched hits to Observability
         this.obs.recordExpUsage({ hits: fixMatchedCount });
         console.log(`[Orchestrator] 🎯 Experience hit-rate (TEST fix round ${fixRound}): ${fixMatchedCount}/${injectedExpIds.length} matched`);
-        for (const expId of fixPassTriggers) {
-          const triggerExp = this.experienceStore.experiences.find(e => e.id === expId);
-          if (triggerExp && triggerExp.skill) {
-            this.skillEvolution.evolve(triggerExp.skill, {
-              section: 'Best Practices',
-              title: triggerExp.title,
-              content: triggerExp.content,
-              sourceExpId: expId,
-              reason: `High-frequency pattern (hitCount=${triggerExp.hitCount}) – validated by TEST auto-fix pass (round ${fixRound})`,
-            });
-            await this.hooks.emit(HOOK_EVENTS.SKILL_EVOLVED, { skillName: triggerExp.skill, expId }).catch(() => {});
-          }
-        }
-        console.log(`[Orchestrator] 📊 Marked ${fixMatchedCount}/${injectedExpIds.length} experience(s) as effective (TEST auto-fix round ${fixRound} pass). Evolution triggers: ${fixPassTriggers.length}`);
+        // P1 fix: centralized evolution trigger
+        const fixEvolved = await this.experienceStore.triggerEvolutions(fixPassTriggers, this.skillEvolution, this.hooks, 'TEST');
+        console.log(`[Orchestrator] 📊 Marked ${fixMatchedCount}/${injectedExpIds.length} experience(s) as effective (TEST auto-fix round ${fixRound} pass). Evolution triggers: ${fixEvolved}`);
       }
       this.experienceStore.record({
         type: ExperienceType.POSITIVE,

@@ -66,6 +66,10 @@ Types → Constants → Core → Agents → Commands → Index
 | `CIIntegration` | Inside `_runTester()` post-test | After all tasks complete | `obs.recordCIResult()` |
 | `SocraticEngine` | ANALYSE / ARCHITECT / TEST phase gates | N/A (no phase boundaries in parallel mode) | Decision helper methods |
 | `MemoryManager` | `_initWorkflow()` | `_initWorkflow()` | Injected via `this._agentsMdContent` |
+| `DecompositionValidation` | N/A (sequential has no decomposition) | `runAuto()` pre-dispatch | `_validateDecomposition()` — pure logic, 0 tokens |
+| `CrossTaskCoherence` | N/A (single pipeline, no cross-task) | `runTaskBased()` post-CI | `_checkCrossTaskCoherence()` — 1 LLM call, ~2K tokens |
+| `RequirementCoverage` | N/A (CoverageChecker in ARCHITECT stage) | `runTaskBased()` post-CI | `_checkRequirementCoverage()` — pure logic, 0 tokens |
+| `GoalAwareExecution` | N/A (sequential mode has natural context flow) | `_executeTask()` + `_evaluateReplan()` | Injects `_currentRequirement` as global goal context, ~50 tokens/task |
 
 ### Cached Resources — Never Re-Read Inside Loops
 

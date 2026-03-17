@@ -18,8 +18,8 @@ const { AgentRole } = require('../core/types');
 const { buildJsonBlockInstruction } = require('../core/agent-output-schema');
 
 class ArchitectAgent extends BaseAgent {
-  constructor(llmCall, hookEmitter) {
-    super(AgentRole.ARCHITECT, llmCall, hookEmitter);
+  constructor(llmCall, hookEmitter, opts = {}) {
+    super(AgentRole.ARCHITECT, llmCall, hookEmitter, opts);
   }
 
   /**

@@ -23,8 +23,13 @@ class BaseAgent {
    * @param {string} role          - One of AgentRole values
    * @param {Function} llmCall     - async (prompt: string) => string  (LLM adapter)
    * @param {Function} hookEmitter - async (event: string, payload: object) => void
+   * @param {object} [opts]
+   * @param {string} [opts.outputDir] - P2-b: Instance-level output directory.
+   *   When provided, agent outputs are written here instead of the global PATHS.OUTPUT_DIR.
+   *   This enables multiple Orchestrator instances to run in parallel without
+   *   overwriting each other's output files.
    */
-  constructor(role, llmCall, hookEmitter = async () => {}) {
+  constructor(role, llmCall, hookEmitter = async () => {}, opts = {}) {
     if (!Object.values(AgentRole).includes(role)) {
       throw new Error(`[BaseAgent] Unknown role: "${role}"`);
     }
@@ -32,6 +37,8 @@ class BaseAgent {
     this.contract = AGENT_CONTRACTS[role];
     this.llmCall = llmCall;
     this.hookEmitter = hookEmitter;
+    // P2-b: instance-level output directory
+    this._outputDir = opts.outputDir || PATHS.OUTPUT_DIR;
   }
 
   // ─── Public API ───────────────────────────────────────────────────────────────
@@ -136,7 +143,7 @@ class BaseAgent {
    * @returns {string} Absolute path to the written file
    */
   _writeOutput(content) {
-    const outputFilePath = path.join(PATHS.OUTPUT_DIR, this.contract.outputFilePath.replace('output/', ''));
+    const outputFilePath = path.join(this._outputDir, this.contract.outputFilePath.replace('output/', ''));
     const dir = path.dirname(outputFilePath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     

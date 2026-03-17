@@ -57,6 +57,12 @@ const _git     = require('./core/orchestrator-git');
 const _stages  = require('./core/orchestrator-stages');
 const _helpers = require('./core/orchestrator-helpers');
 const { StageContextStore } = require('./core/stage-context-store');
+// P0/P1 optimisation: ServiceContainer (DI), StageRunner (stage interface), StageRegistry (stage registration)
+const { ServiceContainer } = require('./core/service-container');
+const { StageRunner, StageRegistry } = require('./core/stage-runner');
+const { AnalystStage, ArchitectStage, DeveloperStage, TesterStage } = require('./core/stages');
+// P3 optimisation: multi-model routing support
+const { LlmRouter } = require('./core/llm-router');
 
 class Orchestrator {
   /**
@@ -76,8 +82,14 @@ class Orchestrator {
    * @param {boolean}  [options.git.draft=false]        - Create PR as draft
    * @param {string[]} [options.git.labels=[]]          - Labels to apply to the PR
    * @param {string[]} [options.git.reviewers=[]]       - Reviewer usernames
+   * @param {Object<string, Function>} [options.llmRoutes] - P3: Per-role LLM model overrides.
+   *   Keys are role names (e.g. 'ANALYST', 'ARCHITECT', 'DEVELOPER', 'TESTER').
+   *   Values are async (prompt: string) => string functions.
+   *   When specified, each role uses its own LLM model instead of the shared llmCall.
+   *   Roles without an explicit override fall back to the default llmCall.
+   *   Example: { ARCHITECT: claudeOpusCall, DEVELOPER: gpt4oCall }
    */
-  constructor({ projectId, llmCall, projectRoot = null, askUser = null, dryRun = false, git = {}, outputDir = null }) {
+  constructor({ projectId, llmCall, projectRoot = null, askUser = null, dryRun = false, git = {}, outputDir = null, llmRoutes = {} }) {
     this.projectId = projectId;
     this.projectRoot = projectRoot || path.resolve(__dirname, '..');
 
@@ -170,7 +182,9 @@ class Orchestrator {
     // Initialise core subsystems
     this.hooks = new HookSystem();
     this.bus = new FileRefBus();
-    this.stateMachine = new StateMachine(projectId, this.hooks.getEmitter());
+    this.stateMachine = new StateMachine(projectId, this.hooks.getEmitter(), {
+      manifestPath: path.join(this._outputDir, 'manifest.json'),
+    });
     this.memory = new MemoryManager(this.projectRoot);
     this.socratic = new SocraticEngine();
 
@@ -227,6 +241,16 @@ class Orchestrator {
     // the prompt length, records the call under the special role '__internal', and
     // returns the response unchanged.
     const _originalLlmCall = llmCall;
+
+    // ── P3: LlmRouter (multi-model routing) ──────────────────────────────────
+    // When llmRoutes is provided, different agent roles can use different LLM models.
+    // This enables cost optimisation (cheap model for requirement analysis, strong model
+    // for architecture design) and quality tuning (best coding model for development).
+    // The router maintains a Map<role, llmCall> with a default fallback.
+    this.llmRouter = new LlmRouter(_originalLlmCall, llmRoutes);
+    if (Object.keys(llmRoutes).length > 0) {
+      console.log(`[Orchestrator] 🔀 LlmRouter configured with ${Object.keys(llmRoutes).length} role-specific route(s): [${Object.keys(llmRoutes).join(', ')}]`);
+    }
     this._rawLlmCall = async (prompt) => {
       try {
         // Estimate tokens from prompt length (char / 4 heuristic, same as buildAgentPrompt)
@@ -277,6 +301,13 @@ class Orchestrator {
       } catch (_) { /* metering must never break the call */ }
       return response;
     };
+
+    // ── LLM Query Expansion: inject LLM into ExperienceStore ─────────────────
+    // The experience store uses LLM-based query expansion to semantically expand
+    // search keywords with synonyms, abbreviations, and related terms. This bridges
+    // the vocabulary gap between how experiences are stored and how they are searched.
+    // Uses the metered _rawLlmCall so expansion calls are tracked by Observability.
+    this.experienceStore.setLlmCall(this._rawLlmCall);
 
     // P1-NEW-3 fix: independent rollback counter Map, keyed by stage name.
     // Using stageCtx.meta for rollback counting is unsafe because RollbackCoordinator
@@ -359,7 +390,11 @@ class Orchestrator {
       // Standard OpenAI/Anthropic SDKs return usage in the response object; if the
       // caller wraps the response as a plain string, actual tokens remain null and
       // we fall back to the estimated count. No error is thrown either way.
-      const rawResponse = await _originalLlmCall(optimisedPrompt);
+      // P3: use LlmRouter to get the role-specific LLM function.
+      // If llmRoutes was configured with a per-role override (e.g. ARCHITECT → Claude Opus),
+      // that function is used instead of the default _originalLlmCall.
+      const roleLlm = this.llmRouter.getRawForRole(role);
+      const rawResponse = await roleLlm(optimisedPrompt);
       const actualTokens = (rawResponse && typeof rawResponse === 'object')
         ? (rawResponse.usage?.total_tokens ?? rawResponse.usage?.input_tokens ?? null)
         : null;
@@ -372,12 +407,61 @@ class Orchestrator {
         : rawResponse;
     };
 
+    // P2-b: pass instance-level outputDir so agents write to the correct directory
+    const agentOpts = { outputDir: this._outputDir };
     this.agents = {
-      [AgentRole.ANALYST]:   new AnalystAgent(wrappedLlm(AgentRole.ANALYST), emitter),
-      [AgentRole.ARCHITECT]: new ArchitectAgent(wrappedLlm(AgentRole.ARCHITECT), emitter),
-      [AgentRole.DEVELOPER]: new DeveloperAgent(wrappedLlm(AgentRole.DEVELOPER), emitter),
-      [AgentRole.TESTER]:    new TesterAgent(wrappedLlm(AgentRole.TESTER), emitter),
+      [AgentRole.ANALYST]:   new AnalystAgent(wrappedLlm(AgentRole.ANALYST), emitter, agentOpts),
+      [AgentRole.ARCHITECT]: new ArchitectAgent(wrappedLlm(AgentRole.ARCHITECT), emitter, agentOpts),
+      [AgentRole.DEVELOPER]: new DeveloperAgent(wrappedLlm(AgentRole.DEVELOPER), emitter, agentOpts),
+      [AgentRole.TESTER]:    new TesterAgent(wrappedLlm(AgentRole.TESTER), emitter, agentOpts),
     };
+
+    // ── P1-a: ServiceContainer (Dependency Injection) ────────────────────────
+    // Instead of Orchestrator directly instantiating 20+ subsystems, the
+    // ServiceContainer provides lazy initialisation, testability (mock injection),
+    // and replaceability (swap subsystems at runtime via register with force=true).
+    //
+    // For backward compatibility, we register all existing subsystem instances
+    // that were already created above. New code should use
+    // this.services.resolve('name') instead of direct property access.
+    this.services = new ServiceContainer();
+    this.services.registerValue('projectId', this.projectId);
+    this.services.registerValue('projectRoot', this.projectRoot);
+    this.services.registerValue('outputDir', this._outputDir);
+    this.services.registerValue('config', this._config);
+    this.services.registerValue('hooks', this.hooks);
+    this.services.registerValue('bus', this.bus);
+    this.services.registerValue('stateMachine', this.stateMachine);
+    this.services.registerValue('memory', this.memory);
+    this.services.registerValue('socratic', this.socratic);
+    this.services.registerValue('taskManager', this.taskManager);
+    this.services.registerValue('experienceStore', this.experienceStore);
+    this.services.registerValue('complaintWall', this.complaintWall);
+    this.services.registerValue('skillEvolution', this.skillEvolution);
+    this.services.registerValue('stageCtx', this.stageCtx);
+    this.services.registerValue('obs', this.obs);
+    this.services.registerValue('entropyGC', this.entropyGC);
+    this.services.registerValue('ci', this.ci);
+    this.services.registerValue('codeGraph', this.codeGraph);
+    this.services.registerValue('git', this.git);
+    this.services.registerValue('sandbox', this.sandbox);
+    this.services.registerValue('agents', this.agents);
+    this.services.registerValue('rawLlmCall', this._rawLlmCall);
+    this.services.registerValue('adaptiveStrategy', this._adaptiveStrategy);
+    this.services.registerValue('llmRouter', this.llmRouter);
+    console.log(`[Orchestrator] 🏗️  ServiceContainer initialised with ${this.services.getRegisteredNames().length} service(s).`);
+
+    // ── P0/P1-b: StageRegistry (stage registration) ─────────────────────────
+    // Replaces the hardcoded _runStage switch pattern. New stages can be added by:
+    //   1. Creating a class that extends StageRunner
+    //   2. Calling orchestrator.registerStage(name, runner)
+    // Built-in stages are registered in order: ANALYSE → ARCHITECT → CODE → TEST
+    this.stageRegistry = new StageRegistry();
+    this.stageRegistry.register(new AnalystStage());
+    this.stageRegistry.register(new ArchitectStage());
+    this.stageRegistry.register(new DeveloperStage());
+    this.stageRegistry.register(new TesterStage());
+    console.log(`[Orchestrator] 🔧 StageRegistry initialised: [${this.stageRegistry.getOrder().join(' → ')}]`);
   }
 
   // ─── Shared Workflow Lifecycle Helpers ───────────────────────────────────────
@@ -634,6 +718,35 @@ class Orchestrator {
 
     // Parallel mode
     const { taskDefs } = decompositionResult;
+
+    // ── Enhancement 1: Task Decomposition Self-Validation ─────────────────────
+    // After LLM decomposes the requirement, run a lightweight self-validation pass
+    // to catch structural issues BEFORE committing to parallel execution.
+    // This is a pure-logic check (no LLM call, 0 extra tokens, <1ms).
+    // If validation fails, fall back to sequential mode (safer).
+    const validationResult = this._validateDecomposition(taskDefs, rawRequirement);
+    if (!validationResult.valid) {
+      console.warn(`[Orchestrator] ⚠️  Task decomposition self-validation FAILED:`);
+      for (const issue of validationResult.issues) {
+        console.warn(`  • ${issue}`);
+      }
+      console.log(`[Orchestrator] ▶️  Falling back to sequential mode due to decomposition quality issues.`);
+      if (this.stateMachine && this.stateMachine.manifest) {
+        this.stateMachine.recordRisk('medium', `[DecompositionValidation] Parallel plan rejected: ${validationResult.issues.join('; ')}`);
+      }
+      return this.run(rawRequirement);
+    }
+    if (validationResult.warnings.length > 0) {
+      console.log(`[Orchestrator] ⚠️  Decomposition validation warnings:`);
+      for (const w of validationResult.warnings) {
+        console.warn(`  • ${w}`);
+        if (this.stateMachine && this.stateMachine.manifest) {
+          this.stateMachine.recordRisk('low', `[DecompositionValidation] ${w}`);
+        }
+      }
+    }
+    console.log(`[Orchestrator] ✅ Task decomposition validated: ${taskDefs.length} tasks, coverage=${validationResult.coverageRate}%`);
+
     console.log(`[Orchestrator] ⚡ Auto-dispatch → parallel task-based mode (${taskDefs.length} tasks, concurrency=${concurrency})`);
     console.log(`[Orchestrator] 📋 Auto-generated task plan:`);
     for (const t of taskDefs) {
@@ -785,33 +898,70 @@ class Orchestrator {
     const resumeState = await this._initWorkflow();
 
     try {
-      // 4. Execute stages sequentially, skipping already-completed ones
-      await this._runStage(WorkflowState.INIT, WorkflowState.ANALYSE, async () => {
-        return this._runAnalyst(rawRequirement);
-      }, resumeState);
+      // 4. Execute stages via StageRegistry (P0/P1-b: replaces hardcoded stage calls).
+      //
+      // The StageRegistry contains all pipeline stages in order (e.g. ANALYSE → ARCHITECT → CODE → TEST).
+      // Each stage is a StageRunner subclass that implements execute(context).
+      // Custom stages can be inserted via orchestrator.registerStage(runner, { before/after }).
+      //
+      // STATE_ORDER is still used by StateMachine for state transition validation.
+      // The StageRegistry provides the execution order and the runner implementations.
+      // The two must be kept in sync – a registered stage name must have a corresponding
+      // WorkflowState entry for StateMachine.transition() to work.
+      //
+      // For built-in stages, the mapping is:
+      //   ANALYSE   → INIT      → ANALYSE
+      //   ARCHITECT → ANALYSE   → ARCHITECT
+      //   CODE      → ARCHITECT → CODE
+      //   TEST      → CODE      → TEST
+      //   (FINISHED is implicit – no runner needed)
 
-      await this._runStage(WorkflowState.ANALYSE, WorkflowState.ARCHITECT, async () => {
-        return this._runArchitect();
-      }, resumeState);
+      const stages = this.stageRegistry.getStages();
+      // Build the fromState/toState pairs for each registered stage.
+      // The first stage transitions from INIT to its name; subsequent stages
+      // transition from the previous stage name to their own name.
+      // The last stage's output transitions to FINISHED.
+      const stateOrder = [WorkflowState.INIT, ...stages.map(s => s.name), WorkflowState.FINISHED];
 
-      await this._runStage(WorkflowState.ARCHITECT, WorkflowState.CODE, async () => {
-        const artifactPath = await this._runDeveloper();
-        // Incremental code graph update after developer stage completes
-        // (captures all new/modified code before the test stage runs)
-        this._rebuildCodeGraphAsync('post-developer');
-        return artifactPath;
-      }, resumeState);
+      for (let i = 0; i < stages.length; i++) {
+        const { name, runner } = stages[i];
+        const fromState = stateOrder[i];     // e.g. INIT for first stage
+        const toState   = stateOrder[i + 1]; // e.g. ANALYSE for first stage
 
-      await this._runStage(WorkflowState.CODE, WorkflowState.TEST, async () => {
-        return this._runTester();
-      }, resumeState);
+        await this._runStage(fromState, toState, async () => {
+          const stageContext = {
+            rawRequirement,
+            orchestrator: this,
+            services: this.services,
+          };
+          const result = await runner.execute(stageContext);
 
-      await this._runStage(WorkflowState.TEST, WorkflowState.FINISHED, async () => {
+          // Special handling: CODE stage triggers incremental code graph update
+          if (name === 'CODE') {
+            this._rebuildCodeGraphAsync('post-developer');
+          }
+
+          return result;
+        }, resumeState);
+      }
+
+      // Final transition: last registered stage → FINISHED
+      await this._runStage(stateOrder[stateOrder.length - 2], WorkflowState.FINISHED, async () => {
         return null; // No agent for FINISHED – just transition
       }, resumeState);
 
     } catch (err) {
       await this.hooks.emit(HOOK_EVENTS.WORKFLOW_ERROR, { error: err, state: this.stateMachine.getState() });
+
+      // Best-effort teardown: even when the workflow fails, commit whatever
+      // artifacts were produced so far.  _finalizeWorkflow is wrapped in its
+      // own try/catch so a teardown failure cannot mask the original error.
+      try {
+        await this._finalizeWorkflow('sequential', { requirement: rawRequirement, error: err.message });
+      } catch (teardownErr) {
+        console.warn(`[Orchestrator] ⚠️  Post-error teardown failed (non-fatal): ${teardownErr.message}`);
+      }
+
       throw err;
     }
 
@@ -860,6 +1010,9 @@ class Orchestrator {
     console.log(`  Goal: ${goal}`);
     console.log(`  Tasks: ${taskDefs.length} | Concurrency: ${concurrency}`);
     console.log(`${'='.repeat(60)}\n`);
+
+    // Store current requirement/goal so cross-task checks can reference it
+    this._currentRequirement = goal;
 
     // 1–3. Shared startup: StateMachine init + memory + AGENTS.md + complaints
     // P1-3 fix: capture resumeState returned by _initWorkflow() for logging and
@@ -941,6 +1094,28 @@ class Orchestrator {
       }
     } catch (err) {
       console.warn(`[Orchestrator] CI pipeline validation failed (non-fatal): ${err.message}`);
+    }
+
+    // ── Enhancement 2: Cross-Task Output Coherence Check ─────────────────────
+    // After all tasks complete, do a single LLM check to verify that the combined
+    // outputs form a coherent whole. This catches integration gaps that per-task
+    // QualityGate cannot detect (e.g. Task A produced an API and Task B consumed
+    // a different API signature).
+    // Cost: 1 LLM call, ~2K tokens, non-blocking (failures are logged, not fatal).
+    try {
+      await this._checkCrossTaskCoherence(goal);
+    } catch (err) {
+      console.warn(`[Orchestrator] ⚠️  Cross-task coherence check failed (non-fatal): ${err.message}`);
+    }
+
+    // ── Enhancement 3: Requirement Coverage Traceability ──────────────────────
+    // Verify that the original requirement's key aspects are covered by completed
+    // tasks. Pure logic check (0 LLM calls, <1ms). Records risk notes for any
+    // uncovered requirement aspects.
+    try {
+      this._checkRequirementCoverage(goal);
+    } catch (err) {
+      console.warn(`[Orchestrator] ⚠️  Requirement coverage check failed (non-fatal): ${err.message}`);
     }
 
     // Print task-based specific summary before shared teardown
@@ -1071,7 +1246,7 @@ class Orchestrator {
         }
 
         // Fetch fresh experience context at task execution time (not startup snapshot)
-        const expContext = this.experienceStore.getContextBlock(task.skill || null);
+        const expContext = await this.experienceStore.getContextBlock(task.skill || null);
 
         // Execute task (in real usage, this calls the appropriate agent)
         console.log(`[AgentWorker:${agentId}] Executing task: ${task.id} – "${task.title}"`);
@@ -1237,8 +1412,18 @@ class Orchestrator {
 
     // ── Cross-stage context injection (Defect #9 fix) ─────────────────────────
     // Task-based workers also benefit from upstream stage summaries.
-    // If stageCtx is available (e.g. after a sequential pre-pass), inject it.
-    const crossStageCtx = this.stageCtx ? this.stageCtx.getAll([], 1200) : '';
+    // D2 optimisation: use getRelevant() instead of getAll() so that the most
+    // relevant upstream context is dynamically prioritised based on task role,
+    // stage proximity, risk density, and keyword overlap with the task description.
+    // This matches the behaviour of sequential-mode stage helpers.
+    let crossStageCtx = '';
+    if (this.stageCtx) {
+      const currentStage = _roleToStage(role);
+      const taskHints = `${task.title ?? ''} ${task.description ?? ''}`;
+      crossStageCtx = currentStage
+        ? this.stageCtx.getRelevant(currentStage, { taskHints, maxChars: 1200 })
+        : this.stageCtx.getAll([], 1200);
+    }
 
     // ── CodeGraph: on-demand symbol lookup for ARCHITECT and DEVELOPER tasks ──
     // Mirrors the logic in _runDeveloper() so task-based paths also benefit from
@@ -1265,7 +1450,23 @@ class Orchestrator {
       }
     }
 
+    // ── Goal-Aware Execution: inject global goal context ──────────────────────
+    // In parallel (task-based) mode, each worker only sees its own task title and
+    // description. Without the global goal, the agent lacks the "big picture" –
+    // it doesn't know WHY this task exists or how it fits into the larger plan.
+    // By injecting a one-line goal summary (~50 tokens), each worker gains:
+    //   1. Better architectural decisions aligned with the overall objective
+    //   2. More coherent naming and interface choices across parallel tasks
+    //   3. Ability to flag if the task seems misaligned with the goal
+    // Cost: ~50 tokens per task. ROI: prevents integration mismatches that would
+    // otherwise only be caught by _checkCrossTaskCoherence() post-completion.
+    const globalGoal = this._currentRequirement || '';
+    const goalContext = globalGoal
+      ? `## Global Goal\nThis task is part of a larger objective: ${globalGoal.slice(0, 300)}${globalGoal.length > 300 ? '...' : ''}\nEnsure your output aligns with and contributes to this overall goal.`
+      : '';
+
     const dynamicInput = [
+      goalContext,
       skillContent    ? `## Skill Context\n${skillContent}` : '',
       expContext      ? `## Experience Context\n${expContext}` : '',
       agentsMdContent ? `## Project Context (AGENTS.md)\n${agentsMdContent}` : '',
@@ -1401,9 +1602,19 @@ class Orchestrator {
       .map(t => `- [${t.id}] ${t.title}${t.deps && t.deps.length > 0 ? ` (deps: ${t.deps.join(', ')})` : ''}`)
       .join('\n');
 
+    // ── Goal-Aware Re-planning: inject global goal for better re-plan decisions ──
+    // Without the global goal, the re-planning LLM may insert tasks that address
+    // gaps in the completed task's output but are irrelevant to the actual objective.
+    // Adding the goal ensures new tasks are always aligned with the original requirement.
+    const replanGoal = this._currentRequirement || '';
+    const replanGoalSection = replanGoal
+      ? [`## Global Goal`, replanGoal.slice(0, 300) + (replanGoal.length > 300 ? '...' : ''), ``]
+      : [];
+
     const replanPrompt = [
       `You are a **Task Re-planning Agent**. A task just completed and you must evaluate whether its result reveals the need for additional tasks.`,
       ``,
+      ...replanGoalSection,
       `## Completed Task`,
       `**ID**: ${completedTask.id}`,
       `**Title**: ${completedTask.title}`,
@@ -1495,6 +1706,321 @@ class Orchestrator {
     }
   }
 
+  // ─── Enhancement Methods: Decomposition Validation, Coherence, Coverage ────────
+
+  /**
+   * Enhancement 1: Validates the quality of LLM-generated task decomposition.
+   *
+   * Pure logic checks (no LLM call, 0 extra tokens):
+   *   1. Requirement keyword coverage: do task titles collectively cover the key
+   *      concepts from the original requirement?
+   *   2. Dependency graph validity: is the graph a valid DAG? Any orphaned subgraphs?
+   *   3. Task granularity balance: are tasks roughly even in scope? (no one task
+   *      covers 80% of the requirement while others are trivial)
+   *
+   * @param {object[]} taskDefs - Array of { id, title, deps }
+   * @param {string} rawRequirement - Original user requirement text
+   * @returns {{ valid: boolean, issues: string[], warnings: string[], coverageRate: number }}
+   */
+  _validateDecomposition(taskDefs, rawRequirement) {
+    const issues = [];   // Hard failures → fall back to sequential
+    const warnings = []; // Soft warnings → proceed but log risks
+
+    // ── Check 1: Requirement Keyword Coverage ──────────────────────────────────
+    // Extract significant keywords from the requirement, then check how many are
+    // mentioned in at least one task title.
+    const reqWords = _extractSignificantWords(rawRequirement);
+    const taskTitleWords = new Set();
+    for (const t of taskDefs) {
+      for (const w of _extractSignificantWords(t.title)) {
+        taskTitleWords.add(w);
+      }
+    }
+    const coveredWords = reqWords.filter(w => taskTitleWords.has(w));
+    const coverageRate = reqWords.length > 0
+      ? Math.round((coveredWords.length / reqWords.length) * 100)
+      : 100;
+
+    if (coverageRate < 30) {
+      issues.push(`Requirement keyword coverage too low (${coverageRate}%): tasks may not address the core requirement. ` +
+        `Missing concepts: [${reqWords.filter(w => !taskTitleWords.has(w)).slice(0, 5).join(', ')}]`);
+    } else if (coverageRate < 60) {
+      warnings.push(`Requirement keyword coverage is moderate (${coverageRate}%). ` +
+        `Potentially missing: [${reqWords.filter(w => !taskTitleWords.has(w)).slice(0, 5).join(', ')}]`);
+    }
+
+    // ── Check 2: Dependency Graph Validity (DAG check) ────────────────────────
+    // Detect cycles using topological sort (Kahn's algorithm)
+    const idSet = new Set(taskDefs.map(t => t.id));
+    const inDegree = {};
+    const adjacency = {};
+    for (const t of taskDefs) {
+      inDegree[t.id] = 0;
+      adjacency[t.id] = [];
+    }
+    let invalidDeps = 0;
+    for (const t of taskDefs) {
+      for (const dep of t.deps) {
+        if (!idSet.has(dep)) {
+          invalidDeps++;
+          continue;
+        }
+        adjacency[dep].push(t.id);
+        inDegree[t.id]++;
+      }
+    }
+    if (invalidDeps > 0) {
+      warnings.push(`${invalidDeps} dependency reference(s) point to non-existent task IDs (will be ignored).`);
+    }
+
+    // Kahn's algorithm: detect cycle
+    const queue = Object.keys(inDegree).filter(id => inDegree[id] === 0);
+    let sorted = 0;
+    const visited = new Set();
+    while (queue.length > 0) {
+      const node = queue.shift();
+      visited.add(node);
+      sorted++;
+      for (const next of (adjacency[node] || [])) {
+        inDegree[next]--;
+        if (inDegree[next] === 0) queue.push(next);
+      }
+    }
+    if (sorted < taskDefs.length) {
+      const cycleNodes = taskDefs.filter(t => !visited.has(t.id)).map(t => t.id);
+      issues.push(`Dependency cycle detected among tasks: [${cycleNodes.join(', ')}]. Parallel execution would deadlock.`);
+    }
+
+    // Check for disconnected subgraphs (tasks with no deps AND no dependents)
+    // These are fine individually, but if there are ≥2 completely isolated groups,
+    // it might indicate the decomposition split unrelated work incorrectly.
+    const hasOutgoing = new Set();
+    const hasIncoming = new Set();
+    for (const t of taskDefs) {
+      if (t.deps.length > 0) {
+        hasIncoming.add(t.id);
+        t.deps.forEach(d => hasOutgoing.add(d));
+      }
+    }
+    const isolated = taskDefs.filter(t => !hasOutgoing.has(t.id) && !hasIncoming.has(t.id));
+    if (isolated.length > 1 && isolated.length === taskDefs.length) {
+      warnings.push(`All ${isolated.length} tasks are completely independent (no dependencies). ` +
+        `This may indicate the requirement was split into unrelated work items rather than a coherent plan.`);
+    }
+
+    // ── Check 3: Task Granularity Balance ──────────────────────────────────────
+    // Use title length as a rough proxy for task scope. If one task's title is >3x
+    // the average, it might be too broad; if <0.3x, it might be too trivial.
+    const titleLengths = taskDefs.map(t => t.title.length);
+    const avgLen = titleLengths.reduce((a, b) => a + b, 0) / titleLengths.length;
+    if (avgLen > 0) {
+      for (const t of taskDefs) {
+        if (t.title.length > avgLen * 3 && t.title.length > 40) {
+          warnings.push(`Task "${t.id}" title is unusually long (${t.title.length} chars vs avg ${Math.round(avgLen)}). May need further decomposition.`);
+        }
+      }
+    }
+
+    return {
+      valid: issues.length === 0,
+      issues,
+      warnings,
+      coverageRate,
+    };
+  }
+
+  /**
+   * Enhancement 2: Cross-task output coherence check.
+   *
+   * After all tasks complete, performs a single LLM call to verify that the
+   * combined task outputs form a coherent whole. Catches integration issues that
+   * per-task QualityGate cannot detect.
+   *
+   * Cost: 1 LLM call, ~2K tokens input. Non-blocking (failures are logged).
+   *
+   * @param {string} goal - Original requirement/goal
+   */
+  async _checkCrossTaskCoherence(goal) {
+    const allTasks = this.taskManager.getAllTasks();
+    const doneTasks = allTasks.filter(t => t.status === 'done');
+
+    // Skip if fewer than 2 completed tasks (nothing to check coherence between)
+    if (doneTasks.length < 2) {
+      console.log(`[Orchestrator] ⏭️  Cross-task coherence check skipped (only ${doneTasks.length} completed task(s)).`);
+      return;
+    }
+
+    // Build a compact summary of each task's output (cap per-task to 200 chars)
+    const taskSummaries = doneTasks.map(t => {
+      const outputSnippet = (t.result && t.result.summary)
+        ? String(t.result.summary).slice(0, 200)
+        : '(no output summary)';
+      return `[${t.id}] ${t.title}\n  Output: ${outputSnippet}`;
+    }).join('\n\n');
+
+    const coherencePrompt = [
+      `You are an **Integration Coherence Auditor**. Multiple parallel tasks just completed for the following goal:`,
+      ``,
+      `## Goal`,
+      goal.slice(0, 500),
+      ``,
+      `## Completed Tasks and Outputs`,
+      taskSummaries,
+      ``,
+      `## Task`,
+      `Evaluate whether these task outputs are COHERENT as a whole:`,
+      `- Do the outputs reference consistent interfaces/APIs/data models?`,
+      `- Are there any obvious contradictions or gaps between tasks?`,
+      `- Is anything from the original goal clearly NOT addressed by any task?`,
+      ``,
+      `## Output Format`,
+      `If all outputs are coherent, respond with exactly:`,
+      `COHERENT`,
+      ``,
+      `If there are integration issues, respond with:`,
+      `ISSUES`,
+      `- <issue description>`,
+      `- <issue description>`,
+      `(max 5 issues)`,
+    ].join('\n');
+
+    let response;
+    try {
+      const TIMEOUT_MS = 15_000;
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Cross-task coherence check timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS)
+      );
+      response = await Promise.race([this._rawLlmCall(coherencePrompt), timeoutPromise]);
+    } catch (err) {
+      console.warn(`[Orchestrator] Cross-task coherence LLM call failed: ${err.message}`);
+      return;
+    }
+
+    if (!response || /COHERENT/i.test(response.trim().split('\n')[0])) {
+      console.log(`[Orchestrator] ✅ Cross-task coherence check: all outputs are coherent.`);
+      // Record positive experience for this coherent multi-task execution
+      this.experienceStore.recordIfAbsent(
+        `Cross-task coherence: ${doneTasks.length} tasks produced coherent output`,
+        {
+          type: 'positive',
+          category: 'stable_pattern',
+          title: `Cross-task coherence: ${doneTasks.length} tasks produced coherent output`,
+          content: `Goal: ${goal.slice(0, 200)}\nTasks: ${doneTasks.map(t => t.title).join(', ')}\nAll task outputs were verified as coherent – no integration issues detected.`,
+          skill: 'task-management',
+          tags: ['coherence', 'cross-task', 'positive'],
+        }
+      );
+      return;
+    }
+
+    // Parse issues
+    const issueLines = response.split('\n')
+      .map(l => l.trim())
+      .filter(l => l.startsWith('- '))
+      .map(l => l.slice(2).trim())
+      .slice(0, 5);
+
+    if (issueLines.length > 0) {
+      console.warn(`[Orchestrator] ⚠️  Cross-task coherence issues detected (${issueLines.length}):`);
+      for (const issue of issueLines) {
+        console.warn(`  • ${issue}`);
+        if (this.stateMachine && this.stateMachine.manifest) {
+          this.stateMachine.recordRisk('medium', `[CrossTaskCoherence] ${issue}`);
+        }
+      }
+
+      // Record negative experience for future learning
+      this.experienceStore.record({
+        type: 'negative',
+        category: 'pitfall',
+        title: `Cross-task coherence: integration issues found`,
+        content: `Goal: ${goal.slice(0, 200)}\nTasks: ${doneTasks.map(t => t.title).join(', ')}\nIssues:\n${issueLines.map(i => `- ${i}`).join('\n')}`,
+        skill: 'task-management',
+        tags: ['coherence', 'cross-task', 'negative', 'integration'],
+      });
+    }
+  }
+
+  /**
+   * Enhancement 3: Requirement coverage traceability.
+   *
+   * Compares the original requirement's key concepts against completed task titles
+   * and output summaries. Identifies requirement aspects that may not have been
+   * addressed by any task.
+   *
+   * Pure logic check (0 LLM calls, <1ms). Records risk notes for uncovered aspects.
+   *
+   * @param {string} goal - Original requirement/goal
+   */
+  _checkRequirementCoverage(goal) {
+    const allTasks = this.taskManager.getAllTasks();
+    const doneTasks = allTasks.filter(t => t.status === 'done');
+    const failedTasks = allTasks.filter(t => t.status === 'failed' || t.status === 'exhausted');
+
+    if (doneTasks.length === 0) {
+      console.warn(`[Orchestrator] ⚠️  Requirement coverage: no tasks completed. Cannot verify coverage.`);
+      return;
+    }
+
+    // Build a combined "output corpus" from all completed tasks
+    const outputCorpus = doneTasks.map(t => {
+      const summary = (t.result && t.result.summary) ? String(t.result.summary) : '';
+      return `${t.title} ${summary}`;
+    }).join(' ').toLowerCase();
+
+    // Extract significant words from requirement
+    const reqWords = _extractSignificantWords(goal);
+    if (reqWords.length === 0) {
+      console.log(`[Orchestrator] ⏭️  Requirement coverage check skipped (no significant keywords extracted from goal).`);
+      return;
+    }
+
+    // Check which requirement keywords appear in the output corpus
+    const covered = [];
+    const uncovered = [];
+    for (const word of reqWords) {
+      if (outputCorpus.includes(word)) {
+        covered.push(word);
+      } else {
+        uncovered.push(word);
+      }
+    }
+
+    const coverageRate = Math.round((covered.length / reqWords.length) * 100);
+
+    // Report
+    if (uncovered.length === 0) {
+      console.log(`[Orchestrator] ✅ Requirement coverage: 100% (${reqWords.length}/${reqWords.length} key concepts addressed).`);
+    } else {
+      const statusIcon = coverageRate >= 80 ? '⚠️' : '❌';
+      console.log(`[Orchestrator] ${statusIcon} Requirement coverage: ${coverageRate}% (${covered.length}/${reqWords.length} key concepts addressed).`);
+      console.log(`[Orchestrator]    Potentially uncovered: [${uncovered.join(', ')}]`);
+
+      // Record risk notes for each uncovered concept
+      if (this.stateMachine && this.stateMachine.manifest) {
+        for (const word of uncovered.slice(0, 5)) {
+          this.stateMachine.recordRisk(
+            coverageRate < 50 ? 'high' : 'medium',
+            `[RequirementCoverage] Concept "${word}" from original requirement not found in any completed task output.`
+          );
+        }
+      }
+    }
+
+    // Report failed tasks as coverage risks
+    if (failedTasks.length > 0) {
+      console.warn(`[Orchestrator] ⚠️  ${failedTasks.length} task(s) failed/exhausted – their requirement aspects may be uncovered:`);
+      for (const t of failedTasks) {
+        console.warn(`  • [${t.id}] ${t.title}`);
+        if (this.stateMachine && this.stateMachine.manifest) {
+          this.stateMachine.recordRisk('high', `[RequirementCoverage] Task "${t.title}" failed – its requirement scope is uncovered.`);
+        }
+      }
+    }
+
+    return { coverageRate, covered, uncovered, failedTasks: failedTasks.map(t => t.id) };
+  }
+
   // ─── AgentFlow: Experience & Skill Management ─────────────────────────────────
 
   /**
@@ -1572,6 +2098,38 @@ class Orchestrator {
     return lines.filter(l => l !== '').join('\n');
   }
 
+  // ─── Stage Registration (P1-b) ────────────────────────────────────────────
+
+  /**
+   * Registers a custom stage runner in the pipeline.
+   *
+   * P1-b optimisation: New stages can be added without modifying STATE_ORDER,
+   * StateMachine, or any existing stage files. Just create a class that extends
+   * StageRunner and call this method.
+   *
+   * @param {StageRunner} runner - Must extend StageRunner
+   * @param {object} [opts]
+   * @param {string} [opts.before] - Insert before this existing stage (e.g. 'CODE')
+   * @param {string} [opts.after]  - Insert after this existing stage (e.g. 'ARCHITECT')
+   * @returns {Orchestrator} this (for chaining)
+   *
+   * @example
+   *   // Add a security audit stage after CODE, before TEST
+   *   const securityStage = new SecurityAuditStage();
+   *   orchestrator.registerStage(securityStage, { after: 'CODE' });
+   */
+  registerStage(runner, opts = {}) {
+    this.stageRegistry.register(runner, opts);
+    // P1-b: sync StateMachine's state order with the updated registry.
+    // When custom stages are registered after construction, StateMachine needs
+    // to know about them for jumpTo() validation and getNextState()/getPreviousState().
+    const { buildStateOrder } = require('./core/types');
+    const newStateOrder = buildStateOrder(this.stageRegistry.getOrder());
+    this.stateMachine.setStateOrder(newStateOrder);
+    console.log(`[Orchestrator] 🔧 Custom stage "${runner.getName()}" registered. Pipeline: [${this.stageRegistry.getOrder().join(' → ')}]`);
+    return this;
+  }
+
   // ─── Stage Runners ────────────────────────────────────────────────────────────
 
   /**
@@ -1582,8 +2140,12 @@ class Orchestrator {
     const resumeIdx = STATE_ORDER.indexOf(resumeState);
     const fromIdx = STATE_ORDER.indexOf(fromState);
 
+    // If resumeState is invalid (not in STATE_ORDER), treat as fresh start (idx = 0).
+    // This prevents the -1 > N comparison from accidentally skipping stages.
+    const effectiveResumeIdx = resumeIdx === -1 ? 0 : resumeIdx;
+
     // Skip if already past this stage
-    if (resumeIdx > fromIdx) {
+    if (effectiveResumeIdx > fromIdx) {
       console.log(`[Orchestrator] Skipping stage ${fromState} → ${toState} (already completed)`);
       return;
     }
@@ -1659,7 +2221,86 @@ class Orchestrator {
   }
 }
 
-module.exports = { Orchestrator };
+// ─── Module-level helpers ─────────────────────────────────────────────────────
+
+// ── Stopwords for keyword extraction (used by Enhancement 1 & 3) ──────────────
+const _DECOMP_STOPWORDS = new Set([
+  // English stopwords
+  'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with',
+  'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+  'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'shall',
+  'can', 'need', 'must', 'it', 'its', 'this', 'that', 'these', 'those', 'i', 'we', 'you',
+  'they', 'he', 'she', 'my', 'our', 'your', 'their', 'all', 'each', 'every', 'both',
+  'few', 'more', 'most', 'other', 'some', 'such', 'no', 'not', 'only', 'same', 'so',
+  'than', 'too', 'very', 'just', 'about', 'above', 'after', 'again', 'also', 'any',
+  'because', 'before', 'below', 'between', 'during', 'further', 'here', 'how', 'if',
+  'into', 'once', 'out', 'over', 'own', 'then', 'there', 'through', 'under', 'until',
+  'up', 'when', 'where', 'which', 'while', 'who', 'whom', 'why', 'what', 'as', 'new',
+  'use', 'using', 'used', 'make', 'like', 'get', 'set',
+  // Common software meta-words (too generic to indicate requirement coverage)
+  'implement', 'create', 'build', 'add', 'update', 'write', 'code', 'develop',
+  'feature', 'function', 'method', 'class', 'file', 'module', 'system', 'project',
+  'please', 'want', 'based', 'following',
+  // Chinese stopwords
+  '的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一', '一个',
+  '上', '也', '很', '到', '说', '要', '去', '你', '会', '着', '没有', '看', '好',
+  '自己', '这', '他', '她', '它', '我们', '你们', '他们', '这个', '那个',
+  '可以', '需要', '进行', '实现', '使用', '通过', '以及', '并且', '或者',
+]);
+
+/**
+ * Extracts significant (non-stopword) keywords from a text string.
+ * Supports both English and Chinese text. Returns lowercased unique words.
+ *
+ * Used by Enhancement 1 (_validateDecomposition) and Enhancement 3 (_checkRequirementCoverage).
+ *
+ * @param {string} text
+ * @returns {string[]} Array of unique significant words (lowercased)
+ */
+function _extractSignificantWords(text) {
+  if (!text || typeof text !== 'string') return [];
+
+  // Split on whitespace, punctuation, and CJK boundaries
+  // For CJK: extract individual characters or 2-char bigrams
+  const words = new Set();
+
+  // English/code words: split by non-alphanumeric (keeping hyphens for compound terms)
+  const englishWords = text.toLowerCase().match(/[a-z][a-z0-9_-]{1,}/g) || [];
+  for (const w of englishWords) {
+    if (!_DECOMP_STOPWORDS.has(w) && w.length > 2) {
+      words.add(w);
+    }
+  }
+
+  // Chinese: extract 2-char bigrams (better recall than single chars)
+  const chineseChars = text.match(/[\u4e00-\u9fff]{2,}/g) || [];
+  for (const segment of chineseChars) {
+    if (!_DECOMP_STOPWORDS.has(segment) && segment.length >= 2) {
+      words.add(segment);
+    }
+  }
+
+  return Array.from(words);
+}
+
+/**
+ * D2 optimisation: maps AgentRole → WorkflowState for getRelevant() context selection.
+ * Returns null for roles that don't map to a standard pipeline stage (e.g. 'coding-agent').
+ *
+ * @param {string} role - AgentRole value (e.g. 'analyst', 'architect')
+ * @returns {string|null} WorkflowState value (e.g. 'ANALYSE', 'ARCHITECT'), or null
+ */
+function _roleToStage(role) {
+  const map = {
+    [AgentRole.ANALYST]:   WorkflowState.ANALYSE,
+    [AgentRole.ARCHITECT]: WorkflowState.ARCHITECT,
+    [AgentRole.DEVELOPER]: WorkflowState.CODE,
+    [AgentRole.TESTER]:    WorkflowState.TEST,
+  };
+  return map[role] || null;
+}
+
+module.exports = { Orchestrator, ServiceContainer, StageRunner, StageRegistry, LlmRouter };
 
 //  Mixin: attach extracted methods to Orchestrator.prototype 
 // This keeps index.js slim while preserving the same public/private API surface.

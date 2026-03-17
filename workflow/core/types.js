@@ -28,6 +28,18 @@ const STATE_ORDER = [
   WorkflowState.FINISHED,
 ];
 
+/**
+ * P1-b: Builds a dynamic STATE_ORDER from a StageRegistry.
+ * When custom stages are registered (e.g. SECURITY_AUDIT between CODE and TEST),
+ * StateMachine needs an updated STATE_ORDER to validate transitions and jumps.
+ *
+ * @param {string[]} stageNames - Ordered array of registered stage names from StageRegistry
+ * @returns {string[]} Full state order: [INIT, ...stageNames, FINISHED]
+ */
+function buildStateOrder(stageNames) {
+  return [WorkflowState.INIT, ...stageNames, WorkflowState.FINISHED];
+}
+
 // ─── Agent Role Identifiers ────────────────────────────────────────────────────
 
 const AgentRole = {
@@ -156,6 +168,7 @@ const AGENT_CONTRACTS = {
 module.exports = {
   WorkflowState,
   STATE_ORDER,
+  buildStateOrder,
   AgentRole,
   AGENT_CONTRACTS,
   createManifest,

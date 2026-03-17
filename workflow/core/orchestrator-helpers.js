@@ -3,6 +3,7 @@
 const fs   = require('fs');
 const path = require('path');
 const { PATHS } = require('./constants');
+const { WorkflowState } = require('./types');
 
 /**
  * Helper methods for Orchestrator.
@@ -33,13 +34,13 @@ function _buildInvestigationTools(stageLabel) {
 
     // Dynamically add artifacts from all upstream stages (via StageContextStore)
     if (self.stageCtx) {
-      const stageOrder = ['ANALYSE', 'ARCHITECT', 'CODE', 'TEST'];
-      const currentStageIdx = stageOrder.indexOf(
-        stageLabel === 'Architecture' ? 'ARCHITECT'
-        : stageLabel === 'Code'       ? 'CODE'
-        : stageLabel === 'TestReport' ? 'TEST'
-        : stageLabel.toUpperCase()
-      );
+    const stageOrder = [WorkflowState.ANALYSE, WorkflowState.ARCHITECT, WorkflowState.CODE, WorkflowState.TEST];
+    const currentStageIdx = stageOrder.indexOf(
+      stageLabel === 'Architecture' ? WorkflowState.ARCHITECT
+      : stageLabel === 'Code'       ? WorkflowState.CODE
+      : stageLabel === 'TestReport' ? WorkflowState.TEST
+      : stageLabel.toUpperCase()
+    );
       for (let i = 0; i < stageOrder.length; i++) {
         if (currentStageIdx !== -1 && i >= currentStageIdx) break; // only upstream
         const ctx = self.stageCtx.get(stageOrder[i]);
@@ -115,7 +116,7 @@ function _buildInvestigationTools(stageLabel) {
       const skillName = stageLabel === 'Architecture' ? 'architecture-design'
                       : stageLabel === 'Code'         ? 'code-development'
                       : 'test-report';
-      const contextBlock = self.experienceStore.getContextBlock(skillName);
+      const contextBlock = await self.experienceStore.getContextBlock(skillName);
       if (!contextBlock) {
         console.log(`  [Investigation:queryExperience] No experience context for signal type "${signalType}".`);
         return null;

@@ -1,0 +1,26 @@
+{
+  "cache|redis": {
+    "expandedTerms": [
+      "memcached",
+      "caching",
+      "ttl",
+      "invalidation",
+      "key-value",
+      "in-memory"
+    ],
+    "createdAt": "2026-03-16T14:22:46.796Z",
+    "hitCount": 1,
+    "skill": "backend"
+  },
+  "auth|login": {
+    "expandedTerms": [
+      "authentication",
+      "sso",
+      "oauth",
+      "jwt"
+    ],
+    "createdAt": "2025-01-01",
+    "hitCount": 0,
+    "skill": "security"
+  }
+}

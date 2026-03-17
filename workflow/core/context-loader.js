@@ -89,6 +89,39 @@ class ContextLoader {
     this._docsDir          = workflowRoot;  // docs/ is relative to workflowRoot
     this._skillKeywords    = { ...BUILTIN_SKILL_KEYWORDS, ...skillKeywords };
     this._alwaysLoadSkills = alwaysLoadSkills;
+
+    // ── File Read Cache (D1+D3 optimisation) ──────────────────────────────────
+    // Caches file contents in memory to avoid redundant disk I/O within the same
+    // workflow run. Skills and docs don't change during a run, so caching is safe.
+    // Key: absolute file path, Value: { content: string, mtime: number }
+    // The cache is per-instance; when a new ContextLoader is created, it starts fresh.
+    /** @type {Map<string, { content: string, mtime: number }>} */
+    this._fileCache = new Map();
+  }
+
+  /**
+   * Reads a file with in-memory caching. Returns the cached content if the
+   * file's mtime hasn't changed since last read; otherwise reads from disk
+   * and updates the cache.
+   *
+   * @param {string} filePath - Absolute path to the file
+   * @returns {string|null} File content, or null if the file doesn't exist
+   * @private
+   */
+  _readFileCached(filePath) {
+    try {
+      if (!fs.existsSync(filePath)) return null;
+      const stat = fs.statSync(filePath);
+      const cached = this._fileCache.get(filePath);
+      if (cached && cached.mtime === stat.mtimeMs) {
+        return cached.content;
+      }
+      const content = fs.readFileSync(filePath, 'utf-8');
+      this._fileCache.set(filePath, { content, mtime: stat.mtimeMs });
+      return content;
+    } catch {
+      return null;
+    }
   }
 
   // ─── Public API ───────────────────────────────────────────────────────────
@@ -122,9 +155,8 @@ class ContextLoader {
         docPath = path.join(this._workflowRoot, docRelPath);
       }
 
-      if (!fs.existsSync(docPath)) continue;
-
-      const content = fs.readFileSync(docPath, 'utf-8');
+      const content = this._readFileCached(docPath);
+      if (!content) continue;
       const docName = path.basename(docRelPath);
 
       // For decision-log.md: extract only relevant ADR entries to save tokens
@@ -208,7 +240,9 @@ class ContextLoader {
 
     for (const [skillName, keywords] of Object.entries(this._skillKeywords)) {
       const skillPath = path.join(this._skillsDir, `${skillName}.md`);
-      if (!fs.existsSync(skillPath)) continue;
+      // Use _readFileCached to benefit from the cache (also pre-warms the cache
+      // for _loadSkill which will be called next for matching skills).
+      if (!this._readFileCached(skillPath)) continue;
 
       let score = 0;
       for (const kw of keywords) {
@@ -293,9 +327,8 @@ class ContextLoader {
    */
   _loadSkill(skillName, tokenBudget) {
     const skillPath = path.join(this._skillsDir, `${skillName}.md`);
-    if (!fs.existsSync(skillPath)) return null;
-
-    const content = fs.readFileSync(skillPath, 'utf-8');
+    const content = this._readFileCached(skillPath);
+    if (!content) return null;
 
     // Skip empty/placeholder skills (no real content yet)
     if (this._isPlaceholderSkill(content)) return null;
@@ -334,13 +367,24 @@ class ContextLoader {
    * Truncates content to fit within a token budget.
    * Truncates at paragraph boundaries when possible.
    *
+   * D6 optimisation: uses a content-aware chars/token ratio instead of a fixed
+   * constant. Chinese text averages ~2 chars/token (vs ~4 for English), so a
+   * Chinese-heavy document with 2000 chars is ~1000 tokens, not ~500.
+   * We sample the first 200 chars to estimate the CJK ratio and adjust accordingly.
+   *
    * @param {string} content
    * @param {number} tokenBudget
    * @returns {string}
    */
   _truncate(content, tokenBudget) {
     if (!content) return '';
-    const maxChars = tokenBudget * 4; // ~4 chars per token
+    // Estimate CJK ratio from the first 200 chars to adjust chars/token ratio.
+    // CJK characters: ~2 chars/token; ASCII/Latin: ~4 chars/token.
+    const sample = content.slice(0, 200);
+    const cjkCount = (sample.match(/[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/g) || []).length;
+    const cjkRatio = sample.length > 0 ? cjkCount / sample.length : 0;
+    const charsPerToken = cjkRatio > 0.3 ? 2 : (cjkRatio > 0.1 ? 3 : 4);
+    const maxChars = tokenBudget * charsPerToken;
     if (content.length <= maxChars) return content;
 
     // Try to truncate at a paragraph boundary

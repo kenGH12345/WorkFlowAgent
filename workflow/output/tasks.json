@@ -1,0 +1,61 @@
+[
+  {
+    "id": "t1",
+    "title": "Implement JWT authentication",
+    "deps": [],
+    "skill": null,
+    "agentRole": null,
+    "status": "pending",
+    "priority": 3,
+    "retryCount": 0,
+    "maxRetries": 3,
+    "claimedBy": null,
+    "createdAt": "2026-03-16T17:26:56.177Z",
+    "updatedAt": "2026-03-16T17:26:56.178Z",
+    "startedAt": null,
+    "completedAt": null,
+    "result": null,
+    "error": null,
+    "notes": []
+  },
+  {
+    "id": "t2",
+    "title": "Build login page with form validation",
+    "deps": [],
+    "skill": null,
+    "agentRole": null,
+    "status": "pending",
+    "priority": 3,
+    "retryCount": 0,
+    "maxRetries": 3,
+    "claimedBy": null,
+    "createdAt": "2026-03-16T17:26:56.180Z",
+    "updatedAt": "2026-03-16T17:26:56.180Z",
+    "startedAt": null,
+    "completedAt": null,
+    "result": null,
+    "error": null,
+    "notes": []
+  },
+  {
+    "id": "t3",
+    "title": "Write authentication tests",
+    "deps": [
+      "t1"
+    ],
+    "skill": null,
+    "agentRole": null,
+    "status": "blocked",
+    "priority": 1,
+    "retryCount": 0,
+    "maxRetries": 3,
+    "claimedBy": null,
+    "createdAt": "2026-03-16T17:26:56.182Z",
+    "updatedAt": "2026-03-16T17:26:56.183Z",
+    "startedAt": null,
+    "completedAt": null,
+    "result": null,
+    "error": null,
+    "notes": []
+  }
+]

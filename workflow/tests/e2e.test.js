@@ -510,7 +510,7 @@ replace: |
     const result = orch._applyFileReplacements('Sorry, I cannot fix this issue.');
     assertEqual(result.applied, 0);
     assertEqual(result.failed, 1);
-    assertContains(result.errors[0], 'No [REPLACE_IN_FILE] blocks');
+    assertContains(result.errors[0], 'No [REPLACE_IN_FILE] or [LINE_RANGE] blocks found in LLM response');
   });
 
   // ── Summary ──────────────────────────────────────────────────────────────────

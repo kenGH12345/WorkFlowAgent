@@ -14,6 +14,64 @@ const fs = require('fs');
 const path = require('path');
 const { PATHS } = require('./constants');
 
+// ─── P0 Fix: Stopwords + Short-word Whitelist for keyword extraction ────────
+// Stopwords: common English words that add noise to keyword matching.
+// Short-word whitelist: important technical terms < 4 chars that would be
+// filtered out by the default `word.length >= 4` rule.
+
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'that', 'this', 'from', 'your', 'have', 'will',
+  'been', 'were', 'they', 'their', 'what', 'when', 'where', 'which', 'there',
+  'about', 'each', 'make', 'like', 'just', 'over', 'such', 'than', 'into',
+  'some', 'could', 'them', 'then', 'should', 'would', 'also', 'after', 'before',
+  'more', 'most', 'only', 'other', 'these', 'those', 'does', 'done', 'using',
+  'used', 'uses', 'need', 'needs', 'want', 'very', 'well', 'here',
+  'implement', 'implementation', 'create', 'creating', 'please', 'ensure',
+  'based', 'following', 'include', 'including', 'support', 'system', 'provide',
+]);
+
+const SHORT_WORD_WHITELIST = new Set([
+  'api', 'jwt', 'sql', 'orm', 'ui', 'db', 'css', 'dom', 'url', 'xml',
+  'cli', 'sdk', 'rpc', 'tcp', 'udp', 'ssl', 'tls', 'ssh', 'git', 'npm',
+  'vue', 'tsx', 'jsx', 'ssr', 'spa', 'ecs', 'mvp', 'mvc', 'ddd', 'tdd',
+  'bdd', 'ci', 'cd', 'io', 'ai', 'ml', 'go', 'lua', 'php', 'c++',
+  'aws', 'gcp', 'k8s', 'os', 'gpu', 'cpu', 'ram', 'ssd', 'hdd',
+]);
+
+/**
+ * Extracts meaningful keywords from a text string.
+ * P0 fix: applies stopword filtering and short-word whitelist to improve
+ * search precision. Previously used a blanket `word.length >= 4` filter
+ * which dropped important short technical terms (API, JWT, SQL, etc.)
+ * and kept noise words (this, that, from, with, etc.).
+ *
+ * @param {string} text - Source text to extract keywords from
+ * @param {number} [maxKeywords=10] - Maximum keywords to return
+ * @returns {string[]} Deduplicated, filtered keywords
+ */
+function extractKeywords(text, maxKeywords = 10) {
+  if (!text || !text.trim()) return [];
+  const words = text.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(Boolean);
+  const seen = new Set();
+  const result = [];
+  for (const w of words) {
+    if (seen.has(w)) continue;
+    seen.add(w);
+    // Accept short-word whitelist entries regardless of length
+    if (SHORT_WORD_WHITELIST.has(w)) {
+      result.push(w);
+      continue;
+    }
+    // Reject words shorter than 3 chars (unless whitelisted above)
+    if (w.length < 3) continue;
+    // Reject stopwords
+    if (STOPWORDS.has(w)) continue;
+    // Accept words with 3+ chars that pass stopword filter
+    result.push(w);
+  }
+  return result.slice(0, maxKeywords);
+}
+
 // ─── Experience Types ─────────────────────────────────────────────────────────
 
 const ExperienceType = {
@@ -73,6 +131,32 @@ class ExperienceStore {
     // When set, recording a NEGATIVE experience auto-files a complaint.
     /** @type {object|null} */
     this._complaintWall = null;
+    // LLM Query Expansion: optional LLM function for semantic keyword expansion.
+    // When set via setLlmCall(), getContextBlockWithIds() will expand extracted
+    // keywords with LLM-generated synonyms, abbreviations, and related terms
+    // before searching. Gracefully degrades to pure extractKeywords()
+    // when no LLM is available.
+    /** @type {Function|null} async (prompt: string) => string */
+    this._llmCall = null;
+
+    // ── Persistent Synonym / Alias Table (LLM Distillation Cache) ──────────
+    // Every LLM query expansion result is persisted to a JSON file so that:
+    //   1. Repeated queries hit the table instantly (0ms) instead of calling LLM (~1-3s)
+    //   2. Knowledge accumulates across sessions (self-growing synonym dictionary)
+    //   3. The table can be exported/imported across projects
+    //   4. After sufficient accumulation, the system works without LLM entirely
+    //
+    // Table structure: { [sortedKeywordKey: string]: SynonymEntry }
+    //   SynonymEntry = { expandedTerms: string[], createdAt: string, hitCount: number, skill: string|null }
+    //
+    // Lookup strategy: exact match on sorted keyword key (O(1) via object property access)
+    // Write-through: every LLM expansion result is immediately persisted to disk
+    /** @type {Object<string, { expandedTerms: string[], createdAt: string, hitCount: number, skill: string|null }>} */
+    this._synonymTable = {};
+    this._synonymTablePath = path.join(path.dirname(this.storePath), 'synonym-table.json');
+    this._synonymTableDirty = false;
+    this._loadSynonymTable();
+
     this._load();
   }
 
@@ -173,6 +257,13 @@ class ExperienceStore {
       );
     }
 
+    // P2 fix: zombie experience auto-demotion.
+    // Experiences that have been injected many times (high retrievalCount) but
+    // never confirmed effective (hitCount=0) are "zombies" – they waste prompt
+    // tokens without providing value. Demote them to the bottom of results.
+    // Zombie threshold: retrieved >= 5 times, hitCount === 0.
+    const ZOMBIE_RETRIEVAL_THRESHOLD = 5;
+
     if (keyword) {
       // Multi-keyword: split by space, score each result
       const keywords = keyword.toLowerCase().split(/\s+/).filter(Boolean);
@@ -187,14 +278,48 @@ class ExperienceStore {
             if (tagsLower.some(t => t.includes(kw))) score += 6; // Tag match: high weight
             if (contentLower.includes(kw)) score += 2;     // Content match: base weight
           }
-          return { exp: e, score };
+
+          // P0 fix: time-decay scoring.
+          // Recency matters: a 1-day-old experience with score=4 should rank above
+          // a 6-month-old experience with score=6, because the older one may be stale.
+          // Formula: recencyMultiplier = 1 / (1 + daysSinceLastUsed / halfLifeDays)
+          //   halfLifeDays = 60 → experiences lose 50% recency weight after 60 days of inactivity.
+          //   A fresh experience (0 days) gets multiplier=1.0
+          //   A 60-day-old experience gets multiplier=0.5
+          //   A 180-day-old experience gets multiplier=0.25
+          const lastActivity = new Date(e.updatedAt || e.createdAt).getTime();
+          const daysSinceActivity = (now - lastActivity) / 86400_000;
+          const HALF_LIFE_DAYS = 60;
+          const recencyMultiplier = 1 / (1 + daysSinceActivity / HALF_LIFE_DAYS);
+
+          // Blend: keyword relevance × recency × (1 + log(hitCount+1))
+          // hitCount contribution is logarithmic to prevent old high-hitCount
+          // experiences from permanently dominating the results.
+          const hitBoost = Math.log2(1 + (e.hitCount || 0));
+          const finalScore = score * recencyMultiplier * (1 + hitBoost * 0.2);
+
+          // P2 fix: zombie demotion – if zombie, slash score by 90%
+          const isZombie = (e.retrievalCount || 0) >= ZOMBIE_RETRIEVAL_THRESHOLD && e.hitCount === 0;
+          return { exp: e, score: isZombie ? finalScore * 0.1 : finalScore, rawScore: score };
         })
-        .filter(({ score }) => score > 0)
+        .filter(({ rawScore }) => rawScore > 0)
         .sort((a, b) => scoreSort ? b.score - a.score : b.exp.hitCount - a.exp.hitCount)
         .map(({ exp }) => exp);
     } else {
-      // Sort by hitCount desc (most useful first)
-      results = results.sort((a, b) => b.hitCount - a.hitCount);
+      // P0 fix: even without keyword, apply time-decay to hitCount-based sorting.
+      // This prevents ancient high-hitCount experiences from permanently topping results.
+      results = results
+        .map(e => {
+          const lastActivity = new Date(e.updatedAt || e.createdAt).getTime();
+          const daysSinceActivity = (now - lastActivity) / 86400_000;
+          const HALF_LIFE_DAYS = 60;
+          const recencyMultiplier = 1 / (1 + daysSinceActivity / HALF_LIFE_DAYS);
+          const decayedScore = (e.hitCount || 0) * recencyMultiplier;
+          const isZombie = (e.retrievalCount || 0) >= ZOMBIE_RETRIEVAL_THRESHOLD && e.hitCount === 0;
+          return { exp: e, decayedScore: isZombie ? decayedScore * 0.1 : decayedScore };
+        })
+        .sort((a, b) => b.decayedScore - a.decayedScore)
+        .map(({ exp }) => exp);
     }
 
     return results.slice(0, limit);
@@ -227,6 +352,18 @@ class ExperienceStore {
     // with the same boilerplate (e.g. "After 2 self-correction round(s)...") would be
     // incorrectly treated as duplicates. Use 120 chars for a more reliable dedup check.
     if (exp.content.includes(additionalContent.slice(0, 120))) return exp;
+
+    // P2 fix: structured content via updates array.
+    // Instead of free-text concatenation, maintain a structured updates[] array
+    // that keeps each update as a separate entry with timestamp and content.
+    // The main content string is still updated for backward compatibility with
+    // existing code that reads exp.content directly (search, getContextBlock, etc.)
+    if (!exp.updates) exp.updates = [];
+    exp.updates.push({
+      date: new Date().toISOString().slice(0, 10),
+      content: additionalContent,
+    });
+
     exp.content = `${exp.content}\n\n[Update ${new Date().toISOString().slice(0, 10)}] ${additionalContent}`;
     exp.updatedAt = new Date().toISOString();
     // P1-D fix: return the save-queue promise so callers can await persistence.
@@ -338,6 +475,23 @@ class ExperienceStore {
    * @param {string} expId
    * @returns {boolean} true if this experience should trigger skill evolution
    */
+  /**
+   * Increments the retrieval counter for an experience.
+   * Called when an experience is included in a context block (retrieved),
+   * regardless of whether the downstream task succeeds.
+   * This enables zombie detection: high retrievalCount + zero hitCount = zombie.
+   *
+   * @param {string} expId
+   */
+  markRetrieved(expId) {
+    const exp = this.experiences.find(e => e.id === expId);
+    if (!exp) return;
+    if (!exp.retrievalCount) exp.retrievalCount = 0;
+    exp.retrievalCount += 1;
+    // Deferred save – flushed by next natural _save() or flushDirty()
+    this._dirty = true;
+  }
+
   markUsed(expId) {
     const exp = this.experiences.find(e => e.id === expId);
     if (!exp) return false;
@@ -388,6 +542,8 @@ class ExperienceStore {
    * @returns {Promise<void>}
    */
   flushDirty() {
+    // Also flush synonym table hitCount changes (accumulated from table lookups)
+    this.flushSynonymTable();
     if (this._dirty) {
       this._dirty = false; // reset before save so a concurrent markUsed() re-sets it
       return this._save();
@@ -436,18 +592,32 @@ class ExperienceStore {
    *   hit-rate analysis. Pass orch._adaptiveStrategy?.maxExpInjected ?? 5 here.
    * @returns {{ block: string, ids: string[] }}
    */
-  getContextBlockWithIds(skill = null, taskDescription = null, limit = 5) {
+  async getContextBlockWithIds(skill = null, taskDescription = null, limit = 5) {
     if (!skill) return { block: '', ids: [] };
 
     let scoreSort = true;
     let keyword = null;
     if (taskDescription && taskDescription.trim().length > 0) {
-      const taskKeywords = [...new Set(
-        taskDescription.toLowerCase()
-          .replace(/[^\w\s]/g, ' ')
-          .split(/\s+/)
-          .filter(w => w.length >= 4)
-      )].slice(0, 10);
+      // P0 fix: use extractKeywords() with stopword filtering + short-word whitelist
+      // instead of the blanket `word.length >= 4` filter. This improves precision by:
+      //   1. Keeping important short terms: API, JWT, SQL, ORM, UI, DB, etc.
+      //   2. Removing common noise words: the, with, for, this, that, etc.
+      let taskKeywords = extractKeywords(taskDescription, 10);
+
+      // LLM Query Expansion + Synonym Table Lookup:
+      // First checks the persistent synonym table (0ms, no LLM needed).
+      // Falls back to LLM expansion if no table entry exists.
+      // This means expansion works even without LLM after sufficient accumulation.
+      // Example: ["redis", "cache"] → ["redis", "cache", "memcached", "caching", "ttl"]
+      // Gracefully degrades to original keywords if both table and LLM are unavailable.
+      if (taskKeywords.length > 0) {
+        try {
+          taskKeywords = await this._expandKeywordsWithLlm(taskKeywords, skill);
+        } catch (_) {
+          // Silent fallback – expansion failure must never break the main flow
+        }
+      }
+
       if (taskKeywords.length > 0) {
         keyword = taskKeywords.join(' ');
         scoreSort = true;
@@ -462,6 +632,13 @@ class ExperienceStore {
     const positives = this.search({ type: ExperienceType.POSITIVE, skill, keyword, limit: perTypeLimit, scoreSort });
     const negatives = this.search({ type: ExperienceType.NEGATIVE, skill, keyword, limit: perTypeLimit, scoreSort });
     const ids = [...positives.map(e => e.id), ...negatives.map(e => e.id)];
+
+    // P2 fix: track retrieval count for zombie detection.
+    // Mark each retrieved experience so we can detect zombies (retrieved many
+    // times but never confirmed effective via markUsedBatch).
+    for (const id of ids) {
+      this.markRetrieved(id);
+    }
 
     const lines = ['## Accumulated Experience\n'];
 
@@ -577,30 +754,38 @@ class ExperienceStore {
       // POSITIVE experiences: always matched on task success
       if (exp.type === ExperienceType.POSITIVE) return true;
 
-      // NEGATIVE experiences: only matched when error context contains relevant keywords
-      // Check 1: any tag keyword appears in the error context
-      const tagMatch = (exp.tags || []).some(tag =>
-        tag.length >= 3 && errorLower.includes(tag.toLowerCase())
-      );
-      if (tagMatch) return true;
+      // NEGATIVE experiences: only matched when error context contains relevant keywords.
+      // P2 fix: require at least 2 token matches (across tags, category, and title)
+      // to reduce false positives. Previously a single generic token like 'module'
+      // would trigger a match, causing e.g. "Cannot find module 'lodash'" to falsely
+      // match a "Cocos Creator Module Usage" experience.
+      let matchScore = 0;
+      const MATCH_THRESHOLD = 2; // require at least 2 token matches
 
-      // Check 2: the category keyword appears in the error context
-      // (e.g. category='pitfall' → check if 'pitfall' is in error text;
-      //  category='module_usage' → check if 'module' or 'usage' is in error text)
+      // Check 1: tag keywords in error context
+      for (const tag of (exp.tags || [])) {
+        if (tag.length >= 3 && errorLower.includes(tag.toLowerCase())) {
+          matchScore++;
+        }
+      }
+
+      // Check 2: category tokens in error context
+      // Only count tokens with length >= 4 to avoid single-char category fragments
       const categoryTokens = (exp.category || '').toLowerCase().split('_').filter(t => t.length >= 4);
-      const categoryMatch = categoryTokens.some(token => errorLower.includes(token));
-      if (categoryMatch) return true;
+      for (const token of categoryTokens) {
+        if (errorLower.includes(token)) matchScore++;
+      }
 
-      // Check 3: significant words from the experience title appear in the error context
-      // (handles cases where tags are sparse but the title is descriptive)
+      // Check 3: significant title words in error context
       const titleTokens = (exp.title || '').toLowerCase()
         .replace(/[^\w\s]/g, ' ')
         .split(/\s+/)
-        .filter(t => t.length >= 5); // only meaningful words (≥5 chars)
-      const titleMatch = titleTokens.some(token => errorLower.includes(token));
-      if (titleMatch) return true;
+        .filter(t => t.length >= 5 && !STOPWORDS.has(t));
+      for (const token of titleTokens) {
+        if (errorLower.includes(token)) matchScore++;
+      }
 
-      return false;
+      return matchScore >= MATCH_THRESHOLD;
     });
 
     return {
@@ -623,79 +808,19 @@ class ExperienceStore {
    *   out low-frequency but highly relevant experiences for the current task.
    * @returns {string} Markdown-formatted experience context
    */
-  getContextBlock(skill = null, taskDescription = null) {
-    // N22 fix: when skill is null, return empty string instead of querying all experiences.
-    // Injecting experiences from all skill domains into a single agent prompt causes
-    // irrelevant context noise and may mislead the agent.
-    if (!skill) {
-      return '';
-    }
-
-    // P1-NEW-2 fix: when taskDescription is provided, use keyword-overlap relevance
-    // scoring to rank experiences by current-task relevance instead of global hitCount.
-    // Strategy: extract keywords from taskDescription, score each experience by how
-    // many keywords appear in its title/content/tags, then blend with hitCount so
-    // frequently-used AND task-relevant experiences rank highest.
-    let scoreSort = true;
-    let keyword = null;
-    if (taskDescription && taskDescription.trim().length > 0) {
-      // Extract meaningful keywords: words ≥4 chars, deduplicated, lowercased.
-      const taskKeywords = [...new Set(
-        taskDescription.toLowerCase()
-          .replace(/[^\w\s]/g, ' ')
-          .split(/\s+/)
-          .filter(w => w.length >= 4)
-      )].slice(0, 10); // cap at 10 keywords to avoid over-filtering
-      if (taskKeywords.length > 0) {
-        keyword = taskKeywords.join(' ');
-        scoreSort = true; // scoreSort=true uses keyword relevance score, not hitCount
-      }
-    }
-
-    const positives = this.search({ type: ExperienceType.POSITIVE, skill, keyword, limit: 5, scoreSort });
-    const negatives = this.search({ type: ExperienceType.NEGATIVE, skill, keyword, limit: 5, scoreSort });
-
-    const lines = ['## Accumulated Experience\n'];
-
-    if (positives.length > 0) {
-      lines.push('### ✅ Proven Patterns (use these)');
-      for (const exp of positives) {
-        lines.push(`\n**[${exp.category}] ${exp.title}**`);
-        lines.push(exp.content);
-        if (exp.codeExample) {
-          lines.push('```');
-          lines.push(exp.codeExample);
-          lines.push('```');
-        }
-      }
-    }
-
-    if (negatives.length > 0) {
-      lines.push('\n### ❌ Known Pitfalls (avoid these)');
-      for (const exp of negatives) {
-        lines.push(`\n**[${exp.category}] ${exp.title}**`);
-        lines.push(exp.content);
-        if (exp.codeExample) {
-          lines.push('```');
-          lines.push(exp.codeExample);
-          lines.push('```');
-        }
-      }
-    }
-
-    if (positives.length === 0 && negatives.length === 0) {
-      lines.push('_No accumulated experience yet for this context._');
-    }
-
-    // Token guard: cap the context block at 6000 chars to avoid prompt bloat.
-    // Experiences are already sorted by relevance (scoreSort=true), so truncation
-    // drops the least-relevant entries first.
-    const MAX_CONTEXT_CHARS = 6000;
-    const raw = lines.join('\n');
-    if (raw.length > MAX_CONTEXT_CHARS) {
-      return raw.slice(0, MAX_CONTEXT_CHARS) + '\n\n_... (experience context truncated to stay within token budget)_';
-    }
-    return raw;
+  /**
+   * P1 DRY fix: getContextBlock now delegates to getContextBlockWithIds
+   * and returns only the block string. Previously these two methods had ~60 lines
+   * of duplicated keyword extraction, search, and Markdown formatting logic.
+   * Any future search/formatting improvements now only need to be made in one place.
+   *
+   * @param {string} [skill]
+   * @param {string} [taskDescription]
+   * @returns {Promise<string>}
+   */
+  async getContextBlock(skill = null, taskDescription = null) {
+    if (!skill) return '';
+    return (await this.getContextBlockWithIds(skill, taskDescription)).block;
   }
 
   /**
@@ -733,6 +858,550 @@ class ExperienceStore {
    */
   setComplaintWall(complaintWall) {
     this._complaintWall = complaintWall;
+  }
+
+  /**
+   * Sets the LLM function for query expansion.
+   * When set, getContextBlockWithIds() will use LLM to expand search keywords
+   * with semantically related terms (synonyms, abbreviations, related concepts)
+   * before matching against the experience store.
+   *
+   * @param {Function} llmCall - async (prompt: string) => string
+   */
+  setLlmCall(llmCall) {
+    if (typeof llmCall === 'function') {
+      this._llmCall = llmCall;
+      console.log(`[ExperienceStore] 🧠 LLM query expansion enabled.`);
+    }
+  }
+
+  /**
+   * LLM Query Expansion – expands a set of keywords with semantically related terms.
+   *
+   * Given keywords like ["redis", "cache", "performance"], the LLM generates
+   * additional search terms like ["memcached", "caching", "latency", "ttl", "invalidation"].
+   * This bridges the vocabulary gap between how experiences are stored (author's words)
+   * and how they are searched (searcher's words).
+   *
+   * Design decisions:
+   *   - Tiny prompt (<200 tokens) to minimize cost and latency
+   *   - JSON array output for reliable parsing
+   *   - 3-second timeout to prevent blocking the main workflow
+   *   - In-memory cache with 10-minute TTL to avoid redundant calls
+   *   - Silent fallback: returns original keywords on any failure
+   *
+   * @param {string[]} keywords - Original keywords from extractKeywords()
+   * @param {string} [skill] - Optional skill context to guide expansion
+   * @returns {Promise<string[]>} Expanded keyword list (original + new terms)
+   * @private
+   */
+  async _expandKeywordsWithLlm(keywords, skill = null) {
+    if (!keywords || keywords.length === 0) {
+      return keywords;
+    }
+
+    // ── Step 1: Synonym Table Lookup (O(1), 0ms) ─────────────────────────
+    // The synonym table is a persistent LLM distillation cache: every past LLM
+    // expansion result is stored as a key→expandedTerms mapping. Over time, this
+    // table grows to cover the project's entire vocabulary, eliminating the need
+    // for LLM calls entirely.
+    const cacheKey = keywords.slice().sort().join('|');
+    const tableEntry = this._synonymTable[cacheKey];
+    if (tableEntry && Array.isArray(tableEntry.expandedTerms) && tableEntry.expandedTerms.length > 0) {
+      // Table hit: merge original keywords + stored expansion terms
+      const merged = [...keywords, ...tableEntry.expandedTerms].slice(0, 20);
+      // Track hit count for observability (how often is this entry reused?)
+      tableEntry.hitCount = (tableEntry.hitCount || 0) + 1;
+      this._synonymTableDirty = true;
+      console.log(`[ExperienceStore] 📖 Synonym table HIT: [${keywords.join(', ')}] → +${tableEntry.expandedTerms.length} cached terms (hit #${tableEntry.hitCount})`);
+      return merged;
+    }
+
+    // ── Step 2: LLM Query Expansion (fallback, ~1-3s) ────────────────────
+    // No table entry found – call LLM to generate expansion terms, then persist
+    // the result to the synonym table for future lookups.
+    if (!this._llmCall) {
+      // No LLM available and no table entry – return original keywords
+      return keywords;
+    }
+
+    const skillHint = skill ? `\nDomain context: ${skill}` : '';
+    const prompt = `You are a search query expansion engine for a software engineering experience database.
+
+Given these search keywords: [${keywords.join(', ')}]${skillHint}
+
+Generate 5-10 additional search terms that are:
+- Synonyms (e.g. "auth" → "authentication", "login")
+- Abbreviations or full forms (e.g. "k8s" → "kubernetes", "db" → "database")
+- Closely related technical concepts (e.g. "cache" → "ttl", "invalidation", "memcached")
+
+Rules:
+- Only return terms highly likely to appear in software engineering experience records
+- Do NOT return generic words (the, is, with, etc.)
+- Do NOT repeat the original keywords
+- Return ONLY a JSON array of strings, no explanation
+
+Example: ["redis", "cache"] → ["memcached", "caching", "ttl", "invalidation", "key-value", "in-memory"]
+
+Output:`;
+
+    try {
+      // 3-second timeout to prevent blocking the main workflow
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Query expansion timeout')), 3000)
+      );
+      const response = await Promise.race([this._llmCall(prompt), timeoutPromise]);
+
+      // Parse JSON array from response (tolerant of markdown code fences)
+      const cleaned = (response || '').replace(/```json?\s*/gi, '').replace(/```/g, '').trim();
+      const arrayMatch = cleaned.match(/\[([^\]]+)\]/);
+      if (!arrayMatch) {
+        console.warn(`[ExperienceStore] ⚠️  Query expansion: could not parse LLM response as JSON array.`);
+        return keywords;
+      }
+
+      let expanded;
+      try {
+        expanded = JSON.parse(`[${arrayMatch[1]}]`);
+      } catch (_) {
+        console.warn(`[ExperienceStore] ⚠️  Query expansion: JSON parse failed.`);
+        return keywords;
+      }
+
+      // Validate and deduplicate
+      const originalSet = new Set(keywords.map(k => k.toLowerCase()));
+      const validTerms = expanded
+        .filter(term => typeof term === 'string' && term.trim().length > 0)
+        .map(term => term.trim().toLowerCase())
+        .filter(term => !originalSet.has(term) && !STOPWORDS.has(term));
+
+      if (validTerms.length === 0) {
+        return keywords;
+      }
+
+      // ── Step 3: Persist to Synonym Table (write-through) ─────────────────
+      // Store the LLM result so the next identical query hits the table directly.
+      // Only expandedTerms are stored (not the full merged array), because the
+      // original keywords are always prepended at lookup time.
+      this._synonymTable[cacheKey] = {
+        expandedTerms: validTerms,
+        createdAt: new Date().toISOString(),
+        hitCount: 0,
+        skill: skill || null,
+      };
+      this._synonymTableDirty = true;
+      this._saveSynonymTable();
+
+      // Merge: original keywords + expanded terms (capped at 20 total)
+      const merged = [...keywords, ...validTerms].slice(0, 20);
+
+      console.log(`[ExperienceStore] 🧠 Query expansion (LLM→table): [${keywords.join(', ')}] → +${validTerms.length} terms: [${validTerms.join(', ')}]`);
+      return merged;
+    } catch (err) {
+      // Silent fallback: any failure returns original keywords
+      console.warn(`[ExperienceStore] ⚠️  Query expansion failed (${err.message}). Using original keywords.`);
+      return keywords;
+    }
+  }
+
+  // ── Synonym Table Persistence ────────────────────────────────────────────
+
+  /**
+   * Loads the persistent synonym table from disk.
+   * Called once during construction. If the file doesn't exist, starts with
+   * an empty table (cold start – all queries will go to LLM until the table
+   * is populated).
+   * @private
+   */
+  _loadSynonymTable() {
+    try {
+      if (fs.existsSync(this._synonymTablePath)) {
+        const raw = JSON.parse(fs.readFileSync(this._synonymTablePath, 'utf-8'));
+        // Validate structure: must be a plain object (not array, not null)
+        if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+          this._synonymTable = raw;
+          const entryCount = Object.keys(raw).length;
+          const totalHits = Object.values(raw).reduce((sum, e) => sum + (e.hitCount || 0), 0);
+          console.log(`[ExperienceStore] 📖 Synonym table loaded: ${entryCount} entries, ${totalHits} total hits`);
+        } else {
+          console.warn(`[ExperienceStore] ⚠️  Synonym table file has unexpected format. Starting fresh.`);
+          this._synonymTable = {};
+        }
+      } else {
+        console.log(`[ExperienceStore] 📖 No synonym table found. Starting fresh (cold start).`);
+      }
+    } catch (err) {
+      console.warn(`[ExperienceStore] ⚠️  Could not load synonym table: ${err.message}. Starting fresh.`);
+      this._synonymTable = {};
+    }
+  }
+
+  /**
+   * Persists the synonym table to disk (write-through on every LLM expansion).
+   * Uses atomic write (tmp + rename) to prevent corruption.
+   * @private
+   */
+  _saveSynonymTable() {
+    if (!this._synonymTableDirty) return;
+    try {
+      const dir = path.dirname(this._synonymTablePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const tmpPath = this._synonymTablePath + '.tmp';
+      fs.writeFileSync(tmpPath, JSON.stringify(this._synonymTable, null, 2), 'utf-8');
+      fs.renameSync(tmpPath, this._synonymTablePath);
+      this._synonymTableDirty = false;
+    } catch (err) {
+      console.warn(`[ExperienceStore] ⚠️  Could not save synonym table: ${err.message}`);
+    }
+  }
+
+  /**
+   * Flushes dirty synonym table hit counts to disk.
+   * Should be called at session end (alongside flushDirty()) to persist
+   * accumulated hitCount increments from table lookups.
+   */
+  flushSynonymTable() {
+    if (this._synonymTableDirty) {
+      this._saveSynonymTable();
+    }
+  }
+
+  /**
+   * Returns synonym table statistics for observability and diagnostics.
+   * @returns {{ entryCount: number, totalHits: number, topEntries: Array, coldStartPct: number }}
+   */
+  getSynonymStats() {
+    const entries = Object.entries(this._synonymTable);
+    const entryCount = entries.length;
+    const totalHits = entries.reduce((sum, [, e]) => sum + (e.hitCount || 0), 0);
+    // Top 10 most-used synonym entries
+    const topEntries = entries
+      .sort((a, b) => (b[1].hitCount || 0) - (a[1].hitCount || 0))
+      .slice(0, 10)
+      .map(([key, val]) => ({
+        keywords: key.split('|'),
+        expandedTerms: val.expandedTerms,
+        hitCount: val.hitCount || 0,
+        skill: val.skill,
+        createdAt: val.createdAt,
+      }));
+    // Cold-start percentage: entries with hitCount=0 (never reused)
+    const coldEntries = entries.filter(([, e]) => (e.hitCount || 0) === 0).length;
+    const coldStartPct = entryCount > 0 ? Math.round((coldEntries / entryCount) * 100) : 100;
+    return { entryCount, totalHits, topEntries, coldStartPct };
+  }
+
+  /**
+   * Imports synonym entries from an external synonym table (e.g. from another project).
+   * Merges without overwriting existing entries. This enables cross-project knowledge transfer.
+   *
+   * @param {Object<string, { expandedTerms: string[], createdAt: string, hitCount: number, skill: string|null }>} externalTable
+   * @returns {{ imported: number, skipped: number, total: number }}
+   */
+  importSynonymTable(externalTable) {
+    if (!externalTable || typeof externalTable !== 'object' || Array.isArray(externalTable)) {
+      return { imported: 0, skipped: 0, total: Object.keys(this._synonymTable).length };
+    }
+    let imported = 0;
+    let skipped = 0;
+    for (const [key, entry] of Object.entries(externalTable)) {
+      if (this._synonymTable[key]) {
+        // Existing entry: merge expandedTerms (union) but don't reset hitCount
+        const existingTerms = new Set(this._synonymTable[key].expandedTerms || []);
+        const newTerms = (entry.expandedTerms || []).filter(t => !existingTerms.has(t));
+        if (newTerms.length > 0) {
+          this._synonymTable[key].expandedTerms.push(...newTerms);
+          imported++;
+        } else {
+          skipped++;
+        }
+      } else {
+        // New entry: import with hitCount reset to 0
+        this._synonymTable[key] = {
+          expandedTerms: entry.expandedTerms || [],
+          createdAt: entry.createdAt || new Date().toISOString(),
+          hitCount: 0,  // Reset: imported entries start fresh in this project
+          skill: entry.skill || null,
+        };
+        imported++;
+      }
+    }
+    if (imported > 0) {
+      this._synonymTableDirty = true;
+      this._saveSynonymTable();
+      console.log(`[ExperienceStore] 📖 Synonym table import: ${imported} entries imported, ${skipped} skipped.`);
+    }
+    return { imported, skipped, total: Object.keys(this._synonymTable).length };
+  }
+
+  // ─── P1: Centralized Evolution Triggers ───────────────────────────────────────
+
+  /**
+   * P1 fix: centralizes the skill evolution trigger logic that was previously
+   * duplicated 4 times in orchestrator-stages.js (_runArchitect, _runDeveloper,
+   * _runRealTestLoop × 2). Each call site had the same 10-line block:
+   *   for (const expId of triggers) {
+   *     const exp = this.experienceStore.experiences.find(...);
+   *     if (exp && exp.skill) { this.skillEvolution.evolve(...); ... }
+   *   }
+   *
+   * Now: orchestrator-stages.js calls experienceStore.triggerEvolutions(triggers, ...)
+   * and this method handles the find + evolve + hook-emit logic in one place.
+   *
+   * @param {string[]} triggerExpIds - Experience IDs that crossed their evolution threshold
+   * @param {object} skillEvolution  - SkillEvolutionEngine instance
+   * @param {object} hooks           - HookSystem instance for emitting SKILL_EVOLVED
+   * @param {string} stageName       - Stage name for logging (e.g. 'ARCHITECT', 'CODE', 'TEST')
+   * @returns {Promise<number>} Number of evolutions triggered
+   */
+  async triggerEvolutions(triggerExpIds, skillEvolution, hooks, stageName) {
+    if (!triggerExpIds || triggerExpIds.length === 0) return 0;
+    let evolved = 0;
+    for (const expId of triggerExpIds) {
+      const triggerExp = this.experiences.find(e => e.id === expId);
+      if (triggerExp && triggerExp.skill) {
+        skillEvolution.evolve(triggerExp.skill, {
+          section: 'Best Practices',
+          title: triggerExp.title,
+          content: triggerExp.content,
+          sourceExpId: expId,
+          reason: `High-frequency pattern (hitCount=${triggerExp.hitCount}) – validated by ${stageName} stage success`,
+        });
+        if (hooks) {
+          await hooks.emit('skill_evolved', { skillName: triggerExp.skill, expId }).catch(() => {});
+        }
+        evolved++;
+      }
+    }
+    return evolved;
+  }
+
+  // ─── P1: Cross-project Experience Export/Import ───────────────────────────────
+
+  /**
+   * Exports experiences that are portable across projects.
+   *
+   * Supports two modes:
+   *   1. Universal export: extracts project-agnostic experiences (generic patterns,
+   *      performance insights, debug techniques, architecture decisions, pitfalls)
+   *   2. Full export: exports all experiences matching the filter criteria
+   *
+   * The exported format includes a metadata header with source project info
+   * and a compatibility version number for forward/backward compat.
+   *
+   * @param {object} [options]
+   * @param {boolean}  [options.universalOnly=false]  - Only export project-agnostic experiences
+   * @param {string[]} [options.categories]           - Filter by specific categories
+   * @param {number}   [options.minHitCount=0]        - Only export experiences with >= N hits
+   * @param {string}   [options.projectId]            - Source project identifier (metadata)
+   * @param {boolean}  [options.stripProjectSpecifics=true] - Remove sourceFile, namespace, taskId
+   * @returns {{ version: number, exportedAt: string, sourceProject: string|null, count: number, experiences: object[] }}
+   */
+  exportPortable({
+    universalOnly = false,
+    categories = null,
+    minHitCount = 0,
+    projectId = null,
+    stripProjectSpecifics = true,
+  } = {}) {
+    let candidates = this.experiences.filter(e => {
+      // Filter out expired
+      if (e.expiresAt && new Date(e.expiresAt).getTime() < Date.now()) return false;
+      // Min hit count filter
+      if (e.hitCount < minHitCount) return false;
+      // Category filter
+      if (categories && categories.length > 0 && !categories.includes(e.category)) return false;
+      return true;
+    });
+
+    if (universalOnly) {
+      // Only export experiences from universal (project-agnostic) categories
+      candidates = candidates.filter(e => UNIVERSAL_CATEGORIES.has(e.category));
+    }
+
+    const exported = candidates.map(e => {
+      const entry = { ...e };
+      if (stripProjectSpecifics) {
+        // Remove project-specific fields that don't transfer
+        delete entry.sourceFile;
+        delete entry.namespace;
+        delete entry.taskId;
+      }
+      // Reset hit metrics for the importing project (they need to earn trust again)
+      entry.hitCount = 0;
+      entry.retrievalCount = 0;
+      entry.evolutionCount = 0;
+      // Mark as imported
+      entry._importedFrom = projectId || 'unknown';
+      entry._importedAt = null; // set during import
+      return entry;
+    });
+
+    return {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      sourceProject: projectId || null,
+      count: exported.length,
+      experiences: exported,
+    };
+  }
+
+  /**
+   * Imports experiences from an exported file or another project's experience store.
+   *
+   * Conflict resolution strategies:
+   *   - 'skip': skip if an experience with the same title already exists (default)
+   *   - 'merge': if same title exists, append imported content as an update
+   *   - 'overwrite': replace existing experience with the imported one
+   *
+   * @param {string|object} source - File path to exported JSON, or the export object directly
+   * @param {object} [options]
+   * @param {string}  [options.conflictStrategy='skip'] - How to handle title collisions
+   * @param {boolean} [options.resetTTL=true]           - Reset TTL for imported experiences
+   * @param {string[]} [options.filterCategories]       - Only import specific categories
+   * @param {number}  [options.ttlDays]                 - Override TTL for imported experiences
+   * @returns {{ imported: number, skipped: number, merged: number, errors: string[] }}
+   */
+  importFrom(source, {
+    conflictStrategy = 'skip',
+    resetTTL = true,
+    filterCategories = null,
+    ttlDays = null,
+  } = {}) {
+    let exportData;
+    if (typeof source === 'string') {
+      // File path
+      try {
+        const raw = fs.readFileSync(source, 'utf-8');
+        exportData = JSON.parse(raw);
+      } catch (err) {
+        return { imported: 0, skipped: 0, merged: 0, errors: [`Failed to read import file: ${err.message}`] };
+      }
+    } else {
+      exportData = source;
+    }
+
+    if (!exportData || !Array.isArray(exportData.experiences)) {
+      return { imported: 0, skipped: 0, merged: 0, errors: ['Invalid export format: missing experiences array'] };
+    }
+
+    let imported = 0;
+    let skipped = 0;
+    let merged = 0;
+    const errors = [];
+
+    for (const exp of exportData.experiences) {
+      try {
+        // Category filter
+        if (filterCategories && filterCategories.length > 0 && !filterCategories.includes(exp.category)) {
+          skipped++;
+          continue;
+        }
+
+        const existing = this.findByTitle(exp.title);
+
+        if (existing) {
+          if (conflictStrategy === 'skip') {
+            skipped++;
+            continue;
+          } else if (conflictStrategy === 'merge') {
+            // Append imported content as an update
+            const importNote = `[Imported from ${exp._importedFrom || 'external'} on ${new Date().toISOString().slice(0, 10)}]\n${exp.content}`;
+            this.appendByTitle(exp.title, importNote);
+            // Merge tags (union)
+            if (exp.tags && exp.tags.length > 0) {
+              const tagSet = new Set([...(existing.tags || []), ...exp.tags]);
+              existing.tags = [...tagSet];
+            }
+            merged++;
+            continue;
+          } else if (conflictStrategy === 'overwrite') {
+            // Remove existing, then add imported
+            const idx = this.experiences.indexOf(existing);
+            if (idx !== -1) {
+              this.experiences.splice(idx, 1);
+              this._titleIndex.delete(existing.title);
+            }
+          }
+        }
+
+        // Generate new ID for the imported experience
+        const newId = `EXP-${Date.now()}-IMP-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+
+        // Compute TTL
+        const effectiveTtl = ttlDays !== undefined && ttlDays !== null
+          ? ttlDays
+          : (resetTTL
+            ? (exp.type === ExperienceType.NEGATIVE ? 90 : 365)
+            : null);
+        const expiresAt = effectiveTtl != null
+          ? new Date(Date.now() + effectiveTtl * 86400_000).toISOString()
+          : exp.expiresAt || null;
+
+        const importedExp = {
+          ...exp,
+          id: newId,
+          hitCount: 0,
+          retrievalCount: 0,
+          evolutionCount: 0,
+          createdAt: exp.createdAt || new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          expiresAt,
+          _importedFrom: exp._importedFrom || exportData.sourceProject || 'external',
+          _importedAt: new Date().toISOString(),
+        };
+
+        this.experiences.push(importedExp);
+        this._titleIndex.add(importedExp.title);
+        imported++;
+      } catch (err) {
+        errors.push(`Failed to import "${exp.title}": ${err.message}`);
+      }
+    }
+
+    if (imported > 0 || merged > 0) {
+      this._save();
+    }
+
+    console.log(`[ExperienceStore] 📦 Import complete: ${imported} imported, ${skipped} skipped, ${merged} merged, ${errors.length} error(s). Source: ${exportData.sourceProject || 'external'}`);
+    return { imported, skipped, merged, errors };
+  }
+
+  /**
+   * Extracts universal (project-agnostic) experiences and saves them to a shared
+   * directory that other projects can import from.
+   *
+   * Universal experiences are those in categories that are inherently cross-project:
+   *   - stable_pattern, performance, debug_technique, architecture, pitfall,
+   *     workflow_process, interface_def, data_structure
+   *
+   * This method is the "supply side" of cross-project knowledge sharing:
+   *   Project A: store.extractUniversalExperiences('./shared/universal-experiences.json')
+   *   Project B: store.importFrom('./shared/universal-experiences.json')
+   *
+   * @param {string} outputPath - File path to write the universal experiences JSON
+   * @param {object} [options]
+   * @param {number}  [options.minHitCount=1] - Only export experiences confirmed effective at least once
+   * @param {string}  [options.projectId]     - Source project identifier for traceability
+   * @returns {{ exported: number, path: string }}
+   */
+  extractUniversalExperiences(outputPath, { minHitCount = 1, projectId = null } = {}) {
+    const exportData = this.exportPortable({
+      universalOnly: true,
+      minHitCount,
+      projectId,
+      stripProjectSpecifics: true,
+    });
+
+    const dir = path.dirname(outputPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    const tmpPath = outputPath + '.tmp';
+    fs.writeFileSync(tmpPath, JSON.stringify(exportData, null, 2), 'utf-8');
+    fs.renameSync(tmpPath, outputPath);
+
+    console.log(`[ExperienceStore] 🌐 Extracted ${exportData.count} universal experience(s) → ${outputPath}`);
+    return { exported: exportData.count, path: outputPath };
   }
 
   // ─── Private Helpers ──────────────────────────────────────────────────────────
@@ -842,6 +1511,23 @@ class ExperienceStore {
 // The threshold determines how many times an experience must be confirmed
 // effective (via markUsed → hitCount) before it triggers skill evolution.
 
+// ─── P1: Universal (Project-Agnostic) Categories ──────────────────────────────
+// Categories whose experiences are inherently transferable across projects.
+// Used by exportPortable({ universalOnly: true }) and extractUniversalExperiences().
+// These are the categories where the knowledge is about SOFTWARE ENGINEERING
+// principles, not about a specific project's codebase.
+
+const UNIVERSAL_CATEGORIES = new Set([
+  ExperienceCategory.STABLE_PATTERN,
+  ExperienceCategory.PERFORMANCE,
+  ExperienceCategory.DEBUG_TECHNIQUE,
+  ExperienceCategory.ARCHITECTURE,
+  ExperienceCategory.PITFALL,
+  ExperienceCategory.WORKFLOW_PROCESS,
+  ExperienceCategory.INTERFACE_DEF,
+  ExperienceCategory.DATA_STRUCTURE,
+]);
+
 /**
  * Categories classified by specificity level.
  *
@@ -911,4 +1597,12 @@ function _computeEvolutionThreshold(exp) {
   return base + tagBonus;
 }
 
-module.exports = { ExperienceStore, ExperienceType, ExperienceCategory };
+module.exports = {
+  ExperienceStore,
+  ExperienceType,
+  ExperienceCategory,
+  UNIVERSAL_CATEGORIES,
+  STOPWORDS,
+  SHORT_WORD_WHITELIST,
+  extractKeywords,
+};

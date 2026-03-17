@@ -1,6 +1,6 @@
 'use strict';
 
-const { AgentRole } = require('./types');
+const { AgentRole, WorkflowState } = require('./types');
 
 /**
  * RollbackCoordinator – Unified rollback cleanup for all stages.
@@ -231,9 +231,9 @@ class RollbackCoordinator {
  * + AnalystAgent are sequential and tightly coupled – no meaningful partial retry).
  */
 const STAGE_SUBTASKS = {
-  ARCHITECT: ['CoverageCheck', 'ArchReview'],
-  CODE:      ['CodeGeneration', 'CodeReview'],
-  TEST:      ['TestCaseGen', 'TestExecution', 'TestReportReview'],
+  [WorkflowState.ARCHITECT]: ['CoverageCheck', 'ArchReview'],
+  [WorkflowState.CODE]:      ['CodeGeneration', 'CodeReview'],
+  [WorkflowState.TEST]:      ['TestCaseGen', 'TestExecution', 'TestReportReview'],
 };
 
 /**
@@ -243,27 +243,27 @@ const STAGE_SUBTASKS = {
  * When TEST fails, DEVELOPER's output is stale (TESTER will re-consume it).
  */
 const ROLLBACK_BUS_SENDER = {
-  ARCHITECT: AgentRole.ANALYST,
-  CODE:      AgentRole.ARCHITECT,
-  TEST:      AgentRole.DEVELOPER,
+  [WorkflowState.ARCHITECT]: AgentRole.ANALYST,
+  [WorkflowState.CODE]:      AgentRole.ARCHITECT,
+  [WorkflowState.TEST]:      AgentRole.DEVELOPER,
 };
 
 /**
  * Maps the failing stage to the human-readable rollback target (for logging).
  */
 const ROLLBACK_TARGET = {
-  ARCHITECT: 'ANALYSE',
-  CODE:      'ARCHITECT',
-  TEST:      'CODE',
+  [WorkflowState.ARCHITECT]: WorkflowState.ANALYSE,
+  [WorkflowState.CODE]:      WorkflowState.ARCHITECT,
+  [WorkflowState.TEST]:      WorkflowState.CODE,
 };
 
 /**
  * Maps the failing stage to the investigation source cache keys to invalidate.
  */
 const ROLLBACK_CACHE_KEYS = {
-  ARCHITECT: ['Architecture', 'ARCHITECT'],
-  CODE:      ['Architecture', 'Code', 'ARCHITECT', 'CODE'],
-  TEST:      ['Code', 'CODE', 'TestReport'],
+  [WorkflowState.ARCHITECT]: ['Architecture', WorkflowState.ARCHITECT],
+  [WorkflowState.CODE]:      ['Architecture', 'Code', WorkflowState.ARCHITECT, WorkflowState.CODE],
+  [WorkflowState.TEST]:      ['Code', WorkflowState.CODE, 'TestReport'],
 };
 
 module.exports = { RollbackCoordinator, STAGE_SUBTASKS };

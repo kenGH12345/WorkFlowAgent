@@ -44,6 +44,8 @@ const PATHS = {
   PR_DESCRIPTION_MD: path.join(WORKFLOW_ROOT, 'output', 'pr-description.md'),
   /** Dry-run sandbox report (written when dryRun: true) */
   DRYRUN_REPORT_MD: path.join(WORKFLOW_ROOT, 'output', 'dry-run-report.md'),
+  /** LLM query expansion synonym/alias table (auto-accumulated, persistent) */
+  SYNONYM_TABLE_JSON: path.join(WORKFLOW_ROOT, 'output', 'synonym-table.json'),
 };
 
 // ─── Output Artifact File Names ────────────────────────────────────────────────

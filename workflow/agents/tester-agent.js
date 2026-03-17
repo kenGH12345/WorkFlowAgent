@@ -22,8 +22,8 @@ const { PATHS } = require('../core/constants');
 const { buildJsonBlockInstruction } = require('../core/agent-output-schema');
 
 class TesterAgent extends BaseAgent {
-  constructor(llmCall, hookEmitter) {
-    super(AgentRole.TESTER, llmCall, hookEmitter);
+  constructor(llmCall, hookEmitter, opts = {}) {
+    super(AgentRole.TESTER, llmCall, hookEmitter, opts);
   }
 
   /**
