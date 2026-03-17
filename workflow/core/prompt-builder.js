@@ -167,6 +167,17 @@ function getPromptSlotManager() {
 }
 
 /**
+ * Returns the cached ContextLoader instance (or null if none exists yet).
+ * Exposed so orchestrator-lifecycle.js can pass it to SkillWatcher for
+ * cache invalidation without creating a second ContextLoader.
+ *
+ * @returns {ContextLoader|null}
+ */
+function getCachedLoader() {
+  return _cachedLoader;
+}
+
+/**
  * Returns a (possibly cached) ContextLoader instance.
  * Recreates only if the options fingerprint changes.
  * @private
@@ -587,6 +598,8 @@ module.exports = {
   // Prompt A/B testing
   setPromptSlotManager,
   getPromptSlotManager,
+  // ContextLoader access (for SkillWatcher integration)
+  getCachedLoader,
   // Long-running agent pattern modules
   FeatureList:    require('./feature-list').FeatureList,
   FeatureStatus:  require('./feature-list').FeatureStatus,

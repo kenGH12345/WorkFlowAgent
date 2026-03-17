@@ -75,7 +75,9 @@ module.exports = {
         domains: [
             "workflow",
             "orchestration"
-        ]
+        ],
+        type: "workflow",
+        loadLevel: "task"
     },
     {
         name: "code-review",
@@ -83,7 +85,9 @@ module.exports = {
         domains: [
             "quality",
             "review"
-        ]
+        ],
+        type: "best-practice",
+        loadLevel: "task"
     },
     {
         name: "javascript-dev",
@@ -92,7 +96,9 @@ module.exports = {
             "frontend",
             "backend",
             "javascript"
-        ]
+        ],
+        type: "language",
+        loadLevel: "project"
     },
     {
         name: "standards",

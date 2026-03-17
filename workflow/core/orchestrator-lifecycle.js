@@ -22,6 +22,7 @@ const fs = require('fs');
 const { PATHS, HOOK_EVENTS } = require('./constants');
 const { STATE_ORDER } = require('./types');
 const { SkillWatcher } = require('./skill-watcher');
+const { getCachedLoader } = require('./prompt-builder');
 
 module.exports = {
 
@@ -61,14 +62,19 @@ module.exports = {
     }
 
     // 4. Start SkillWatcher for hot-reload of skill files
-    if (this.contextLoader && this.skillEvolution) {
-      this._skillWatcher = new SkillWatcher(this.contextLoader, PATHS.SKILLS_DIR, {
+    // Fix: ContextLoader is a module-level cached singleton inside prompt-builder.js,
+    // not an Orchestrator property. Use getCachedLoader() to retrieve it.
+    const cachedLoader = getCachedLoader();
+    if (cachedLoader && this.skillEvolution) {
+      this._skillWatcher = new SkillWatcher(cachedLoader, PATHS.SKILLS_DIR, {
         skillEvolution: this.skillEvolution,
       });
       this._skillWatcher.on('skill:changed', ({ filename, eventType }) => {
         console.log(`[Orchestrator] 🔄 Skill hot-reload: ${filename} (${eventType})`);
       });
       this._skillWatcher.start();
+    } else if (!cachedLoader) {
+      console.log(`[Orchestrator] ℹ️  SkillWatcher deferred: ContextLoader not yet initialised (will activate on first LLM call).`);
     }
 
     return resumeState;
@@ -115,6 +121,33 @@ module.exports = {
     if (this._skillWatcher) {
       this._skillWatcher.stop();
       this._skillWatcher = null;
+    }
+
+    // ── Export resolved complaints to troubleshooting skill ────────────────────
+    // Closes the feedback loop: complaint resolution → troubleshooting knowledge.
+    // Collects all resolved complaints, formats them as troubleshooting entries,
+    // and feeds them into SkillEvolution to update the troubleshooting skill file.
+    if (this.complaintWall && this.skillEvolution) {
+      try {
+        const { entries, count } = this.complaintWall.exportToTroubleshooting();
+        if (count > 0) {
+          for (const entry of entries) {
+            this.skillEvolution.evolve('troubleshooting', {
+              trigger: `complaint-resolution:${entry.sourceComplaintId}`,
+              newContent: [
+                `### ${entry.title}`,
+                `**Error:** ${entry.error}`,
+                `**Root Cause:** ${entry.rootCause}`,
+                `**Fix:** ${entry.fix}`,
+                `**Prevention:** ${entry.prevention}`,
+              ].join('\n'),
+            });
+          }
+          console.log(`[Orchestrator] 📚 Exported ${count} resolved complaint(s) to troubleshooting skill.`);
+        }
+      } catch (tsErr) {
+        console.warn(`[Orchestrator] ⚠️  Troubleshooting export failed (non-fatal): ${tsErr.message}`);
+      }
     }
 
     // ── Prompt A/B: snapshot variant stats into Observability before flush ──
