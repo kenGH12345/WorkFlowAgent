@@ -177,6 +177,65 @@ module.exports = {
       }
     }
 
+    // ── AEF Self-Refinement Analysis ──────────────────────────────────────────
+    // Inspired by AEF's self-refinement skill: analyse the workflow run for
+    // error patterns and generate refinement suggestions.
+    // Two channels: automatic (low-severity, auto-evolve) and prudent (high-severity, suggest only).
+    if (this.complaintWall && this.skillEvolution && this.experienceStore) {
+      try {
+        const openComplaints = this.complaintWall.getOpenComplaints();
+        const negativeExps = this.experienceStore.getAll ? this.experienceStore.getAll().filter(e => e.type === 'negative') : [];
+        const refinementSuggestions = [];
+
+        // Analyse open complaints for recurring patterns
+        const patternCounts = {};
+        for (const c of openComplaints) {
+          const key = c.targetType + ':' + (c.rootCause || 'unknown');
+          patternCounts[key] = (patternCounts[key] || 0) + 1;
+        }
+
+        for (const [pattern, count] of Object.entries(patternCounts)) {
+          if (count >= 2) {
+            const [targetType, rootCause] = pattern.split(':');
+            refinementSuggestions.push({
+              pattern,
+              count,
+              rootCause,
+              suggestion: `Recurring ${targetType} issue (${rootCause}): ${count} open complaints. Consider adding a preventive rule to the relevant skill.`,
+            });
+          }
+        }
+
+        if (refinementSuggestions.length > 0) {
+          console.log(`\n${'─'.repeat(60)}`);
+          console.log(`  💡 AEF SELF-REFINEMENT SUGGESTIONS (${refinementSuggestions.length})`);
+          console.log(`${'─'.repeat(60)}`);
+          for (const s of refinementSuggestions.slice(0, 3)) {
+            console.log(`  [${s.rootCause}] ${s.suggestion}`);
+          }
+          console.log(`${'─'.repeat(60)}\n`);
+        }
+
+        // Auto-evolve: for low-severity resolved complaints with clear patterns,
+        // automatically add prevention rules to relevant skills
+        const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status === 'resolved' && c.rootCause);
+        for (const rc of resolvedComplaints.slice(-3)) {  // Last 3 resolved
+          const skillName = rc.targetType === 'skill' ? rc.targetId : 'troubleshooting';
+          if (this.skillEvolution.registry.has(skillName)) {
+            this.skillEvolution.evolve(skillName, {
+              section: 'Prevention Rules',
+              title: `[Auto] Prevention for ${rc.rootCause}: ${rc.description.slice(0, 60)}`,
+              content: `**Root Cause**: ${rc.rootCause}\n**Prevention**: ${rc.suggestion}\n**Source**: Complaint ${rc.id}`,
+              sourceExpId: rc.id,
+              reason: `AEF self-refinement: auto-evolve from resolved complaint`,
+            });
+          }
+        }
+      } catch (srErr) {
+        console.warn(`[Orchestrator] ⚠️  AEF Self-Refinement analysis failed (non-fatal): ${srErr.message}`);
+      }
+    }
+
     // ── Prompt A/B: snapshot variant stats into Observability before flush ──
     if (this.promptSlotManager) {
       this.obs.recordPromptVariantUsage(this.promptSlotManager.getStats());

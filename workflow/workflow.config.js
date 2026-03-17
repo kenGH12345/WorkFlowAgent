@@ -64,9 +64,9 @@ module.exports = {
   // Skills in higher tiers have loading priority; lower-tier skills fill remaining
   // token budget. Dependencies declared in skill YAML frontmatter are auto-resolved.
 
-  globalSkills: ['standards', 'troubleshooting'],
+  globalSkills: ['standards', 'troubleshooting', 'bp-coding-best-practices'],
 
-  projectSkills: ['javascript-dev'],
+  projectSkills: ['javascript-dev', 'bp-architecture-design'],
 
   // ─── Built-in Skills ─────────────────────────────────────────────────────────
   builtinSkills: [    {
@@ -121,6 +121,56 @@ module.exports = {
         ],
         type: "troubleshooting",
         loadLevel: "global"
+    },
+    // ── AEF Best Practice Skills ──────────────────────────────────────────
+    {
+        name: "bp-coding-best-practices",
+        description: "Universal coding best practices: readability, naming, functions, control flow, resource safety",
+        domains: ["general", "quality", "coding"],
+        type: "best-practice",
+        loadLevel: "global"
+    },
+    {
+        name: "bp-architecture-design",
+        description: "Architecture design principles: module decomposition, dependency management, data architecture",
+        domains: ["architecture", "design"],
+        type: "best-practice",
+        loadLevel: "project"
+    },
+    {
+        name: "bp-component-design",
+        description: "Component-level design: SOLID, interfaces, data models, concurrency, error handling",
+        domains: ["design", "component"],
+        type: "best-practice",
+        loadLevel: "task"
+    },
+    {
+        name: "bp-distributed-systems",
+        description: "Distributed systems design principles and SDLC checklists",
+        domains: ["distributed", "network", "reliability"],
+        type: "best-practice",
+        loadLevel: "task"
+    },
+    {
+        name: "bp-performance-optimization",
+        description: "Performance optimization methodology, design principles and concrete rules",
+        domains: ["performance", "optimization"],
+        type: "best-practice",
+        loadLevel: "task"
+    },
+    {
+        name: "self-refinement",
+        description: "Error-driven feedback loop: distill correction experiences into persistent Rules/Skills",
+        domains: ["meta", "feedback", "learning"],
+        type: "workflow",
+        loadLevel: "task"
+    },
+    {
+        name: "spec-template",
+        description: "Structured spec document template (10-chapter format from AEF Spec-First methodology)",
+        domains: ["requirements", "specification", "design"],
+        type: "workflow",
+        loadLevel: "task"
     }
 ],
 

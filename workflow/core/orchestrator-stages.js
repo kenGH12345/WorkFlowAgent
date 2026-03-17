@@ -146,10 +146,31 @@ async function _runAnalyst(rawRequirement) {
   //   2. It's written to metrics-history.jsonl for cross-session complexity drift
   //      detection (Rule 6b: if complex tasks systematically fail more than simple
   //      ones, proactively raise retry budgets)
+  //
+  // AEF Fast-Path: complexity assessment also drives stage routing:
+  //   - Simple (score < 3): streamlined flow, can skip detailed architecture
+  //   - Medium (3-6): standard flow
+  //   - Complex (> 6): full flow with enhanced review budgets
   if (this.obs) {
     const requirementText = clarResult.enrichedRequirement || '';
     const complexity = Observability.estimateTaskComplexity(requirementText);
     this.obs.recordTaskComplexity(complexity);
+
+    // Store complexity for downstream fast-path decisions
+    if (this.stageCtx) {
+      const existingAnalyse = this.stageCtx.get('ANALYSE') || {};
+      this.stageCtx.set('ANALYSE', {
+        ...existingAnalyse,
+        meta: { ...(existingAnalyse.meta || {}), complexity },
+      });
+    }
+
+    console.log(`[Orchestrator] 📊 AEF Complexity Assessment: level=${complexity.level}, score=${complexity.score}`);
+    if (complexity.level === 'simple') {
+      console.log(`[Orchestrator] ⚡ AEF Fast-Path: Simple task detected — ARCHITECT stage will use streamlined review.`);
+    } else if (complexity.level === 'complex') {
+      console.log(`[Orchestrator] 🔍 AEF Full-Path: Complex task detected — enhanced review budgets will be applied.`);
+    }
 
     // Re-derive adaptive strategy with the complexity dimension now available.
     // At Orchestrator construction time, taskComplexity was null (ANALYSE hadn't run yet),

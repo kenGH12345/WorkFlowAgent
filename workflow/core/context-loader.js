@@ -74,16 +74,24 @@ const BUILTIN_SKILL_KEYWORDS = {
   'troubleshooting':      ['error', 'bug', 'fix', 'crash', 'fail', 'issue', 'debug', 'troubleshoot', 'exception'],
   'standards':            ['standard', 'convention', 'naming', 'style', 'format', 'lint'],
   'code-development':     ['code', 'develop', 'implement', 'build', 'program'],
+  // ── AEF Best Practice Skills ──────────────────────────────────────────────
+  'bp-coding-best-practices':  ['coding', 'clean code', 'naming', 'guard clause', 'RAII', 'readability', 'safety'],
+  'bp-architecture-design':    ['architecture', 'module', 'dependency', 'data flow', 'trade-off', 'coupling'],
+  'bp-component-design':       ['component', 'class', 'interface', 'SOLID', 'design pattern', 'concurrency', 'error handling'],
+  'bp-distributed-systems':    ['distributed', 'RPC', 'network', 'replication', 'failover', 'consensus', 'circuit breaker'],
+  'bp-performance-optimization':['performance', 'optimize', 'cache', 'latency', 'throughput', 'profiling', 'memory'],
+  'self-refinement':           ['refine', 'reflect', 'improve', 'learn', 'mistake', 'correct', 'feedback'],
+  'spec-template':             ['spec', 'specification', 'feature', 'requirement', 'design document'],
 };
 
 // ─── Role → Mandatory docs mapping ───────────────────────────────────────────
 // These docs are ALWAYS injected for the given role, regardless of task content.
 
 const ROLE_MANDATORY_DOCS = {
-  analyst:    ['docs/architecture-constraints.md'],
-  architect:  ['docs/architecture-constraints.md', 'docs/decision-log.md'],
-  developer:  ['docs/architecture-constraints.md', 'output/code-graph.md'],
-  tester:     ['docs/architecture-constraints.md'],
+  analyst:    ['docs/architecture-constraints.md', 'output/spec.md'],
+  architect:  ['docs/architecture-constraints.md', 'docs/decision-log.md', 'output/spec.md'],
+  developer:  ['docs/architecture-constraints.md', 'output/code-graph.md', 'output/spec.md'],
+  tester:     ['docs/architecture-constraints.md', 'output/spec.md'],
   'coding-agent': ['docs/architecture-constraints.md', 'output/code-graph.md'],
   'init-agent':   [],
 };

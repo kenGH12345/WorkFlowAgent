@@ -32,6 +32,17 @@ const ComplaintSeverity = {
   MINOR:       'minor',        // Small inconsistency, fix when convenient
 };
 
+// ─── AEF Root Cause Classification ────────────────────────────────────────────
+// From AEF self-refinement: every error has one of four root causes.
+// Used for structured error analysis and targeted skill evolution.
+
+const RootCause = {
+  SPEC_MISSING:    'spec-missing',     // No rule/skill covers this scenario
+  KNOWLEDGE_GAP:   'knowledge-gap',    // AI lacks project-specific domain knowledge
+  PROCESS_SKIP:    'process-skip',     // Workflow skill missing a critical step or checkpoint
+  PATTERN_WRONG:   'pattern-wrong',    // AI applied wrong reasoning pattern (analogy vs first principles)
+};
+
 // ─── Complaint Target Types ───────────────────────────────────────────────────
 
 const ComplaintTarget = {
@@ -90,7 +101,7 @@ class ComplaintWall {
    * @param {string}   [options.taskId]     - Task where the issue was encountered
    * @returns {Complaint}
    */
-  file({ targetType, targetId, severity, description, suggestion, agentId = 'unknown', taskId = null }) {
+  file({ targetType, targetId, severity, description, suggestion, agentId = 'unknown', taskId = null, rootCause = null }) {
     // N44 fix: include a monotonic sequence number to avoid ID collisions within the same ms.
     const id = `CMP-${Date.now()}-${String(this._idSeq++).padStart(4, '0')}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
     const complaint = {
@@ -100,6 +111,7 @@ class ComplaintWall {
       severity,
       description,
       suggestion,
+      rootCause: rootCause || null,   // AEF root cause classification
       agentId,
       taskId,
       status: ComplaintStatus.OPEN,
@@ -383,4 +395,4 @@ class ComplaintWall {
   }
 }
 
-module.exports = { ComplaintWall, ComplaintSeverity, ComplaintTarget, ComplaintStatus };
+module.exports = { ComplaintWall, ComplaintSeverity, ComplaintTarget, ComplaintStatus, RootCause };

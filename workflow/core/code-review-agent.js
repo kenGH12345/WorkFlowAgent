@@ -32,6 +32,35 @@ const { ReviewAgentBase } = require('./review-agent-base');
 // ─── Built-in Checklist ───────────────────────────────────────────────────────
 
 /**
+ * AEF-inspired Review Dimensions (from workflow-code-review).
+ * Used to categorise findings and support targeted re-review.
+ *
+ * When a fix addresses only one dimension, only the corresponding reviewer
+ * dimension is re-run (instead of full re-review) – saving LLM calls.
+ */
+const REVIEW_DIMENSIONS = {
+  SPEC_COMPLIANCE: 'spec-compliance',   // Does the code match the spec?
+  STANDARDS:       'standards',          // Does the code follow coding standards?
+  PERFORMANCE:     'performance',        // Are there performance concerns?
+  ROBUSTNESS:      'robustness',         // Are edge cases and errors handled?
+};
+
+/**
+ * Maps each checklist item to its review dimension.
+ * This enables targeted re-review: when fixing a PERF issue,
+ * only the performance dimension is re-reviewed.
+ */
+const ITEM_TO_DIMENSION = {
+  'SEC':    REVIEW_DIMENSIONS.ROBUSTNESS,
+  'ERR':    REVIEW_DIMENSIONS.ROBUSTNESS,
+  'PERF':   REVIEW_DIMENSIONS.PERFORMANCE,
+  'STYLE':  REVIEW_DIMENSIONS.STANDARDS,
+  'REQ':    REVIEW_DIMENSIONS.SPEC_COMPLIANCE,
+  'SYNTAX': REVIEW_DIMENSIONS.STANDARDS,
+  'EDGE':   REVIEW_DIMENSIONS.ROBUSTNESS,
+};
+
+/**
  * Default checklist items.
  * Each item has: id, category, severity, description, hint.
  * Callers can extend this via options.extraChecklist.
@@ -447,6 +476,32 @@ class CodeReviewAgent extends ReviewAgentBase {
       ``,
     ];
 
+    // ── AEF Multi-Dimensional Summary ──────────────────────────────────────
+    // Group failures by review dimension for targeted re-review support
+    const dimensionStats = {};
+    for (const dim of Object.values(REVIEW_DIMENSIONS)) {
+      dimensionStats[dim] = { total: 0, passed: 0, failed: 0 };
+    }
+    for (const f of (result.allResults || [])) {
+      const prefix = (f.id || '').split('-')[0];
+      const dim = ITEM_TO_DIMENSION[prefix] || REVIEW_DIMENSIONS.STANDARDS;
+      if (!dimensionStats[dim]) dimensionStats[dim] = { total: 0, passed: 0, failed: 0 };
+      dimensionStats[dim].total++;
+      if (f.result === 'PASS') dimensionStats[dim].passed++;
+      else if (f.result === 'FAIL') dimensionStats[dim].failed++;
+    }
+    if (result.allResults && result.allResults.length > 0) {
+      lines.push(`## 🔍 Multi-Dimensional Analysis (AEF 4-Way Review)`);
+      lines.push(``);
+      lines.push(`| Dimension | Status | Issues |`);
+      lines.push(`|-----------|--------|--------|`);
+      for (const [dim, stats] of Object.entries(dimensionStats)) {
+        const dimIcon = stats.failed === 0 ? '✅ PASS' : '❌ NEEDS_CHANGES';
+        lines.push(`| ${dim} | ${dimIcon} | ${stats.failed} |`);
+      }
+      lines.push(``);
+    }
+
     if (result.failures.length > 0) {
       const byCategory = {};
       for (const f of result.failures) {
@@ -504,4 +559,4 @@ class CodeReviewAgent extends ReviewAgentBase {
  * @property {string}   [skipReason]
  */
 
-module.exports = { CodeReviewAgent, DEFAULT_CHECKLIST };
+module.exports = { CodeReviewAgent, DEFAULT_CHECKLIST, REVIEW_DIMENSIONS, ITEM_TO_DIMENSION };
