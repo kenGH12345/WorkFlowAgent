@@ -168,8 +168,10 @@ async function _runAnalyst(rawRequirement) {
     console.log(`[Orchestrator] 📊 AEF Complexity Assessment: level=${complexity.level}, score=${complexity.score}`);
     if (complexity.level === 'simple') {
       console.log(`[Orchestrator] ⚡ AEF Fast-Path: Simple task detected — ARCHITECT stage will use streamlined review.`);
-    } else if (complexity.level === 'complex') {
-      console.log(`[Orchestrator] 🔍 AEF Full-Path: Complex task detected — enhanced review budgets will be applied.`);
+    } else if (complexity.level === 'moderate') {
+      console.log(`[Orchestrator] ▶️  AEF Standard-Path: Moderate task detected — standard review flow.`);
+    } else if (complexity.level === 'complex' || complexity.level === 'very_complex') {
+      console.log(`[Orchestrator] 🔍 AEF Full-Path: ${complexity.level === 'very_complex' ? 'Very complex' : 'Complex'} task detected — enhanced review budgets will be applied.`);
     }
 
     // Re-derive adaptive strategy with the complexity dimension now available.

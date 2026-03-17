@@ -270,6 +270,11 @@ class ReviewAgentBase {
       na: lastReviewResults.filter(r => r.result === 'N/A').length,
       missing: finalMissing.length,
       failures: allFailed,
+      // Fix: expose the full results array (PASS + FAIL + N/A + MISSING) so
+      // subclass formatReport() methods can perform multi-dimensional analysis.
+      // Previously only `failures` (FAIL + MISSING) was returned, causing
+      // CodeReviewAgent's AEF 4-Way Review dimension table to always be empty.
+      allResults: lastReviewResults,
       history,
       riskNotes,
       needsHumanReview: highFailures.length > 0,

@@ -23,6 +23,7 @@ const { PATHS, HOOK_EVENTS } = require('./constants');
 const { STATE_ORDER } = require('./types');
 const { SkillWatcher } = require('./skill-watcher');
 const { getCachedLoader, onLoaderReady } = require('./prompt-builder');
+const { ComplaintStatus } = require('./complaint-wall');
 
 module.exports = {
 
@@ -218,7 +219,7 @@ module.exports = {
 
         // Auto-evolve: for low-severity resolved complaints with clear patterns,
         // automatically add prevention rules to relevant skills
-        const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status === 'resolved' && c.rootCause);
+const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status === ComplaintStatus.RESOLVED && c.rootCause);
         for (const rc of resolvedComplaints.slice(-3)) {  // Last 3 resolved
           const skillName = rc.targetType === 'skill' ? rc.targetId : 'troubleshooting';
           if (this.skillEvolution.registry.has(skillName)) {

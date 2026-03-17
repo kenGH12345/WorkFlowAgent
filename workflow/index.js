@@ -39,13 +39,13 @@ const { PATHS, HOOK_EVENTS } = require('./core/constants');
 // AgentFlow modules
 const { TaskManager, TaskStatus } = require('./core/task-manager');
 const { ExperienceStore, ExperienceType, ExperienceCategory } = require('./core/experience-store');
-const { ComplaintWall, ComplaintSeverity, ComplaintTarget } = require('./core/complaint-wall');
+const { ComplaintWall, ComplaintSeverity, ComplaintTarget, ComplaintStatus, RootCause } = require('./core/complaint-wall');
 const { SkillEvolutionEngine } = require('./core/skill-evolution');
 const { getConfig } = require('./core/config-loader');
 const { SelfCorrectionEngine, formatClarificationReport } = require('./core/clarification-engine');
 const { RequirementClarifier } = require('./core/requirement-clarifier');
 const { CoverageChecker } = require('./core/coverage-checker');
-const { CodeReviewAgent } = require('./core/code-review-agent');
+const { CodeReviewAgent, REVIEW_DIMENSIONS, ITEM_TO_DIMENSION } = require('./core/code-review-agent');
 const { ArchitectureReviewAgent } = require('./core/architecture-review-agent');
 const { TestRunner } = require('./core/test-runner');
 const { Observability } = require('./core/observability');

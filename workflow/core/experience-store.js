@@ -208,6 +208,16 @@ class ExperienceStore {
   }
 
   /**
+   * Returns all experiences in the store.
+   * Used by AEF Self-Refinement analysis to scan for negative experience patterns.
+   *
+   * @returns {Experience[]}
+   */
+  getAll() {
+    return this.experiences;
+  }
+
+  /**
    * Returns statistics about the experience store.
    */
   getStats() {
