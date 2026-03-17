@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 1280px; height: 640px;
+    background: linear-gradient(135deg, #0d1117 0%, #161b22 40%, #1a1e2e 100%);
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    color: #e6edf3; overflow: hidden; position: relative;
+  }
+  /* Grid background */
+  body::before {
+    content: '';
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(56,139,253,0.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(56,139,253,0.05) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+  .container {
+    display: flex; align-items: center; gap: 60px;
+    position: relative; z-index: 1;
+  }
+  .left {
+    text-align: left;
+  }
+  .logo {
+    font-size: 64px; font-weight: 900; letter-spacing: -2px;
+    background: linear-gradient(135deg, #58a6ff, #f78166);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    margin-bottom: 12px;
+  }
+  .icon { font-size: 56px; margin-right: 8px; }
+  .tagline {
+    font-size: 20px; color: #8b949e; max-width: 440px;
+    line-height: 1.5;
+  }
+  .tagline strong { color: #58a6ff; }
+  /* Architecture mini-diagram */
+  .arch {
+    display: flex; flex-direction: column; gap: 8px;
+    background: rgba(22,27,34,0.8);
+    border: 1px solid rgba(56,139,253,0.2);
+    border-radius: 12px; padding: 24px 28px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 13px; color: #8b949e;
+    box-shadow: 0 0 40px rgba(56,139,253,0.1);
+  }
+  .arch-row {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .agent {
+    background: rgba(56,139,253,0.15);
+    border: 1px solid rgba(56,139,253,0.3);
+    border-radius: 6px; padding: 6px 14px;
+    color: #58a6ff; font-weight: 600;
+  }
+  .arrow { color: #f78166; font-weight: bold; font-size: 16px; }
+  .layer-bar {
+    margin-top: 12px; display: flex; gap: 6px;
+  }
+  .layer {
+    background: rgba(247,129,102,0.15);
+    border: 1px solid rgba(247,129,102,0.3);
+    border-radius: 4px; padding: 4px 10px;
+    color: #f78166; font-size: 11px; font-weight: 600;
+  }
+</style>
+</head>
+<body>
+  <div class="container">
+    <div class="left">
+      <div class="logo"><span class="icon">⚒</span>CODEX FORGE</div>
+      <div class="tagline">
+        <strong>Production-grade AI Agent Runtime</strong><br>
+        Turns one sentence into production code<br>
+        via a 5-layer Harness architecture
+      </div>
+    </div>
+    <div class="arch">
+      <div class="arch-row">
+        <span class="agent">📋 Analyst</span>
+        <span class="arrow">→</span>
+        <span class="agent">🏗️ Architect</span>
+      </div>
+      <div class="arch-row" style="justify-content:center;">
+        <span class="arrow">↓</span>
+      </div>
+      <div class="arch-row">
+        <span class="agent">💻 Developer</span>
+        <span class="arrow">→</span>
+        <span class="agent">🧪 Tester</span>
+      </div>
+      <div class="arch-row" style="justify-content:center;">
+        <span class="arrow">↓</span>
+      </div>
+      <div class="arch-row" style="justify-content:center;">
+        <span class="agent">🔍 Reviewer</span>
+      </div>
+      <div class="layer-bar">
+        <span class="layer">ENV</span>
+        <span class="layer">TOOL</span>
+        <span class="layer">CTRL</span>
+        <span class="layer">MEM</span>
+        <span class="layer">EVAL</span>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

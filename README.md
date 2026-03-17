@@ -11,6 +11,17 @@
 [![Tests](https://img.shields.io/badge/Tests-62%20passed-brightgreen)](https://github.com/kenGH12345/CodexForge)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/kenGH12345/CodexForge/pulls)
 
+### 🎬 See it in action
+
+<!-- 🔴 TODO: Replace with actual demo recording
+     Record a 30s GIF/video: one sentence → full production code
+     Recommended tools: asciinema, vhs (charmbracelet), or OBS + gifski
+     Optimal size: 800×450, < 5MB for fast loading
+-->
+<img src="docs/assets/demo.gif" alt="CODEX FORGE Demo — from one sentence to production code" width="720">
+
+*One sentence in, production code out — powered by 5 specialized AI agents.*
+
 **[English](#english-version)** · **[中文](#chinese-version)**
 
 </div>
