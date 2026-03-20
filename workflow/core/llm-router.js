@@ -50,8 +50,21 @@ class LlmRouter {
    * @param {Object<string, Function>} [roleRoutes] - Per-role LLM overrides.
    *   Keys are role names (e.g. 'ANALYST', 'ARCHITECT', 'DEVELOPER', 'TESTER').
    *   Values are async (prompt: string) => string functions.
+   * @param {Object} [tierConfig] - P1 Tier-based routing: complexity → model tier mapping.
+   *   Keys are tier names: 'fast', 'default', 'strong'.
+   *   Values are async (prompt: string) => string functions.
+   *   When configured, applyTierRouting(complexity) dynamically sets role routes
+   *   based on the task complexity assessed after the ANALYSE stage.
+   *
+   *   Tier assignment rules:
+   *     - 'simple'       → ARCHITECT=fast,  DEVELOPER=default, TESTER=fast
+   *     - 'moderate'     → ARCHITECT=default, DEVELOPER=default, TESTER=default
+   *     - 'complex'      → ARCHITECT=strong, DEVELOPER=strong, TESTER=default
+   *     - 'very_complex' → ARCHITECT=strong, DEVELOPER=strong, TESTER=strong
+   *
+   *   Per-role overrides (roleRoutes) always take priority over tier-derived routes.
    */
-  constructor(defaultLlmCall, roleRoutes = {}) {
+  constructor(defaultLlmCall, roleRoutes = {}, tierConfig = null) {
     if (typeof defaultLlmCall !== 'function') {
       throw new Error('[LlmRouter] defaultLlmCall must be a function.');
     }
@@ -61,11 +74,38 @@ class LlmRouter {
     /** @type {Map<string, { calls: number, totalChars: number }>} */
     this._usage = new Map();
 
+    // P1 Tier-based routing: store tier config and explicit role overrides
+    /** @type {{ fast?: Function, default?: Function, strong?: Function }|null} */
+    this._tiers = null;
+    /** @type {Set<string>} - roles that have explicit per-role overrides (immune to tier routing) */
+    this._explicitRoles = new Set();
+    /** @type {string|null} - the complexity level that was last applied */
+    this._appliedComplexityLevel = null;
+
     for (const [role, fn] of Object.entries(roleRoutes)) {
       if (typeof fn !== 'function') {
         throw new Error(`[LlmRouter] Route for role "${role}" must be a function.`);
       }
       this._routes.set(role, fn);
+      this._explicitRoles.add(role);
+    }
+
+    // Validate and store tier config
+    if (tierConfig && typeof tierConfig === 'object') {
+      const validTiers = ['fast', 'default', 'strong'];
+      const validatedTiers = {};
+      for (const tier of validTiers) {
+        if (tierConfig[tier]) {
+          if (typeof tierConfig[tier] !== 'function') {
+            throw new Error(`[LlmRouter] Tier "${tier}" must be a function.`);
+          }
+          validatedTiers[tier] = tierConfig[tier];
+        }
+      }
+      if (Object.keys(validatedTiers).length > 0) {
+        this._tiers = validatedTiers;
+        console.log(`[LlmRouter] Tier routing configured: [${Object.keys(validatedTiers).join(', ')}]`);
+      }
     }
   }
 
@@ -151,6 +191,16 @@ class LlmRouter {
   }
 
   /**
+   * Checks if a role has an explicit per-role override (immune to tier routing).
+   *
+   * @param {string} role
+   * @returns {boolean}
+   */
+  hasExplicitRoute(role) {
+    return this._explicitRoles.has(role);
+  }
+
+  /**
    * Returns the default LLM function.
    *
    * @returns {Function}
@@ -190,6 +240,114 @@ class LlmRouter {
   resetUsage() {
     this._usage.clear();
     return this;
+  }
+
+  /**
+   * Returns the current tier configuration (if any).
+   *
+   * @returns {{ fast?: Function, default?: Function, strong?: Function }|null}
+   */
+  getTierConfig() {
+    return this._tiers;
+  }
+
+  /**
+   * Returns the complexity level that was last applied via applyTierRouting().
+   *
+   * @returns {string|null}
+   */
+  getAppliedComplexityLevel() {
+    return this._appliedComplexityLevel;
+  }
+
+  /**
+   * P1 Auto Tier Routing: dynamically assigns model tiers to roles based on
+   * task complexity. Called after the ANALYSE stage produces a complexity score.
+   *
+   * Tier assignment strategy (inspired by OpenCode's cost-aware routing):
+   *
+   *   | Complexity    | ANALYST   | ARCHITECT | DEVELOPER | TESTER  |
+   *   |---------------|-----------|-----------|-----------|---------|
+   *   | simple        | default   | fast      | default   | fast    |
+   *   | moderate      | default   | default   | default   | default |
+   *   | complex       | default   | strong    | strong    | default |
+   *   | very_complex  | default   | strong    | strong    | strong  |
+   *
+   * Rules:
+   *   - ANALYST is always 'default' (it runs BEFORE complexity is known)
+   *   - Per-role explicit overrides (from constructor roleRoutes) are NEVER overwritten
+   *   - If a tier function is not configured, falls back to the next lower tier
+   *   - If no tier config exists at all, this is a no-op
+   *
+   * @param {{ score: number, level: string, factors?: object }} complexity
+   *   - From Observability.estimateTaskComplexity()
+   * @returns {{ applied: boolean, changes: string[] }} - Summary of applied changes
+   */
+  applyTierRouting(complexity) {
+    if (!this._tiers || !complexity || !complexity.level) {
+      return { applied: false, changes: [] };
+    }
+
+    const level = complexity.level;
+    this._appliedComplexityLevel = level;
+
+    // Tier resolution: prefer exact tier, fall back to next lower, then default LLM
+    const resolveTier = (tierName) => {
+      if (tierName === 'strong') {
+        return this._tiers.strong || this._tiers.default || this._default;
+      }
+      if (tierName === 'fast') {
+        return this._tiers.fast || this._tiers.default || this._default;
+      }
+      // 'default' tier
+      return this._tiers.default || this._default;
+    };
+
+    // Define the tier mapping strategy
+    const TIER_MAP = {
+      simple: {
+        ANALYST: 'default', ARCHITECT: 'fast', PLANNER: 'fast', DEVELOPER: 'default', TESTER: 'fast',
+      },
+      moderate: {
+        ANALYST: 'default', ARCHITECT: 'default', PLANNER: 'default', DEVELOPER: 'default', TESTER: 'default',
+      },
+      complex: {
+        ANALYST: 'default', ARCHITECT: 'strong', PLANNER: 'default', DEVELOPER: 'strong', TESTER: 'default',
+      },
+      very_complex: {
+        ANALYST: 'default', ARCHITECT: 'strong', PLANNER: 'strong', DEVELOPER: 'strong', TESTER: 'strong',
+      },
+    };
+
+    const mapping = TIER_MAP[level] || TIER_MAP.moderate;
+    const changes = [];
+
+    for (const [role, tierName] of Object.entries(mapping)) {
+      // Never overwrite explicit per-role overrides
+      if (this._explicitRoles.has(role)) {
+        continue;
+      }
+      // Skip ANALYST – it already ran before complexity was known
+      if (role === 'ANALYST') {
+        continue;
+      }
+
+      const tierFn = resolveTier(tierName);
+      // Only apply if the tier function differs from what's currently set
+      const currentFn = this._routes.get(role) || this._default;
+      if (tierFn !== currentFn) {
+        this._routes.set(role, tierFn);
+        changes.push(`${role}→${tierName}`);
+      }
+    }
+
+    if (changes.length > 0) {
+      console.log(`[LlmRouter] 🎯 Auto-tier routing applied (complexity=${level}, score=${complexity.score}): [${changes.join(', ')}]`);
+    } else {
+      console.log(`[LlmRouter] ℹ️  Auto-tier routing: no changes needed (complexity=${level}).`);
+    }
+
+    return { applied: changes.length > 0, changes };
   }
 
   // ─── Private ──────────────────────────────────────────────────────────────────

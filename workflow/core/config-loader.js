@@ -13,10 +13,10 @@
  * ```js
  * module.exports = {
  *   // File extensions to scan for code symbols and experience generation
- *   sourceExtensions: ['.cs', '.lua'],
+ *   sourceExtensions: ['.js', '.ts'],
  *
  *   // Directories to ignore during scanning
- *   ignoreDirs: ['node_modules', '.git', 'Library', 'Temp', 'Packages'],
+ *   ignoreDirs: ['node_modules', '.git', 'dist', 'build'],
  *
  *   // Built-in skills to register on startup
  *   builtinSkills: [
@@ -24,11 +24,11 @@
  *   ],
  *
  *   // Classification rules for experience generation
- *   // Each rule: { ext: '.cs'|'.lua'|'*', test: (path, content) => bool, result: {...} | fn }
+ *   // Each rule: { ext: '.js'|'.py'|'*', test: (path, content) => bool, result: {...} | fn }
  *   classificationRules: [...],
  *
  *   // Default skill name used when no rule matches (per extension)
- *   defaultSkills: { '.cs': 'csharp-dev', '.lua': 'lua-scripting' },
+ *   defaultSkills: { '.js': 'javascript-dev' },
  * };
  * ```
  */

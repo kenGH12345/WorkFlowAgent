@@ -40,6 +40,7 @@ class EntropyGC {
    * @param {string[]} [options.ignoreDirs]  - Directories to skip
    * @param {number}   [options.maxLines]    - Max lines per file
    * @param {string[]} [options.docPaths]    - Paths to freshness-check
+   * @param {object}   [options.codeQualityAdapter] - Optional CodeQuality MCP adapter for deeper analysis
    */
   constructor({
     projectRoot,
@@ -50,6 +51,7 @@ class EntropyGC {
     docPaths    = [],
     lintCommand = null,
     llmCall     = null,
+    codeQualityAdapter = null,
   } = {}) {
     this._root       = projectRoot;
     this._outputDir  = outputDir;
@@ -59,6 +61,7 @@ class EntropyGC {
     this._docPaths   = docPaths;
     this._lintCmd    = lintCommand !== undefined ? lintCommand : this._detectLintCommand();
     this._llmCall    = llmCall;
+    this._codeQualityAdapter = codeQualityAdapter;
   }
 
   // ─── Public API ───────────────────────────────────────────────────────────
@@ -115,6 +118,10 @@ class EntropyGC {
     const lintViolations = await this._runStaticAnalysis();
     violations.push(...lintViolations);
 
+    // Check 6: Code quality (MCP adapter – complexity, duplication, code smells)
+    const qualityViolations = await this._runCodeQualityCheck();
+    violations.push(...qualityViolations);
+
     // Write reports
     const reportPath = this._writeReport(violations, sourceFiles.length);
     this._writeJson(violations, sourceFiles.length);
@@ -149,9 +156,9 @@ class EntropyGC {
         if (pkg.scripts && pkg.scripts.lint) return 'npm run lint';
         const eslintConfigs = ['.eslintrc.js', '.eslintrc.json', '.eslintrc.yml', '.eslintrc'];
         if (eslintConfigs.some(c => fs.existsSync(path.join(this._root, c)))) {
-          return 'npx eslint . --max-warnings=0 --format=compact';
+        return 'npx eslint . --max-warnings=0 --format=compact';
         }
-      } catch (_) {}
+      } catch (err) { console.warn(`[EntropyGC] Failed to parse package.json for lint command: ${err.message}`); }
     }
     if (fs.existsSync(path.join(this._root, 'go.mod'))) {
       return 'golangci-lint run --out-format=line-number 2>&1 || true';
@@ -227,6 +234,88 @@ class EntropyGC {
     return violations;
   }
 
+  // ─── Code Quality (MCP adapter integration) ──────────────────────────────
+
+  /**
+   * Queries the CodeQuality MCP adapter for deeper analysis: complexity hotspots,
+   * duplication, code smells, and quality gate violations. Falls back gracefully
+   * if no adapter is configured.
+   *
+   * @returns {Promise<object[]>} Violation objects
+   */
+  async _runCodeQualityCheck() {
+    if (!this._codeQualityAdapter) return [];
+    try {
+      if (!this._codeQualityAdapter.isConnected) return [];
+      console.log(`[EntropyGC] 📊 Running code quality check (${this._codeQualityAdapter.backend || 'local'})...`);
+
+      const projectMetrics = await this._codeQualityAdapter.getProjectMetrics();
+      const violations = [];
+      const metrics = projectMetrics.metrics || {};
+
+      // High-complexity files
+      if (metrics.highComplexityFiles && metrics.highComplexityFiles.length > 0) {
+        for (const f of metrics.highComplexityFiles.slice(0, 5)) {
+          violations.push({
+            type:     'HIGH_COMPLEXITY',
+            severity: f.complexity > 40 ? 'high' : 'medium',
+            file:     f.file,
+            detail:   `Cyclomatic complexity: ${f.complexity} (threshold: 20)`,
+            suggestion: 'Split into smaller functions. Extract complex conditionals into named helpers.',
+          });
+        }
+      }
+
+      // High duplication
+      if (metrics.duplicatedLinesPct > 10) {
+        violations.push({
+          type:     'CODE_DUPLICATION',
+          severity: metrics.duplicatedLinesPct > 20 ? 'high' : 'medium',
+          file:     '(project-wide)',
+          detail:   `${metrics.duplicatedLinesPct.toFixed(1)}% duplicated lines (threshold: 10%)`,
+          suggestion: 'Extract shared code into utility modules or base classes.',
+        });
+      }
+
+      // Quality gate failure
+      const gate = projectMetrics.qualityGate || {};
+      if (gate.status === 'ERROR') {
+        const failedMetrics = (gate.conditions || [])
+          .filter(c => c.status !== 'OK')
+          .map(c => `${c.metric}=${c.actual}`)
+          .join(', ');
+        violations.push({
+          type:     'QUALITY_GATE_FAILED',
+          severity: 'high',
+          file:     '(project)',
+          detail:   `Quality gate FAILED: ${failedMetrics || 'unknown conditions'}`,
+          suggestion: 'Address the failing quality gate conditions before release.',
+        });
+      }
+
+      // Code smells threshold
+      if (metrics.codeSmells > 50) {
+        violations.push({
+          type:     'CODE_SMELL_DENSITY',
+          severity: metrics.codeSmells > 100 ? 'medium' : 'low',
+          file:     '(project-wide)',
+          detail:   `${metrics.codeSmells} code smell(s) detected`,
+          suggestion: 'Schedule a cleanup sprint to reduce code smell density.',
+        });
+      }
+
+      if (violations.length > 0) {
+        console.log(`[EntropyGC] 📊 Code quality check: ${violations.length} issue(s) found`);
+      } else {
+        console.log(`[EntropyGC] 📊 Code quality check: no issues found`);
+      }
+      return violations;
+    } catch (err) {
+      console.warn(`[EntropyGC] Code quality check failed (non-fatal): ${err.message}`);
+      return [];
+    }
+  }
+
   // ─── Checks ───────────────────────────────────────────────────────────────
 
   _checkDeadCodeDensity(filePath) {
@@ -262,7 +351,7 @@ class EntropyGC {
           suggestion: 'Review and update this document to reflect current project state.',
         };
       }
-    } catch (_) {}
+    } catch (err) { console.warn(`[EntropyGC] Doc freshness check failed for ${path.relative(this._root, docPath)}: ${err.message}`); }
     return null;
   }
 
@@ -288,7 +377,7 @@ class EntropyGC {
             suggestion: `Source files should not live in ${dir}/. Move to appropriate module directory.`,
           });
         }
-      } catch (_) {}
+      } catch (err) { console.warn(`[EntropyGC] Constraint drift check failed for ${dir}/: ${err.message}`); }
     }
     return violations;
   }

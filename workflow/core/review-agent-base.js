@@ -281,6 +281,35 @@ class ReviewAgentBase {
       skipped: false,
     };
 
+    // P1: Coverage self-check matrix (if subclass provides it)
+    if (typeof this.computeCoverageMatrix === 'function') {
+      result.coverageMatrix = this.computeCoverageMatrix(lastReviewResults, currentContent);
+      const cm = result.coverageMatrix;
+      this._log(`[${label}] 🛡️  Coverage matrix: ${cm.coveragePercent}% (${cm.covered.length} covered, ${cm.blindSpots.length} blind spots, ${cm.notCovered.length} N/A)`);
+      if (cm.blindSpots.length > 0) {
+        const blindNames = cm.blindSpots.map(d => d.name).join(', ');
+        this._log(`[${label}] ⚠️  Blind spots: ${blindNames}`);
+        riskNotes.push(`[${label}] Security coverage blind spots: ${blindNames}`);
+      }
+    }
+
+    // P1: Defect chain / attack chain analysis (if subclass provides it)
+    if (typeof this.analyseDefectChains === 'function') {
+      result.defectChains = this.analyseDefectChains(lastReviewResults);
+      if (result.defectChains.chainCount > 0) {
+        this._log(`[${label}] ⛓️  ${result.defectChains.chainCount} defect chain(s) detected!`);
+        for (const chain of result.defectChains.chains) {
+          const ids = chain.involvedFindings.map(f => f.id).join(' + ');
+          this._log(`[${label}]   🔗 ${chain.name} [${chain.severity}]: ${ids} → ${chain.impact.slice(0, 80)}...`);
+          riskNotes.push(`[${label}] Defect chain: ${chain.name} (${chain.severity}) — ${ids}`);
+        }
+        // Escalate to human review if any critical chain is found
+        if (result.defectChains.chains.some(c => c.severity === 'critical')) {
+          result.needsHumanReview = true;
+        }
+      }
+    }
+
     // Write review report
     this._writeReport(result);
 

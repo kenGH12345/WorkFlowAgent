@@ -25,7 +25,7 @@ function _detectFlutterStateManagement(root) {
     if (content.includes('get:') || content.includes('getx')) return 'GetX';
     if (content.includes('mobx'))                           return 'MobX';
     if (content.includes('redux'))                          return 'Redux';
-  } catch (_) {}
+  } catch (err) { console.warn(`[TechProfiles] Failed to read pubspec.yaml: ${err.message}`); }
   return 'StatefulWidget (default)';
 }
 
@@ -40,7 +40,7 @@ function _detectNodePlatform(root) {
     if (deps['next'] || deps['nuxt'])                               return 'Web (SSR)';
     if (deps['react'] || deps['vue'] || deps['svelte'])             return 'Web (SPA)';
     if (deps['express'] || deps['fastify'] || deps['koa'])          return 'Server (Node.js)';
-  } catch (_) {}
+  } catch (err) { console.warn(`[TechProfiles] Failed to detect Node platform: ${err.message}`); }
   return 'Node.js';
 }
 
@@ -58,7 +58,7 @@ function _detectJsStateManagement(root) {
     if (deps['pinia'])                                return 'Pinia (Vue)';
     if (deps['vuex'])                                 return 'Vuex';
     if (deps['react'])                                return 'React useState / useContext';
-  } catch (_) {}
+  } catch (err) { console.warn(`[TechProfiles] Failed to detect JS state management: ${err.message}`); }
   return 'Module-level state';
 }
 
@@ -73,7 +73,7 @@ function _countFilesWithExt(root, ext, subdirs) {
     try {
       const entries = fs.readdirSync(dir);
       count += entries.filter(e => e.endsWith(ext)).length;
-    } catch (_) {}
+    } catch (err) { console.warn(`[TechProfiles] Failed to count files in ${sub}: ${err.message}`); }
   }
   return count;
 }
@@ -127,6 +127,10 @@ const TECH_PROFILES = [
     platforms: (root) => _detectFlutterPlatforms(root),
     namingConvention: 'PascalCase for classes/widgets, camelCase for functions/variables, snake_case for files',
     stateManagement: (root) => _detectFlutterStateManagement(root),
+    // CLI command to scaffold a standard Flutter project structure
+    // Delegates to the official Flutter CLI — always up-to-date, zero maintenance
+    cliInitCommand: (projectRoot, projectName) => `flutter create --project-name ${projectName} "${projectRoot}"`,
+
     skills: [
       { name: 'workflow-orchestration', description: 'Multi-agent workflow orchestration SOP', domains: ['workflow', 'orchestration'] },
       { name: 'code-review',            description: 'Code review checklist and best practices', domains: ['quality', 'review'] },
@@ -184,6 +188,7 @@ const TECH_PROFILES = [
     extensions: ['.go'],
     ignoreDirs: ['node_modules', '.git', 'dist', 'build', 'vendor'],
     testCommand: 'go test ./...',
+    cliInitCommand: (projectRoot, projectName) => `cd "${projectRoot}" && go mod init ${projectName}`,
     platforms: () => 'Server / CLI',
     namingConvention: 'PascalCase for exported, camelCase for unexported, snake_case for files',
     stateManagement: () => 'Stateless services; use context.Context for request-scoped state',
@@ -202,6 +207,7 @@ const TECH_PROFILES = [
     extensions: ['.ts', '.tsx'],
     ignoreDirs: ['node_modules', '.git', 'dist', 'build', 'output'],
     testCommand: 'npm test',
+    cliInitCommand: (projectRoot, projectName) => `cd "${projectRoot}" && npm init -y && npx tsc --init`,
     platforms: (root) => _detectNodePlatform(root),
     namingConvention: 'PascalCase for classes/interfaces, camelCase for functions/variables, kebab-case for files',
     stateManagement: (root) => _detectJsStateManagement(root),
@@ -220,6 +226,7 @@ const TECH_PROFILES = [
     extensions: ['.js', '.mjs'],
     ignoreDirs: ['node_modules', '.git', 'dist', 'build', 'output'],
     testCommand: 'npm test',
+    cliInitCommand: (projectRoot, projectName) => `cd "${projectRoot}" && npm init -y`,
     platforms: (root) => _detectNodePlatform(root),
     namingConvention: 'camelCase for functions/variables, PascalCase for classes, kebab-case for files',
     stateManagement: (root) => _detectJsStateManagement(root),
@@ -238,6 +245,7 @@ const TECH_PROFILES = [
     extensions: ['.py'],
     ignoreDirs: ['node_modules', '.git', '__pycache__', '.venv', 'venv', 'dist', 'build'],
     testCommand: 'pytest',
+    cliInitCommand: (projectRoot, projectName) => `cd "${projectRoot}" && python -m venv .venv && echo "# ${projectName}" > requirements.txt`,
     platforms: () => 'Server / CLI',
     namingConvention: 'snake_case for functions/variables/files, PascalCase for classes, UPPER_SNAKE_CASE for constants',
     stateManagement: () => 'Stateless functions preferred; use dataclasses/Pydantic for structured state',
@@ -256,6 +264,7 @@ const TECH_PROFILES = [
     extensions: ['.java'],
     ignoreDirs: ['node_modules', '.git', 'target', 'build', '.gradle'],
     testCommand: fs.existsSync('pom.xml') ? 'mvn test' : 'gradle test',
+    cliInitCommand: (projectRoot, projectName) => `cd "${projectRoot}" && mvn archetype:generate -DgroupId=com.${projectName} -DartifactId=${projectName} -DarchetypeArtifactId=maven-archetype-quickstart -DinteractiveMode=false`,
     platforms: () => 'Server / JVM',
     namingConvention: 'PascalCase for classes, camelCase for methods/variables, UPPER_SNAKE_CASE for constants',
     stateManagement: () => 'Spring beans (singleton); use immutable DTOs for data transfer',
@@ -274,6 +283,7 @@ const TECH_PROFILES = [
     extensions: ['.rs'],
     ignoreDirs: ['node_modules', '.git', 'target'],
     testCommand: 'cargo test',
+    cliInitCommand: (projectRoot, projectName) => `cargo init "${projectRoot}" --name ${projectName}`,
     platforms: () => 'Server / CLI / Systems',
     namingConvention: 'snake_case for functions/variables/files, PascalCase for types/traits, SCREAMING_SNAKE_CASE for constants',
     stateManagement: () => 'Ownership model; use Arc<Mutex<T>> for shared mutable state',
@@ -292,6 +302,7 @@ const TECH_PROFILES = [
     extensions: ['.cs'],
     ignoreDirs: ['node_modules', '.git', 'bin', 'obj', '.vs'],
     testCommand: 'dotnet test',
+    cliInitCommand: (projectRoot, projectName) => `dotnet new console -o "${projectRoot}" --name ${projectName}`,
     platforms: () => 'Server / Desktop / Web',
     namingConvention: 'PascalCase for classes/methods/properties, camelCase for local variables, _camelCase for private fields',
     stateManagement: () => 'Dependency injection (IServiceCollection); use immutable records for DTOs',
@@ -301,6 +312,143 @@ const TECH_PROFILES = [
       { name: 'dotnet-dev',             description: '.NET/C# development patterns', domains: ['backend', 'dotnet', 'csharp'] },
     ],
     defaultSkills: { '.cs': 'dotnet-dev' },
+  },
+  {
+    id: 'kotlin',
+    name: 'Kotlin',
+    techStack: 'Kotlin + JVM',
+    detect: (root) => {
+      const hasKts = fs.existsSync(path.join(root, 'build.gradle.kts'));
+      const hasKt  = _countFilesWithExt(root, '.kt', ['.', 'src', 'src/main/kotlin']) > 0;
+      return hasKts && hasKt;
+    },
+    extensions: ['.kt', '.kts'],
+    ignoreDirs: ['node_modules', '.git', 'build', '.gradle', '.idea', 'target'],
+    testCommand: 'gradle test',
+    cliInitCommand: (projectRoot, projectName) => `cd "${projectRoot}" && gradle init --type kotlin-application --project-name ${projectName}`,
+    platforms: () => 'Server / Android / JVM',
+    namingConvention: 'PascalCase for classes, camelCase for functions/properties, UPPER_SNAKE_CASE for constants',
+    stateManagement: () => 'Kotlin coroutines + StateFlow; use data classes for immutable state',
+    skills: [
+      { name: 'workflow-orchestration', description: 'Multi-agent workflow orchestration SOP', domains: ['workflow', 'orchestration'] },
+      { name: 'code-review',            description: 'Code review checklist and best practices', domains: ['quality', 'review'] },
+      { name: 'kotlin-dev',             description: 'Kotlin development patterns (Ktor, Compose, Spring)', domains: ['backend', 'kotlin', 'android'] },
+    ],
+    defaultSkills: { '.kt': 'kotlin-dev', '.kts': 'kotlin-dev' },
+  },
+  {
+    id: 'php',
+    name: 'PHP',
+    techStack: 'PHP',
+    detect: (root) => fs.existsSync(path.join(root, 'composer.json')) || _countFilesWithExt(root, '.php', ['.', 'src', 'app', 'public']) > 0,
+    extensions: ['.php'],
+    ignoreDirs: ['node_modules', '.git', 'vendor', 'storage', 'bootstrap/cache'],
+    testCommand: 'vendor/bin/phpunit',
+    cliInitCommand: (projectRoot, projectName) => `cd "${projectRoot}" && composer init --name="${projectName}/${projectName}" --no-interaction`,
+    platforms: () => 'Web Server',
+    namingConvention: 'PascalCase for classes, camelCase for methods/variables, snake_case for functions (legacy), PSR-12 standard',
+    stateManagement: () => 'Request-scoped (stateless); use session/cache for persistence',
+    skills: [
+      { name: 'workflow-orchestration', description: 'Multi-agent workflow orchestration SOP', domains: ['workflow', 'orchestration'] },
+      { name: 'code-review',            description: 'Code review checklist and best practices', domains: ['quality', 'review'] },
+      { name: 'php-dev',                description: 'PHP development patterns (Laravel, Symfony)', domains: ['backend', 'php', 'web'] },
+    ],
+    defaultSkills: { '.php': 'php-dev' },
+  },
+  {
+    id: 'ruby',
+    name: 'Ruby',
+    techStack: 'Ruby',
+    detect: (root) => fs.existsSync(path.join(root, 'Gemfile')) || fs.existsSync(path.join(root, 'config.ru')),
+    extensions: ['.rb', '.erb'],
+    ignoreDirs: ['node_modules', '.git', 'vendor', 'tmp', 'log', '.bundle'],
+    testCommand: 'bundle exec rspec',
+    cliInitCommand: (projectRoot, projectName) => `cd "${projectRoot}" && rails new ${projectName} --skip-bundle`,
+    platforms: () => 'Web Server / CLI',
+    namingConvention: 'snake_case for methods/variables/files, PascalCase for classes/modules, SCREAMING_SNAKE_CASE for constants',
+    stateManagement: () => 'Request-scoped (stateless); use ActiveRecord for persistence',
+    skills: [
+      { name: 'workflow-orchestration', description: 'Multi-agent workflow orchestration SOP', domains: ['workflow', 'orchestration'] },
+      { name: 'code-review',            description: 'Code review checklist and best practices', domains: ['quality', 'review'] },
+      { name: 'ruby-dev',               description: 'Ruby development patterns (Rails, Sinatra)', domains: ['backend', 'ruby', 'web'] },
+    ],
+    defaultSkills: { '.rb': 'ruby-dev' },
+  },
+  {
+    id: 'swift',
+    name: 'Swift',
+    techStack: 'Swift',
+    detect: (root) => fs.existsSync(path.join(root, 'Package.swift')) || _countFilesWithExt(root, '.swift', ['.', 'Sources', 'src']) > 0,
+    extensions: ['.swift'],
+    ignoreDirs: ['node_modules', '.git', '.build', '.swiftpm', 'DerivedData'],
+    testCommand: 'swift test',
+    cliInitCommand: (projectRoot, projectName) => `cd "${projectRoot}" && swift package init --name ${projectName}`,
+    platforms: () => 'iOS / macOS / Server',
+    namingConvention: 'PascalCase for types/protocols, camelCase for functions/properties, UPPER_SNAKE_CASE for static constants',
+    stateManagement: () => 'SwiftUI @State/@ObservedObject; Combine for reactive streams',
+    skills: [
+      { name: 'workflow-orchestration', description: 'Multi-agent workflow orchestration SOP', domains: ['workflow', 'orchestration'] },
+      { name: 'code-review',            description: 'Code review checklist and best practices', domains: ['quality', 'review'] },
+      { name: 'swift-dev',              description: 'Swift development patterns (SwiftUI, Vapor, UIKit)', domains: ['ios', 'macos', 'swift'] },
+    ],
+    defaultSkills: { '.swift': 'swift-dev' },
+  },
+  {
+    id: 'cpp',
+    name: 'C / C++',
+    techStack: 'C/C++',
+    detect: (root) => fs.existsSync(path.join(root, 'CMakeLists.txt')) || fs.existsSync(path.join(root, 'Makefile')) || _countFilesWithExt(root, '.cpp', ['.', 'src']) > 0,
+    extensions: ['.cpp', '.c', '.h', '.hpp'],
+    ignoreDirs: ['node_modules', '.git', 'build', 'cmake-build-debug', 'cmake-build-release', '.cache'],
+    testCommand: 'cmake --build build --target test',
+    cliInitCommand: (projectRoot, projectName) => `mkdir -p "${projectRoot}/src" && echo 'cmake_minimum_required(VERSION 3.15)\\nproject(${projectName} CXX)\\nadd_executable(${projectName} src/main.cpp)' > "${projectRoot}/CMakeLists.txt"`,
+    platforms: () => 'Systems / Desktop / Embedded',
+    namingConvention: 'PascalCase for classes, camelCase or snake_case for functions/variables (project-dependent), UPPER_SNAKE_CASE for macros',
+    stateManagement: () => 'RAII + smart pointers (unique_ptr/shared_ptr); avoid raw pointers',
+    skills: [
+      { name: 'workflow-orchestration', description: 'Multi-agent workflow orchestration SOP', domains: ['workflow', 'orchestration'] },
+      { name: 'code-review',            description: 'Code review checklist and best practices', domains: ['quality', 'review'] },
+      { name: 'cpp-dev',                description: 'C/C++ development patterns (CMake, Qt, systems)', domains: ['systems', 'cpp', 'desktop'] },
+    ],
+    defaultSkills: { '.cpp': 'cpp-dev', '.c': 'cpp-dev', '.h': 'cpp-dev', '.hpp': 'cpp-dev' },
+  },
+  {
+    id: 'scala',
+    name: 'Scala',
+    techStack: 'Scala + JVM',
+    detect: (root) => fs.existsSync(path.join(root, 'build.sbt')) || _countFilesWithExt(root, '.scala', ['.', 'src', 'src/main/scala']) > 0,
+    extensions: ['.scala', '.sc'],
+    ignoreDirs: ['node_modules', '.git', 'target', 'project/target', '.bsp', '.metals'],
+    testCommand: 'sbt test',
+    cliInitCommand: (projectRoot, projectName) => `cd "${projectRoot}" && sbt new scala/scala-seed.g8 --name=${projectName}`,
+    platforms: () => 'Server / Data / JVM',
+    namingConvention: 'PascalCase for classes/objects/traits, camelCase for methods/values, UPPER_SNAKE_CASE for constants',
+    stateManagement: () => 'Immutable vals preferred; Akka actors or ZIO for concurrent state',
+    skills: [
+      { name: 'workflow-orchestration', description: 'Multi-agent workflow orchestration SOP', domains: ['workflow', 'orchestration'] },
+      { name: 'code-review',            description: 'Code review checklist and best practices', domains: ['quality', 'review'] },
+      { name: 'scala-dev',              description: 'Scala development patterns (Akka, Play, Spark)', domains: ['backend', 'data', 'scala'] },
+    ],
+    defaultSkills: { '.scala': 'scala-dev' },
+  },
+  {
+    id: 'elixir',
+    name: 'Elixir',
+    techStack: 'Elixir + OTP',
+    detect: (root) => fs.existsSync(path.join(root, 'mix.exs')),
+    extensions: ['.ex', '.exs'],
+    ignoreDirs: ['node_modules', '.git', '_build', 'deps', '.elixir_ls'],
+    testCommand: 'mix test',
+    cliInitCommand: (projectRoot, projectName) => `cd "${projectRoot}" && mix new ${projectName}`,
+    platforms: () => 'Server / Real-time',
+    namingConvention: 'snake_case for functions/variables/files, PascalCase for modules, SCREAMING_SNAKE_CASE for module attributes',
+    stateManagement: () => 'GenServer / Agent for stateful processes; ETS for shared in-memory state',
+    skills: [
+      { name: 'workflow-orchestration', description: 'Multi-agent workflow orchestration SOP', domains: ['workflow', 'orchestration'] },
+      { name: 'code-review',            description: 'Code review checklist and best practices', domains: ['quality', 'review'] },
+      { name: 'elixir-dev',             description: 'Elixir development patterns (Phoenix, LiveView, Ecto)', domains: ['backend', 'elixir', 'realtime'] },
+    ],
+    defaultSkills: { '.ex': 'elixir-dev', '.exs': 'elixir-dev' },
   },
 ];
 
@@ -317,12 +465,12 @@ function detectTechStack(projectRoot) {
       if (profile.detect(projectRoot)) {
         return { profile, projectName };
       }
-    } catch (_) {}
+    } catch (err) { console.warn(`[TechProfiles] Detection failed for ${profile.id}: ${err.message}`); }
   }
 
   // Fallback: count file extensions to pick the most common one
   const extCounts = {};
-  const knownExts = ['.cs', '.lua', '.go', '.ts', '.js', '.py', '.java', '.cpp', '.rs'];
+  const knownExts = ['.cs', '.lua', '.go', '.ts', '.js', '.py', '.java', '.cpp', '.rs', '.kt', '.php', '.rb', '.swift', '.c', '.scala', '.ex'];
   const ignoreFallback = ['node_modules', '.git', 'Library', 'Temp', 'Packages'];
 
   function walkCount(dir, depth) {

@@ -12,13 +12,39 @@
 'use strict';
 
 module.exports = {
-  // ─── Project Identity ────────────────────────────────────────────────────
-  projectName: 'workflow',
-  techStack: 'JavaScript + Node.js',
+  // ─── Runtime-Detected (uncomment only to override auto-detection) ─────
+  // projectName, techStack, sourceExtensions, and ignoreDirs are auto-detected
+  // at runtime by detectTechStack(). No need to configure manually.
+  // projectName: 'WorkFlowAgent',
+  // techStack: 'JavaScript + Node.js',
+  // sourceExtensions: ['.js', '.mjs'],
+  // ignoreDirs: ['node_modules', '.git', 'dist', 'build', 'output'],
 
-  // ─── Source Scanning ─────────────────────────────────────────────────────
-  sourceExtensions: ['.js', '.mjs'],
-  ignoreDirs: ['node_modules', '.git', 'dist', 'build', 'output'],
+  // ─── Code Graph ──────────────────────────────────────────────────────────────
+  //
+  // Controls how CodeGraph builds the symbol index for the project.
+  //
+  // Three-layer automatic filtering (always active, no config needed):
+  //   Layer 1: .gitignore patterns → auto-skips node_modules/, dist/, build/, etc.
+  //   Layer 2: Non-code dirs       → auto-skips images/, fonts/, docs/, data/, etc.
+  //   Layer 3: Extension check     → only scans files matching sourceExtensions above
+  //
+  // After these three layers, every collected file is a real code file.
+  // No file limit is applied – all code files are indexed for complete coverage.
+  //
+  // Incremental builds:
+  //   CodeGraph caches file mtimes and symbols. On subsequent builds, only files
+  //   whose mtime has changed are re-processed. Use /graph build --force for a
+  //   full rebuild. The cache is stored at output/.code-graph-cache.json.
+  //
+  // scopeDirs (optional, for large monorepos only):
+  //   Limit scanning to specific sub-directories when you only care about part
+  //   of a huge monorepo. Supports exact paths ('src/core') and keyword matching
+  //   ('lua' → matches XLua, tolua, lua_modules, etc.). Empty = full scan.
+  //
+  codeGraph: {
+    scopeDirs: [],             // Large monorepo only: ['packages/core', 'lua']. Empty = full scan
+  },
 
   // ─── Automated Verification Loop ─────────────────────────────────────────────
   //
@@ -228,20 +254,199 @@ module.exports = {
 
   // ─── MCP (Model Context Protocol) ────────────────────────────────────────────
   //
-  // Connect external systems (TAPD, CI/CD, DevTools) via MCP adapters.
+  // Connect external systems (TAPD, CI/CD, DevTools, Web Search) via MCP adapters.
   // When configured, lifecycle events (WORKFLOW_COMPLETE, WORKFLOW_ERROR) are
   // automatically broadcast to all connected adapters.
   //
-  // Uncomment and fill in credentials to enable:
+  // Supported adapters:
+  //   - tapd:            Tencent TAPD project management (stories, bugs, tasks)
+  //   - devtools:        CI/CD, code review, PR comments
+  //   - webSearch:       Web search and page fetching (tavily / brave / fetch)
+  //   - packageRegistry: Query npm/PyPI/crates.io for versions, deprecation, metadata
+  //   - securityCVE:     Query OSV.dev for known vulnerabilities (zero API key needed)
+  //   - codeQuality:     Real code quality metrics (SonarQube / SonarCloud / local analysis)
   //
-  // mcp: {
-  //   tapd: {
-  //     workspaceId: 'your-tapd-workspace-id',
-  //     accessToken: 'your-tapd-access-token',
-  //   },
-  //   devtools: {
-  //     ciApiBase: 'https://ci.example.com',
-  //     authToken: 'your-ci-auth-token',
-  //   },
-  // },
+  // WebSearch providers:
+  //   'tavily' – Best quality, requires API key (https://tavily.com)
+  //   'brave'  – Generous free tier, requires API key (https://brave.com/search/api)
+  //   'fetch'  – No API key needed, uses DuckDuckGo Lite as fallback
+  //
+  mcp: {
+    // tapd: {
+    //   workspaceId: 'your-tapd-workspace-id',
+    //   accessToken: 'your-tapd-access-token',
+    // },
+    // devtools: {
+    //   ciApiBase: 'https://ci.example.com',
+    //   authToken: 'your-ci-auth-token',
+    // },
+    webSearch: {
+      provider: 'fetch',       // 'tavily' | 'brave' | 'fetch'
+      // apiKey: '',            // Required for tavily/brave (or set TAVILY_API_KEY / BRAVE_API_KEY env var)
+      maxResults: 5,           // Max search results per query
+      timeout: 15000,          // HTTP request timeout in ms
+    },
+    // PackageRegistry: enabled by default (free, no API key needed)
+    // Queries npm/PyPI/crates.io for latest versions, deprecation status, metadata.
+    // Set to false to disable: packageRegistry: false
+    packageRegistry: {
+      defaultRegistry: 'npm',  // 'npm' | 'pypi' | 'crates'
+      timeout: 10000,          // HTTP request timeout in ms
+    },
+    // SecurityCVE: enabled by default (free, no API key needed, powered by OSV.dev)
+    // Checks project dependencies against known CVE/vulnerability databases.
+    // Set to false to disable: securityCVE: false
+    securityCVE: {
+      timeout: 15000,          // HTTP request timeout in ms
+    },
+    // LSP (Language Server Protocol): compiler-accurate code intelligence.
+    // Spawns a language server (e.g. typescript-language-server) to provide
+    // gotoDefinition, findReferences, getHover, documentSymbols, etc.
+    // Requires the language server to be installed globally (see installHint).
+    //
+    // AUTO-ENABLED by default: if a project file (tsconfig.json, pyproject.toml,
+    // go.mod, Cargo.toml) is detected AND the corresponding language server is
+    // installed, LSP activates automatically. No config needed.
+    // If no server is found, it falls back gracefully to regex-based indexing.
+    //
+    // Set to false to explicitly disable: lsp: false
+    // Supported servers: typescript, pyright, pylsp, gopls, rust-analyzer, omnisharp
+    //
+    // lsp: {
+    //   server: 'typescript',  // Auto-detect if omitted. Force a specific server.
+    //   // command: 'custom-lsp-server',  // Override the executable
+    //   // args: ['--stdio'],             // Override CLI args
+    //   timeout: 30000,        // LSP request timeout in ms
+    //   autoDetect: true,      // Auto-detect server from project files
+    // },
+
+    // CodeQuality: real code quality metrics for CodeReviewAgent.
+    // Enabled by default with 'local' backend (zero config needed).
+    // The local backend provides: cyclomatic complexity, code duplication,
+    // code smells, deep nesting, and a quality gate – all without external tools.
+    //
+    // For CI-grade accuracy, configure SonarQube or SonarCloud:
+    //   codeQuality: {
+    //     backend: 'sonarqube',
+    //     baseUrl: 'https://sonar.example.com',
+    //     token: 'your-sonar-token',          // or set SONAR_TOKEN env var
+    //     projectKey: 'my-project',
+    //   }
+    //   codeQuality: {
+    //     backend: 'sonarcloud',
+    //     organization: 'my-org',
+    //     token: 'your-sonar-token',
+    //     projectKey: 'my-project',
+    //   }
+    //
+    // Set to false to disable: codeQuality: false
+    codeQuality: {
+      backend: 'local',        // 'local' | 'sonarqube' | 'sonarcloud'
+      timeout: 15000,          // HTTP request timeout in ms (SonarQube/SonarCloud only)
+    },
+
+    // CIStatus: injects CI/CD pipeline status into DEVELOPER and TESTER stages.
+    // Wraps the existing CIIntegration class. Auto-detects GitHub Actions / GitLab CI
+    // from git remote URL or environment variables.
+    // Enabled by default; disable with ciStatus: false
+    //
+    // For remote CI polling: set GITHUB_TOKEN or GITLAB_TOKEN environment variable.
+    // Without a token, falls back to local CI status (last test results).
+    //
+    // ciStatus: {
+    //   provider: 'auto',     // 'github' | 'gitlab' | 'local' | 'auto'
+    //   apiToken: '',         // Or set GITHUB_TOKEN / GITLAB_TOKEN env var
+    //   repoSlug: '',         // 'owner/repo' (auto-detected from git remote)
+    //   cacheTtlMs: 120000,   // Cache TTL in ms (default: 2min)
+    // },
+
+    // LicenseCompliance: checks dependencies for open-source license compatibility.
+    // Uses ClearlyDefined API (free, no API key) with local node_modules fallback.
+    // Detects risky licenses (GPL, AGPL, SSPL) that may conflict with commercial projects.
+    // Enabled by default; disable with licenseCompliance: false
+    //
+    // licenseCompliance: {
+    //   backend: 'clearlydefined',  // 'clearlydefined' | 'local'
+    //   maxPackages: 30,            // Max packages to check
+    //   timeout: 15000,             // HTTP request timeout in ms
+    // },
+
+    // DocGen: API documentation skeleton and CHANGELOG auto-generation.
+    // Scans source files for undocumented exports (functions/classes without JSDoc).
+    // Generates CHANGELOG.md from git log using conventional commits format.
+    // Enabled by default; disable with docGen: false
+    //
+    // docGen: {
+    //   maxFiles: 50,              // Max source files to scan
+    //   sourceExts: ['.js', '.ts', '.mjs', '.py'],
+    // },
+
+    // LLMCostRouter: cost-aware LLM model routing and budget enforcement.
+    // Fetches real-time pricing from OpenRouter API (free, no key needed for pricing).
+    // Tracks per-role cost, warns when budget threshold is exceeded.
+    // Provides model recommendations optimised for cost/quality/speed.
+    // Enabled by default; disable with llmCostRouter: false
+    //
+    // llmCostRouter: {
+    //   budgetUsd: 5.0,           // Per-run budget in USD (default: 5.0)
+    //   warnThresholdPct: 80,     // Warn when budget usage exceeds this % (default: 80)
+    //   pricingBackend: 'openrouter', // 'openrouter' | 'litellm' | 'fallback'
+    //   litellmBaseUrl: 'http://localhost:4000',  // LiteLLM base URL (if using litellm)
+    //   cacheTtlMs: 3600000,      // Pricing cache TTL in ms (default: 1h)
+    // },
+
+    // ContainerSandbox: Docker/Podman container-based sandboxed execution.
+    // Runs tests and code verification in isolated containers with:
+    //   - Read-only filesystem mount
+    //   - Network isolation (--network=none)
+    //   - CPU/memory limits
+    //   - Non-root user execution
+    // DISABLED by default (requires Docker or Podman installed).
+    // Enable with: containerSandbox: true or containerSandbox: {}
+    //
+    // containerSandbox: {
+    //   runtime: 'auto',          // 'docker' | 'podman' | 'auto'
+    //   image: null,              // Auto-detected from project files (e.g. node:20-slim)
+    //   networkEnabled: false,    // Allow network access in container (default: false)
+    //   readonlyMount: true,      // Mount project as read-only (default: true)
+    //   defaultTimeoutMs: 120000, // Default execution timeout (default: 2min)
+    //   limits: {
+    //     cpus: '1.0',            // CPU core limit
+    //     memory: '512m',         // Memory limit
+    //     pidsLimit: 256,         // Max processes
+    //   },
+    // },
+
+    // FigmaDesign: extracts UI design tokens and component hierarchy from Figma files.
+    // Injects color palette, typography, spacing, shadows, breakpoints, and
+    // component tree into ARCHITECT and DEVELOPER stage prompts.
+    // Opt-in only (requires Figma Personal Access Token + file key).
+    // Enable with: figmaDesign: { accessToken: '...', fileKey: '...' }
+    //
+    // figmaDesign: {
+    //   accessToken: '',         // Or set FIGMA_ACCESS_TOKEN env var
+    //   fileKey: '',             // From Figma URL: figma.com/file/<FILE_KEY>/...
+    //   nodeId: '',              // Optional: specific page/node ID to extract
+    //   timeout: 15000,          // HTTP request timeout in ms
+    // },
+
+    // TestInfra: testing infrastructure enhancement.
+    // Parses local coverage reports (Istanbul/lcov/Clover) and tracks test history.
+    // Detects flaky tests and performance regressions across runs.
+    // Optional: integrates with Codecov API for coverage trends.
+    // Enabled by default; disable with testInfra: false
+    //
+    // testInfra: {
+    //   thresholds: {
+    //     lineCoverage: 80,       // Minimum line coverage %
+    //     branchCoverage: 70,     // Minimum branch coverage %
+    //     functionCoverage: 80,   // Minimum function coverage %
+    //     regressionDelta: -5,    // Alert if coverage drops by more than 5pp
+    //   },
+    //   flakyThreshold: 2,        // Min fail count to flag as flaky (default: 2)
+    //   codecovToken: '',         // Or set CODECOV_TOKEN env var
+    //   codecovOwner: '',         // GitHub org/user
+    //   codecovRepo: '',          // Repository name
+    // },
+  },
 };

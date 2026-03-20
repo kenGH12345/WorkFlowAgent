@@ -27,8 +27,9 @@ const { getConfig, getConfigPath, clearConfigCache } = require('./core/config-lo
 const { MemoryManager } = require('./core/memory-manager');
 const { SkillEvolutionEngine } = require('./core/skill-evolution');
 const { TECH_PROFILES, detectTechStack } = require('./core/tech-profiles');
-const { generateConfigFromProfile, _generateInitSh, _generateFeatureListTemplate } = require('./core/project-generators');
+const { generateConfigFromProfile, _generateInitSh, _generateFeatureListTemplate, _runCliInit } = require('./core/project-generators');
 const { _copyProjectTemplates } = require('./core/project-template');
+const { ProjectProfiler } = require('./core/project-profiler');
 
 // ─── CLI Args ─────────────────────────────────────────────────────────────────
 
@@ -51,23 +52,21 @@ function validateConfig(config, configPath) {
   const errors = [];
   const warnings = [];
 
-  // Required fields
-  if (!config.sourceExtensions || !Array.isArray(config.sourceExtensions) || config.sourceExtensions.length === 0) {
-    errors.push('`sourceExtensions` must be a non-empty array (e.g. [\'.cs\', \'.lua\'])');
-  }
-  if (!config.ignoreDirs || !Array.isArray(config.ignoreDirs)) {
-    errors.push('`ignoreDirs` must be an array');
+  // sourceExtensions and ignoreDirs are now auto-detected at runtime.
+  // Only warn if they're explicitly set but look wrong.
+  if (config.sourceExtensions && Array.isArray(config.sourceExtensions) && config.sourceExtensions.length === 0) {
+    warnings.push('`sourceExtensions` is an empty array. Runtime auto-detection will provide defaults.');
   }
   if (!config.builtinSkills || !Array.isArray(config.builtinSkills)) {
     errors.push('`builtinSkills` must be an array');
   }
 
-  // Warnings
+  // Warnings (informational)
   if (!config.projectName) {
-    warnings.push('`projectName` is not set. Consider adding it for better logging.');
+    warnings.push('`projectName` is not set. Will be auto-detected from directory name.');
   }
   if (!config.techStack) {
-    warnings.push('`techStack` is not set. Consider adding it for documentation.');
+    warnings.push('`techStack` is not set. Will be auto-detected from project files.');
   }
   if (!config.classificationRules || config.classificationRules.length === 0) {
     warnings.push('`classificationRules` is empty. Experience generation will use generic fallback rules.');
@@ -141,6 +140,31 @@ How it works:
   if (configPath) {
     // Config already exists – use it
     console.log(`📋 Config file: ${configPath} (existing)`);
+
+    // Always run tech stack detection to populate runtime fields
+    // (projectName, techStack, sourceExtensions, ignoreDirs).
+    // These are intentionally NOT stored in workflow.config.js — they are
+    // auto-detected fresh every time to stay in sync with the actual project.
+    if (!args.dryRun) {
+      try {
+        const { profile: detectedProfile, projectName: detectedName } = detectTechStack(projectRoot);
+        if (detectedProfile && detectedProfile.id !== 'generic') {
+          // Inject detected values into in-memory config (do NOT persist to file)
+          if (!config.projectName)       config.projectName       = detectedName;
+          if (!config.techStack)         config.techStack         = detectedProfile.techStack;
+          if (!config.sourceExtensions || config.sourceExtensions.length === 0) {
+            config.sourceExtensions = detectedProfile.extensions;
+          }
+          if (!config.ignoreDirs || config.ignoreDirs.length === 0) {
+            config.ignoreDirs = detectedProfile.ignoreDirs;
+          }
+          console.log(`   🔍 Auto-detected: ${detectedProfile.name}`);
+        }
+      } catch (detectErr) {
+        // Non-fatal: if re-detection fails, just proceed with existing config
+        console.warn(`   ℹ️  Tech stack auto-detection skipped: ${detectErr.message}`);
+      }
+    }
   } else {
     // No config found – auto-detect tech stack and generate one
     console.log(`📋 No workflow.config.js found. Auto-detecting tech stack...\n`);
@@ -203,6 +227,89 @@ How it works:
   } else {
     console.log(`      [dry-run] Would copy project-init-template/ files to: ${projectRoot}\n`);
   }
+
+  // ── Step 0.5: Run CLI init to scaffold project structure ─────────────────
+  const detectedProfile = TECH_PROFILES.find(p => p.techStack === config.techStack);
+  if (detectedProfile && detectedProfile.cliInitCommand) {
+    console.log(`[0.5/5] Running CLI scaffolding for ${detectedProfile.name}...`);
+    const cliResult = _runCliInit(projectRoot, detectedProfile, config.projectName || 'app', { dryRun: args.dryRun });
+    console.log(`      Command: ${cliResult.command}`);
+    if (cliResult.success) {
+      console.log(`      ✅ CLI scaffolding complete`);
+      if (cliResult.output) console.log(`      ${cliResult.output.split('\n')[0]}`);
+    } else {
+      console.warn(`      ⚠️  CLI scaffolding skipped: ${cliResult.error}`);
+      console.warn(`      💡 You can run the command manually later: ${cliResult.command}`);
+    }
+    console.log('');
+  }
+
+  // ── Step 0.7: Run ProjectProfiler (deep architecture analysis) ────────────
+  console.log(`[0.7/6] Running ProjectProfiler (deep architecture analysis)...`);
+  if (!args.dryRun) {
+    try {
+      const profiler = new ProjectProfiler(projectRoot, { ignoreDirs: config.ignoreDirs });
+
+      // Attempt LSP-enhanced analysis first; fallback to baseline file-detection
+      let projectProfile, profileMdPath;
+      try {
+        const lspConfig = (config.mcp && config.mcp.lsp && typeof config.mcp.lsp === 'object')
+          ? config.mcp.lsp
+          : {};
+        const result = await profiler.analyzeWithLSP(undefined, lspConfig);
+        projectProfile = result.profile;
+        profileMdPath = result.mdPath;
+      } catch (lspErr) {
+        console.log(`      ℹ️  LSP enhancement not available (${lspErr.message}). Using baseline.`);
+        const result = profiler.analyzeAndWrite();
+        projectProfile = result.profile;
+        profileMdPath = result.mdPath;
+      }
+
+      // Inject projectProfile into the running config so downstream steps can use it
+      config.projectProfile = projectProfile;
+
+      // Persist projectProfile into workflow.config.js so it survives across sessions
+      try {
+        const configFilePath = configPath || path.join(projectRoot, 'workflow.config.js');
+        if (fs.existsSync(configFilePath)) {
+          let configContent = fs.readFileSync(configFilePath, 'utf-8');
+          // Replace the null placeholder with the actual profile data
+          if (configContent.includes('projectProfile: null')) {
+            const profileJson = JSON.stringify(projectProfile, null, 4)
+              .split('\n').map((line, i) => i === 0 ? line : '  ' + line).join('\n');
+            configContent = configContent.replace(
+              'projectProfile: null,',
+              `projectProfile: ${profileJson},`
+            );
+            fs.writeFileSync(configFilePath, configContent, 'utf-8');
+            console.log(`      ✅ ProjectProfile persisted to workflow.config.js`);
+          }
+        }
+      } catch (persistErr) {
+        console.warn(`      ⚠️  Could not persist projectProfile to config: ${persistErr.message}`);
+      }
+
+      console.log(`      ✅ ProjectProfiler complete: ${profileMdPath}`);
+      if (projectProfile.frameworks.length > 0) {
+        console.log(`      📦 Frameworks: ${projectProfile.frameworks.map(f => f.name).join(', ')}`);
+      }
+      if (projectProfile.architecture.pattern) {
+        console.log(`      🏗️  Architecture: ${projectProfile.architecture.pattern}`);
+      }
+      if (projectProfile.dataLayer.orm.length > 0) {
+        console.log(`      💾 Data Layer: ${projectProfile.dataLayer.orm.join(', ')}`);
+      }
+      if (projectProfile.lspEnhanced) {
+        console.log(`      🔬 LSP Enhanced: ${projectProfile.lspServerName} (${projectProfile.lspStats?.symbolsCollected || 0} symbols)`);
+      }
+    } catch (err) {
+      console.warn(`      ⚠️  ProjectProfiler warning (non-fatal): ${err.message}`);
+    }
+  } else {
+    console.log(`      [dry-run] Would run ProjectProfiler for: ${projectRoot}`);
+  }
+  console.log('');
 
   // ── Step 1: Build AGENTS.md ────────────────────────────────────────────────
   console.log(`[1/5] Building AGENTS.md (global project context)...`);
@@ -314,13 +421,23 @@ How it works:
       const { CodeGraph } = require('./core/code-graph');
       const outputDir = path.join(projectRoot, 'output');
       const cfg = config || {};
+      // Do NOT pass extensions — let CodeGraph use its built-in default
+      // which covers ALL supported languages (.js, .ts, .cs, .lua, .go, .py, .dart).
+      // This ensures code-graph always scans all code files regardless of config.
+      //
+      // IMPORTANT: Always use projectRoot as the scan root, not any subdirectory.
+      // This prevents the "path anchoring bug" where only a subdirectory gets scanned.
+      console.log(`      📂 Scan root: ${projectRoot} (FULL project scan)`);
+      if (cfg.codeGraph?.scopeDirs?.length > 0) {
+        console.log(`      🔍 Scope limited to: ${cfg.codeGraph.scopeDirs.join(', ')}`);
+      }
       const graph = new CodeGraph({
         projectRoot,
         outputDir,
-        extensions: cfg.sourceExtensions,
-        ignoreDirs: cfg.ignoreDirs,
+        ignoreDirs:     cfg.ignoreDirs,
+        scopeDirs:      cfg.codeGraph?.scopeDirs,
       });
-      const result = await graph.build();
+      const result = await graph.build({ incremental: false, force: true });
       console.log(`      ✅ Code graph built: ${result.symbolCount} symbols, ${result.edgeCount} call edges, ${result.fileCount} files`);
       console.log(`      📄 Index: ${path.join(outputDir, 'code-graph.json')}`);
       console.log(`      📄 Summary: ${path.join(outputDir, 'code-graph.md')}\n`);
@@ -346,6 +463,7 @@ How it works:
   console.log(`  Code intelligence files:`);
   console.log(`    • output/code-graph.json     – Structured symbol index + call graph (auto-updated)`);
   console.log(`    • output/code-graph.md       – Human-readable code graph summary`);
+  console.log(`    • output/project-profile.md  – Deep architecture profile (frameworks, layers, data, infra)`);
   console.log(`  You can now run: node workflow/index.js\n`);
 }
 

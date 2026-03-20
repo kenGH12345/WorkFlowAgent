@@ -32,7 +32,8 @@ const { AnalystAgent } = require('./agents/analyst-agent');
 const { ArchitectAgent } = require('./agents/architect-agent');
 const { DeveloperAgent } = require('./agents/developer-agent');
 const { TesterAgent } = require('./agents/tester-agent');
-const { buildAgentPrompt, setPromptSlotManager, getPromptSlotManager } = require('./core/prompt-builder');
+const { PlannerAgent } = require('./agents/planner-agent');
+const { buildAgentPrompt, setPromptSlotManager, getPromptSlotManager, setSelfReflectionEngine, setSkillEvolutionEngine } = require('./core/prompt-builder');
 const { PromptSlotManager } = require('./core/prompt-slot-manager');
 const { WorkflowState, AgentRole, STATE_ORDER } = require('./core/types');
 const { PATHS, HOOK_EVENTS } = require('./core/constants');
@@ -41,6 +42,7 @@ const { TaskManager, TaskStatus } = require('./core/task-manager');
 const { ExperienceStore, ExperienceType, ExperienceCategory } = require('./core/experience-store');
 const { ComplaintWall, ComplaintSeverity, ComplaintTarget, ComplaintStatus, RootCause } = require('./core/complaint-wall');
 const { SkillEvolutionEngine } = require('./core/skill-evolution');
+const { SelfReflectionEngine } = require('./core/self-reflection-engine');
 const { getConfig } = require('./core/config-loader');
 const { SelfCorrectionEngine, formatClarificationReport } = require('./core/clarification-engine');
 const { RequirementClarifier } = require('./core/requirement-clarifier');
@@ -54,6 +56,8 @@ const { CIIntegration } = require('./core/ci-integration');
 const { CodeGraph } = require('./core/code-graph');
 const { GitIntegration } = require('./core/git-integration');
 const { DryRunSandbox } = require('./core/sandbox');
+const { FileLockManager, fileLockManager } = require('./core/file-lock-manager');
+const { AutoDeployer } = require('./core/auto-deployer');
 const _git       = require('./core/orchestrator-git');
 const _stages    = require('./core/orchestrator-stages');
 const _helpers   = require('./core/orchestrator-helpers');
@@ -63,11 +67,22 @@ const { StageContextStore } = require('./core/stage-context-store');
 // P0/P1 optimisation: ServiceContainer (DI), StageRunner (stage interface), StageRegistry (stage registration)
 const { ServiceContainer } = require('./core/service-container');
 const { StageRunner, StageRegistry } = require('./core/stage-runner');
-const { AnalystStage, ArchitectStage, DeveloperStage, TesterStage } = require('./core/stages');
+const { AnalystStage, ArchitectStage, PlannerStage, DeveloperStage, TesterStage } = require('./core/stages');
 // P3 optimisation: multi-model routing support
 const { LlmRouter } = require('./core/llm-router');
-// MCP (Model Context Protocol) adapters: pluggable external system integration
-const { MCPRegistry, TAPDAdapter, DevToolsAdapter } = require('./hooks/mcp-adapter');
+// P1-2: Agent Negotiation Protocol (inter-agent concern resolution)
+const { NegotiationEngine } = require('./core/negotiation-engine');
+// P1-4: Structured Logger (JSON Lines logging)
+const { Logger, logger: structuredLogger } = require('./core/logger');
+// P2-1: Cross-project experience routing
+const { ExperienceRouter } = require('./core/experience-router');
+// P2-3: Long-running service mode + health check
+const { WorkflowServer } = require('./core/workflow-server');
+// P2-4: Core module contracts (explicit interface validation)
+const { validateContract, assertContract, listContracts, ALL_CONTRACTS } = require('./core/contracts');
+// Smart Context Selection: dynamic adapter block priority adjustment based on project/task type
+// (moved to orchestrator-mcp.js; imports kept only if directly referenced elsewhere)
+// MCP (Model Context Protocol) adapters: moved to orchestrator-mcp.js (P1-1 extraction)
 
 class Orchestrator {
   /**
@@ -93,8 +108,15 @@ class Orchestrator {
    *   When specified, each role uses its own LLM model instead of the shared llmCall.
    *   Roles without an explicit override fall back to the default llmCall.
    *   Example: { ARCHITECT: claudeOpusCall, DEVELOPER: gpt4oCall }
+   * @param {Object} [options.llmTiers] - P1: Tier-based complexity-aware routing.
+   *   Defines model tiers that are automatically assigned to roles after ANALYSE
+   *   stage based on task complexity. More cost-effective than per-role routing
+   *   because assignment is dynamic – simple tasks use cheaper models.
+   *   Keys: 'fast', 'default', 'strong'. Values: async (prompt: string) => string.
+   *   Example: { fast: gpt4oMiniCall, default: gpt4oCall, strong: claudeOpusCall }
+   *   Note: Per-role overrides (llmRoutes) always take priority over tier routing.
    */
-  constructor({ projectId, llmCall, projectRoot = null, askUser = null, dryRun = false, git = {}, outputDir = null, llmRoutes = {} }) {
+  constructor({ projectId, llmCall, projectRoot = null, askUser = null, dryRun = false, git = {}, outputDir = null, llmRoutes = {}, llmTiers = null }) {
     this.projectId = projectId;
     this.projectRoot = projectRoot || path.resolve(__dirname, '..');
 
@@ -151,6 +173,15 @@ class Orchestrator {
       reviewers:  git.reviewers  ?? [],
     };
     this.git = new GitIntegration(this.projectRoot);
+
+    // ── P1 ADR-34: AutoDeployer (Staged Self-Deployment) ──────────────────
+    // Implements GREEN/YELLOW/RED tier deployment: auto-applies safe config
+    // changes, generates PRs for structural changes, maintains audit trail.
+    this.autoDeployer = new AutoDeployer({
+      outputDir:   this._outputDir,
+      projectRoot: this.projectRoot,
+      verbose:     true,
+    });
 
     // Load project config (workflow.config.js) for this project root.
     // N46 fix: do NOT call clearConfigCache() here. N43 fix made getConfig(projectRoot)
@@ -214,6 +245,33 @@ class Orchestrator {
 
     this.skillEvolution = new SkillEvolutionEngine();
 
+    // ADR-29: Register callback for auto-enriching newly created placeholder skills.
+    // When a new skill file is created (e.g. via auto-create from experience), this
+    // fires enrichSkillFromExternalKnowledge() in fire-and-forget mode to pre-populate
+    // the skill with knowledge from web sources, solving the cold-start problem.
+    this.skillEvolution.onSkillFileCreated = (meta) => {
+      const { enrichSkillFromExternalKnowledge } = require('./core/context-budget-manager');
+      // Only enrich if WebSearch is available (non-blocking, non-fatal)
+      enrichSkillFromExternalKnowledge(this, meta.name, { maxSearchResults: 3, maxFetchPages: 2 })
+        .then(r => {
+          if (r.success) {
+            console.log(`[Orchestrator] 🌐→📝 Auto-enriched new skill "${meta.name}": ${r.sectionsAdded} entries from ${r.sources.length} source(s)`);
+          }
+        })
+        .catch(() => { /* non-fatal: enrichment failure should never block workflow */ });
+    };
+
+    // ── P1 Self-Reflection Engine: quality gating + proactive audit ──────────
+    // This engine observes workflow execution, records issues, and proactively
+    // identifies improvement opportunities. It bridges to ExperienceStore (negative
+    // experiences) and ComplaintWall (high-severity auto-complaints).
+    this._selfReflection = new SelfReflectionEngine({
+      outputDir: this._outputDir,
+      experienceStore: this.experienceStore,
+      complaintWall: this.complaintWall,
+    });
+    console.log(`[Orchestrator] 🔍 SelfReflectionEngine initialised (${this._selfReflection.getStats().total} historical reflections loaded).`);
+
     // ── StageContextStore: cross-stage semantic context propagation ──────────
     // P2-A fix: initialise StageContextStore eagerly in the constructor instead of
     // lazily in _runAnalyst. The lazy pattern had two problems:
@@ -252,9 +310,12 @@ class Orchestrator {
     // This enables cost optimisation (cheap model for requirement analysis, strong model
     // for architecture design) and quality tuning (best coding model for development).
     // The router maintains a Map<role, llmCall> with a default fallback.
-    this.llmRouter = new LlmRouter(_originalLlmCall, llmRoutes);
+    this.llmRouter = new LlmRouter(_originalLlmCall, llmRoutes, llmTiers);
     if (Object.keys(llmRoutes).length > 0) {
       console.log(`[Orchestrator] 🔀 LlmRouter configured with ${Object.keys(llmRoutes).length} role-specific route(s): [${Object.keys(llmRoutes).join(', ')}]`);
+    }
+    if (llmTiers && typeof llmTiers === 'object' && Object.keys(llmTiers).length > 0) {
+      console.log(`[Orchestrator] 🎯 LlmRouter tier-based routing enabled: [${Object.keys(llmTiers).join(', ')}] – will auto-assign after ANALYSE stage.`);
     }
     this._rawLlmCall = async (prompt) => {
       try {
@@ -263,7 +324,7 @@ class Orchestrator {
           ? prompt.map(m => (typeof m === 'object' ? (m.content || '') : String(m))).join(' ')
           : String(prompt || '');
         const estimatedTokens = Math.ceil(promptStr.length / 4);
-        this.obs.recordLlmCall('__internal', estimatedTokens);
+        this.obs.recordLlmCall('__internal', estimatedTokens, promptStr);
       } catch (_) { /* metering must never break the call */ }
 
       // P1-A fix: when prompt is a multi-turn conversation array, try to pass it
@@ -354,6 +415,15 @@ class Orchestrator {
     // Inject into prompt-builder module so buildAgentPrompt() can access it
     setPromptSlotManager(this.promptSlotManager);
 
+    // P1: Inject SelfReflectionEngine into prompt-builder so buildAgentPrompt()
+    // auto-injects known-issues summary into every agent prompt.
+    setSelfReflectionEngine(this._selfReflection);
+
+    // Gap 1 fix: Inject SkillEvolutionEngine into prompt-builder so buildAgentPrompt()
+    // can query retired skill names and exclude them from ContextLoader injection.
+    // This closes the loop: retireStaleSkills() → retiredAt → ContextLoader exclusion.
+    setSkillEvolutionEngine(this.skillEvolution);
+
     // ── EntropyGC: architectural drift scanner ──────────────────────────────
     const cfg = this._config || {};
     this.entropyGC = new EntropyGC({
@@ -376,11 +446,12 @@ class Orchestrator {
 
     // ── CodeGraph: structured code index ───────────────────────────────────
     this.codeGraph = new CodeGraph({
-      projectRoot:  this.projectRoot,
-      outputDir:    PATHS.OUTPUT_DIR,
-      extensions:   cfg.sourceExtensions,
-      ignoreDirs:   cfg.ignoreDirs,
-      llmCall:      this._rawLlmCall,
+      projectRoot:    this.projectRoot,
+      outputDir:      PATHS.OUTPUT_DIR,
+      extensions:     cfg.sourceExtensions,
+      ignoreDirs:     cfg.ignoreDirs,
+      scopeDirs:      cfg.codeGraph?.scopeDirs,
+      llmCall:        this._rawLlmCall,
     });
 
     // Create agents with hook emitter
@@ -396,10 +467,20 @@ class Orchestrator {
         const result = buildAgentPrompt(role, prompt);
         optimisedPrompt = result.prompt;
         console.log(`[Orchestrator] LLM call for ${role}: ~${result.meta.estimatedTokens} tokens`);
-        this.obs.recordLlmCall(role, result.meta.estimatedTokens || 0);
+        // Skill Lifecycle: record injected skill names for effectiveness tracking
+        if (result.meta.injectedSkillNames && result.meta.injectedSkillNames.length > 0) {
+          this.obs.recordSkillUsage(result.meta.injectedSkillNames);
+        }
+        // P0 Prompt Tracing: pass the optimised prompt text for digest extraction
+        const promptTextForTrace = typeof optimisedPrompt === 'string'
+          ? optimisedPrompt
+          : (Array.isArray(optimisedPrompt)
+              ? optimisedPrompt.map(m => (typeof m === 'object' ? (m.content || '') : String(m))).join('\n')
+              : String(optimisedPrompt || ''));
+        this.obs.recordLlmCall(role, result.meta.estimatedTokens || 0, promptTextForTrace);
       } catch (err) {
         console.warn(`[Orchestrator] buildAgentPrompt failed for role "${role}": ${err.message}. Using raw prompt.`);
-        this.obs.recordLlmCall(role, 0);
+        this.obs.recordLlmCall(role, 0, typeof prompt === 'string' ? prompt : '');
       }
       // P2-A fix: extract actual token usage from LLM response (if the LLM client
       // attaches a .usage object to the response string, e.g. via a custom wrapper).
@@ -418,9 +499,17 @@ class Orchestrator {
         this.obs.recordActualTokens(role, actualTokens);
         console.log(`[Orchestrator] 📊 Token usage for ${role}: ${actualTokens} actual tokens`);
       }
-      return (typeof rawResponse === 'object' && rawResponse !== null && 'text' in rawResponse)
-        ? rawResponse.text
-        : rawResponse;
+      // R4-2 audit: wrap response extraction in try/catch. Some LLM SDKs return
+      // response objects with getter-based .text that may throw (e.g. streaming response
+      // accessed after close). Graceful fallback to String(rawResponse).
+      try {
+        return (typeof rawResponse === 'object' && rawResponse !== null && 'text' in rawResponse)
+          ? rawResponse.text
+          : rawResponse;
+      } catch (extractErr) {
+        console.warn(`[Orchestrator] ⚠️  Failed to extract .text from LLM response for ${role}: ${extractErr.message}. Falling back to string coercion.`);
+        return String(rawResponse);
+      }
     };
 
     // P2-b: pass instance-level outputDir so agents write to the correct directory
@@ -428,6 +517,7 @@ class Orchestrator {
     this.agents = {
       [AgentRole.ANALYST]:   new AnalystAgent(wrappedLlm(AgentRole.ANALYST), emitter, agentOpts),
       [AgentRole.ARCHITECT]: new ArchitectAgent(wrappedLlm(AgentRole.ARCHITECT), emitter, agentOpts),
+      [AgentRole.PLANNER]:   new PlannerAgent(wrappedLlm(AgentRole.PLANNER), emitter, agentOpts),
       [AgentRole.DEVELOPER]: new DeveloperAgent(wrappedLlm(AgentRole.DEVELOPER), emitter, agentOpts),
       [AgentRole.TESTER]:    new TesterAgent(wrappedLlm(AgentRole.TESTER), emitter, agentOpts),
     };
@@ -471,46 +561,68 @@ class Orchestrator {
     // Replaces the hardcoded _runStage switch pattern. New stages can be added by:
     //   1. Creating a class that extends StageRunner
     //   2. Calling orchestrator.registerStage(name, runner)
-    // Built-in stages are registered in order: ANALYSE → ARCHITECT → CODE → TEST
+    // Built-in stages are registered in order: ANALYSE → ARCHITECT → PLAN → CODE → TEST
     this.stageRegistry = new StageRegistry();
     this.stageRegistry.register(new AnalystStage());
     this.stageRegistry.register(new ArchitectStage());
+    this.stageRegistry.register(new PlannerStage());
     this.stageRegistry.register(new DeveloperStage());
     this.stageRegistry.register(new TesterStage());
     console.log(`[Orchestrator] 🔧 StageRegistry initialised: [${this.stageRegistry.getOrder().join(' → ')}]`);
 
-    // ── MCP (Model Context Protocol) Integration ──────────────────────────────
-    // Initialise MCPRegistry and auto-register adapters from workflow.config.js.
-    // Previously mcp-adapter.js was a fully-implemented but completely orphaned
-    // module – defined, exported, documented in README, but never require()'d by
-    // any runtime code. This bridges the gap.
-    //
-    // The registry is wired into HookSystem so WORKFLOW_COMPLETE / WORKFLOW_ERROR
-    // events are automatically broadcast to all connected MCP adapters (TAPD,
-    // DevTools, etc.), enabling zero-config external system notifications.
-    this.mcpRegistry = new MCPRegistry();
-    const cfgMcp = (this._config && this._config.mcp) || {};
-    if (cfgMcp.tapd) {
-      this.mcpRegistry.register(new TAPDAdapter(cfgMcp.tapd));
-    }
-    if (cfgMcp.devtools) {
-      this.mcpRegistry.register(new DevToolsAdapter(cfgMcp.devtools));
-    }
-    // Wire MCP into HookSystem: broadcast lifecycle events to all connected adapters
-    this.hooks.on(HOOK_EVENTS.WORKFLOW_COMPLETE, async (payload) => {
-      await this.mcpRegistry.broadcastNotify('workflow_complete', payload).catch(() => {});
+    // ── P1-2: NegotiationEngine (Agent Negotiation Protocol) ────────────────
+    // Inter-agent negotiation to reduce wasteful rollbacks. When a downstream
+    // agent discovers an incompatibility, it negotiates instead of rolling back.
+    this.negotiation = new NegotiationEngine({ outputDir: this._outputDir });
+    this.services.registerValue('negotiation', this.negotiation);
+    console.log(`[Orchestrator] 🤝 NegotiationEngine initialised (maxRounds=${this.negotiation._maxRounds}).`);
+
+    // ── P1-4: Structured Logger (JSON Lines) ────────────────────────────────
+    // Configure the module-level logger singleton with session context.
+    // This adds JSONL file logging alongside existing console.log output.
+    structuredLogger.setOutputDir(this._outputDir);
+    structuredLogger.setSessionId(this.projectId);
+    this.logger = structuredLogger;
+    this.services.registerValue('logger', this.logger);
+    console.log(`[Orchestrator] 📝 Structured Logger configured (outputDir=${this._outputDir}, session=${this.projectId}).`);
+
+    // ── P2-1: ExperienceRouter (Cross-Project Experience Migration) ──────────
+    // Intelligent layer on top of ExperienceTransferMixin that automatically
+    // discovers, scores, and imports relevant experiences from other projects.
+    this.experienceRouter = new ExperienceRouter({
+      projectId: this.projectId,
+      projectRoot: this.projectRoot,
+      techStack: [],  // Will be populated in _initWorkflow after AGENTS.md is loaded
+      experienceStore: this.experienceStore,
     });
-    this.hooks.on(HOOK_EVENTS.WORKFLOW_ERROR, async (payload) => {
-      await this.mcpRegistry.broadcastNotify('workflow_error', {
-        error: payload.error?.message ?? String(payload.error),
-        state: payload.state,
-      }).catch(() => {});
-    });
-    // Register in ServiceContainer for DI access
-    this.services.registerValue('mcpRegistry', this.mcpRegistry);
-    if (cfgMcp.tapd || cfgMcp.devtools) {
-      console.log(`[Orchestrator] 🔌 MCPRegistry initialised with ${cfgMcp.tapd ? 'TAPD' : ''}${cfgMcp.tapd && cfgMcp.devtools ? ' + ' : ''}${cfgMcp.devtools ? 'DevTools' : ''} adapter(s).`);
+    this.services.registerValue('experienceRouter', this.experienceRouter);
+    console.log(`[Orchestrator] 🌐 ExperienceRouter initialised.`);
+
+    // ── P2-4: Contract Validation Sweep (non-fatal, development-time) ────────
+    // Validates registered services against their interface contracts.
+    // Uses warn (not throw) so violations don't block production runs.
+    const CONTRACT_MAP = {
+      stateMachine:    'IStateMachine',
+      hooks:           'IHookSystem',
+      experienceStore: 'IExperienceStore',
+      stageCtx:        'IStageContextStore',
+    };
+    for (const [svcName, contractName] of Object.entries(CONTRACT_MAP)) {
+      if (this.services.has(svcName)) {
+        const { valid, violations } = validateContract(contractName, this.services.resolve(svcName));
+        if (!valid) {
+          console.warn(`[Orchestrator] ⚠️  [Contract] ${contractName} violations on '${svcName}': ${violations.join('; ')}`);
+        }
+      }
     }
+    console.log(`[Orchestrator] 📜 Contract validation sweep complete (${Object.keys(CONTRACT_MAP).length} service(s) checked).`);
+
+    // ── MCP + Smart Context + Adapter Telemetry + Plugin Registry ────────────
+    // Extracted to orchestrator-mcp.js (P1-1 big file treatment).
+    // Initialises MCPRegistry, 14+ adapters, SmartContextSelector, AdapterTelemetry,
+    // and AdapterPluginRegistry. See orchestrator-mcp.js for full documentation.
+    const _mcp = require('./core/orchestrator-mcp');
+    _mcp.initMCPSubsystems(this);
   }
 
   // ─── _initWorkflow and _finalizeWorkflow: see orchestrator-lifecycle.js ───
@@ -564,7 +676,7 @@ class Orchestrator {
 
     const decompositionPrompt = [
       `You are a **Task Decomposition Analyst**. Analyse the following software requirement and decide whether it should be executed as:`,
-      `  A) A single sequential workflow (ANALYSE → ARCHITECT → CODE → TEST)`,
+      `  A) A single sequential workflow (ANALYSE → ARCHITECT → PLAN → CODE → TEST)`,
       `  B) Multiple parallel tasks with dependencies`,
       ``,
       // P2-E fix: inject AGENTS.md so the LLM knows the project's tech stack,
@@ -809,7 +921,7 @@ class Orchestrator {
     try {
       // 4. Execute stages via StageRegistry (P0/P1-b: replaces hardcoded stage calls).
       //
-      // The StageRegistry contains all pipeline stages in order (e.g. ANALYSE → ARCHITECT → CODE → TEST).
+      // The StageRegistry contains all pipeline stages in order (e.g. ANALYSE → ARCHITECT → PLAN → CODE → TEST).
       // Each stage is a StageRunner subclass that implements execute(context).
       // Custom stages can be inserted via orchestrator.registerStage(runner, { before/after }).
       //
@@ -845,9 +957,11 @@ class Orchestrator {
           };
           const result = await runner.execute(stageContext);
 
-          // Special handling: CODE stage triggers incremental code graph update
+          // Special handling: CODE stage triggers fast code graph patch update.
+          // Uses quickScan mode: only mtime-compare cached files to find changes,
+          // then patch in-place. Skips disk write since FINISHED stage does a full rebuild.
           if (name === 'CODE') {
-            this._rebuildCodeGraphAsync('post-developer');
+            this._rebuildCodeGraphAsync('post-developer', { quickScan: true, writeOutput: false });
           }
 
           return result;
@@ -913,7 +1027,19 @@ class Orchestrator {
 }
 
 
-module.exports = { Orchestrator, ServiceContainer, StageRunner, StageRegistry, LlmRouter };
+module.exports = {
+  Orchestrator, ServiceContainer, StageRunner, StageRegistry, LlmRouter, FileLockManager,
+  // P1-2: Agent Negotiation Protocol
+  NegotiationEngine,
+  // P1-4: Structured Logger
+  Logger, logger: structuredLogger,
+  // P2-1: Cross-project experience routing
+  ExperienceRouter,
+  // P2-3: Workflow Server (long-running service mode)
+  WorkflowServer,
+  // P2-4: Contracts (explicit interface validation)
+  assertContract, validateContract, listContracts,
+};
 
 //  Mixin: attach extracted methods to Orchestrator.prototype 
 // This keeps index.js slim while preserving the same public/private API surface.

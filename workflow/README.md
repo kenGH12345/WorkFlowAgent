@@ -190,7 +190,7 @@ npm install
 
 ```bash
 # 在目标项目根目录执行
-node workflow/init-project.jsnode workflow/init-project.js
+node workflow/init-project.js
 ```
 
 **就这一条命令，无需任何手动配置。**
@@ -379,13 +379,13 @@ node workflow/gen-agents.js
 node workflow/gen-agents.js --path D:\OtherProject
 
 # 指定扫描的文件类型
-node workflow/gen-agents.js --path D:\OtherProject --ext .cs,.lua
+node workflow/gen-agents.js --path D:\OtherProject --ext .js,.ts
 ```
 
 | 参数 | 简写 | 说明 | 默认值 |
 |------|------|------|--------|
 | `--path <dir>` | `-p` | 目标项目根目录 | 当前工作目录 |
-| `--ext <exts>` | `-e` | 扫描的文件扩展名（逗号分隔） | `.cs,.lua` |
+| `--ext <exts>` | `-e` | 扫描的文件扩展名（逗号分隔） | all supported |
 | `--max-files <n>` | `-m` | 每种扩展名最多扫描文件数 | `80` |
 | `--help` | `-h` | 显示帮助信息 | — |
 

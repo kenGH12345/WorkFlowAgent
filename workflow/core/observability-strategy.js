@@ -61,8 +61,12 @@ function computeTrends(history) {
   const trend = (arr) => {
     // P1-4 / P2-4 fix: need ≥4 data points for meaningful trend comparison.
     if (arr.length < 4) return 'insufficient_data';
-    const recent = arr.slice(0, Math.min(3, arr.length));
-    const older  = arr.slice(Math.min(3, arr.length));
+    // R5-4 audit: use ceil(len/2) split so that 4 data points → 2 recent + 2 older,
+    // instead of 3+1 which biases the comparison. For 5+ points, still use first 3
+    // as "recent" to weight the most recent data more heavily.
+    const splitAt = arr.length <= 4 ? Math.ceil(arr.length / 2) : 3;
+    const recent = arr.slice(0, splitAt);
+    const older  = arr.slice(splitAt);
     if (older.length === 0) return 'stable';
     const recentAvg = avg(recent);
     const olderAvg  = avg(older);
@@ -182,6 +186,9 @@ function estimateTaskComplexity(requirementText) {
     'payment', 'stripe', 'paypal', 'twilio', 'sendgrid',
     'firebase', 'supabase', 'auth0', 'cognito', 'clerk',
   ];
+  // R5-2 audit: pre-compile a single combined regex instead of creating
+  // N RegExp objects in a loop (one per integration keyword).
+  const INTEGRATIONS_RE = new RegExp(INTEGRATIONS.join('|'), 'i');
   let integrationCount = 0;
   for (const i of INTEGRATIONS) {
     if (new RegExp(i, 'i').test(text)) integrationCount++;

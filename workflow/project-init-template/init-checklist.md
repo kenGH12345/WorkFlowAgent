@@ -21,7 +21,7 @@ cp workflow/project-init-template/workflow.config.js     <your-project>/workflow
 Open `<your-project>/AGENTS.md` and replace all `{PLACEHOLDERS}`:
 | Placeholder | What to fill |
 |-------------|-------------|
-| `{PROJECT_NAME}` | e.g., `KartRider`, `WePop`, `TaoFlow` |
+| `{PROJECT_NAME}` | Your project name (auto-detected from directory name) |
 | `{ONE_LINE_DESCRIPTION}` | e.g., `Flutter I-Ching oracle app` |
 | `{TECH_STACK}` | e.g., `Flutter/Dart`, `Unity/Lua`, `Go/React` |
 | `{PLATFORMS}` | e.g., `iOS, Android, Windows` |

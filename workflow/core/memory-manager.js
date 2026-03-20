@@ -16,6 +16,7 @@ const { PATHS, PROJECT_SCALE } = require('../core/constants');
 const { getProjectStructure, selectToolStrategy, scanCodeSymbols } = require('../tools/thick-tools');
 const { getConfig } = require('../core/config-loader');
 const { buildSessionStartChecklist } = require('../core/prompt-builder');
+const { renderCompactProfileSummary } = require('../core/project-profiler');
 
 class MemoryManager {
   /**
@@ -48,9 +49,9 @@ class MemoryManager {
     const { summary: structureSummary } = getProjectStructure(this.projectRoot, strategy === 'thick' ? 2 : 4);
     const packageList = this._detectPackages();
 
-    const extensions = this._config.sourceExtensions || ['.cs', '.lua'];
+    const extensions = this._config.sourceExtensions || ['.js', '.ts', '.py', '.go', '.java', '.cs', '.lua', '.dart'];
     const ignoreDirs  = this._config.ignoreDirs
-      || ['node_modules', '.git', 'dist', 'build', 'output', 'Library', 'Temp', 'obj', 'Packages'];
+      || ['node_modules', '.git', 'dist', 'build', 'output'];
 
     const extLabel = extensions.join(', ');
     console.log(`[MemoryManager] Scanning ${extLabel} code symbols...`);
@@ -244,6 +245,24 @@ class MemoryManager {
       `- Report any inconsistencies to the workflow orchestrator`,
       `- **Output format**: Always begin your response with the indicator line \`> 🔄 启用wf工作流\` as the very first line, before any other content. During the working process, output brief phase results (e.g., "✅ Phase 1 done: ...", "🔍 Analyzing...", "📝 Writing...") to keep the user informed of progress.`,
       ``,
+      `## \`/wf init\` Command Protocol`,
+      ``,
+      `When the user sends \`/wf init\` or \`/wf init --path <dir>\`, you **MUST** execute the initialisation script via **terminal**:`,
+      ``,
+      '```bash',
+      `node workflow/init-project.js --path <project-root>`,
+      '```',
+      ``,
+      `> ⚠️ **CRITICAL**: You MUST run this command in the terminal. Do NOT manually read files and generate a report yourself.`,
+      `> Do NOT substitute a subdirectory for <project-root>. Always use the exact root directory the user specified.`,
+      `> The script handles tech detection, config generation, AGENTS.md, experience store, skill registration, and **code-graph construction** automatically.`,
+      ``,
+      `### /wf <requirement> Workflow Execution`,
+      ``,
+      `When the user sends \`/wf <requirement>\` (not "init"), this triggers the **full workflow pipeline**:`,
+      `ANALYSE → ARCHITECT → PLAN → CODE → TEST. You must respond with \`> 🔄 启用wf工作流\` and execute the pipeline.`,
+      `Do NOT just read code and give analysis — you must run the actual multi-agent orchestration workflow.`,
+      ``,
       buildSessionStartChecklist({
         progressFile: 'manifest.json',
         taskFile: 'output/tasks.json',
@@ -252,6 +271,12 @@ class MemoryManager {
         requireSmokeTest: true,
       }),
       ``,
+      // Inject Project Architecture Profile from ProjectProfiler analysis
+      (() => {
+        const profile = this._config.projectProfile;
+        const summary = renderCompactProfileSummary(profile);
+        return summary || '';
+      })(),
       symbolsSummary ? `## Code Symbols\n\n${symbolsSummary}` : '',
     ].filter(Boolean).join('\n');
   }

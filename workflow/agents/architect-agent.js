@@ -16,6 +16,7 @@
 const { BaseAgent } = require('./base-agent');
 const { AgentRole } = require('../core/types');
 const { buildJsonBlockInstruction } = require('../core/agent-output-schema');
+const { extractAnchorFiles } = require('./analyst-agent');
 
 class ArchitectAgent extends BaseAgent {
   constructor(llmCall, hookEmitter, opts = {}) {
@@ -77,6 +78,15 @@ ${jsonInstruction}
 ## Requirement Document
 ${inputContent}
 ${expSection}
+## Codebase Research Rules (CRITICAL)
+- If the requirement document references specific files (Anchor Files section), focus your research on those files and their direct dependencies ONLY.
+- **Search budget**: at most 8 file searches and 6 file reads total. Stop once you have enough context.
+- **Relevance gate**: before reading any file, ask: "Does this file contain interfaces or patterns that directly affect my architecture decisions?" If no, skip it.
+- Do NOT perform broad exploratory searches. Search only for specific entity names mentioned in the requirement.
+
+## Output Language
+**You MUST write the entire architecture document in Chinese (简体中文).** All section headings, descriptions, component names, data flow explanations, risk assessments, and trade-off analyses must be in Chinese. Only keep technical terms, proper nouns, file names, code identifiers, and Mermaid diagram labels in English.
+
 ## Instructions
 First output the JSON metadata block (as instructed above), then write the full Markdown document.
 Remember: NO code, NO implementation, design decisions ONLY.

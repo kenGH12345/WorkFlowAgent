@@ -7,12 +7,13 @@
 
 /**
  * All valid states of the central state machine.
- * Transition order: INIT → ANALYSE → ARCHITECT → CODE → TEST → FINISHED
+ * Transition order: INIT → ANALYSE → ARCHITECT → PLAN → CODE → TEST → FINISHED
  */
 const WorkflowState = {
   INIT: 'INIT',
   ANALYSE: 'ANALYSE',
   ARCHITECT: 'ARCHITECT',
+  PLAN: 'PLAN',
   CODE: 'CODE',
   TEST: 'TEST',
   FINISHED: 'FINISHED',
@@ -23,6 +24,7 @@ const STATE_ORDER = [
   WorkflowState.INIT,
   WorkflowState.ANALYSE,
   WorkflowState.ARCHITECT,
+  WorkflowState.PLAN,
   WorkflowState.CODE,
   WorkflowState.TEST,
   WorkflowState.FINISHED,
@@ -45,6 +47,7 @@ function buildStateOrder(stageNames) {
 const AgentRole = {
   ANALYST: 'analyst',       // Requirement analysis agent
   ARCHITECT: 'architect',   // Architecture design agent
+  PLANNER: 'planner',       // Execution planning agent
   DEVELOPER: 'developer',   // Code development agent
   TESTER: 'tester',         // Quality testing agent
 };
@@ -72,6 +75,7 @@ function createManifest(projectId) {
       requirementMd: null,
       architectureMd: null,
       codeDiff: null,
+      executionPlanMd: null,
       testReportMd: null,
     },
     /** Risk flags recorded during execution */
@@ -146,6 +150,13 @@ const AGENT_CONTRACTS = {
     'output/architecture.md',
     ['read_requirement_md', 'write_architecture_md'],
     ['write_code', 'write_test_report', 'modify_requirement_md', 'modify_manifest'],
+  ),
+  [AgentRole.PLANNER]: createAgentContract(
+    AgentRole.PLANNER,
+    'output/architecture.md',
+    'output/execution-plan.md',
+    ['read_architecture_md', 'write_execution_plan_md'],
+    ['write_code', 'write_test_report', 'modify_requirement_md', 'modify_architecture_md', 'modify_manifest'],
   ),
   [AgentRole.DEVELOPER]: createAgentContract(
     AgentRole.DEVELOPER,

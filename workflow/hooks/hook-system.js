@@ -82,9 +82,13 @@ class HookSystem {
 
     // Log boundary violations
     this.on(HOOK_EVENTS.AGENT_BOUNDARY_VIOLATION, async ({ role, action }) => {
-      console.error(`\n[Hook] 🚫 BOUNDARY VIOLATION: Agent "${role}" attempted forbidden action "${action}"`);
+      console.warn(`\n[Hook] 🚫 BOUNDARY VIOLATION: Agent "${role}" attempted forbidden action "${action}"`);
     });
 
+    // Log stage artifact production (transparent pipeline output)
+    this.on(HOOK_EVENTS.STAGE_ARTIFACT_PRODUCED, async ({ stage, artifact, lines, size }) => {
+      console.log(`[Hook] 📄 Stage "${stage}" produced artifact: ${artifact} (${lines} lines, ${size} bytes)`);
+    });
     // Log workflow completion
     this.on(HOOK_EVENTS.WORKFLOW_COMPLETE, async ({ manifest }) => {
       console.log(`\n[Hook] 🎉 WORKFLOW COMPLETE!`);

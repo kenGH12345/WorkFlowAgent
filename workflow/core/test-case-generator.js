@@ -39,7 +39,7 @@ class TestCaseGenerator {
    * @returns {Promise<{ path: string, caseCount: number, skipped: boolean }>}
    */
   async generate() {
-    const requirementsPath = path.join(this._outputDir, 'requirements.md');
+    const requirementsPath = path.join(this._outputDir, 'requirement.md');
     const architecturePath = path.join(this._outputDir, 'architecture.md');
     const codeDiffPath     = path.join(this._outputDir, 'code.diff');
     const outputPath       = path.join(this._outputDir, 'test-cases.md');

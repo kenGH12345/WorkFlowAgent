@@ -187,6 +187,14 @@ You are performing a structured architecture review.`,
     `Evaluate the architecture document below against each checklist item.`,
     `For each item, determine: PASS, FAIL, or N/A (not applicable to this architecture).`,
     ``,
+    `## MANDATORY Anti-Hallucination Rules`,
+    ``,
+    `You MUST follow these rules. Violation of ANY rule invalidates your entire review:`,
+    `1. **Section references must be real**: Only cite sections that actually exist in the document. NEVER fabricate or guess section names.`,
+    `2. **Evidence required**: Every FAIL finding MUST quote or paraphrase the specific part of the document (or its absence) that justifies the verdict.`,
+    `3. **No phantom gaps**: If a dimension is genuinely not applicable to this system, mark it N/A with a clear reason. Do NOT mark it FAIL just to seem thorough.`,
+    `4. **Severity must be earned**: A missing backup strategy for a read-only config service is LOW, not HIGH. Match severity to actual risk.`,
+    ``,
     `## Important Evaluation Rules`,
     ``,
     `- PASS: The item is clearly and adequately addressed in the document.`,
@@ -250,6 +258,12 @@ You are performing an adversarial second-opinion architecture review. Your job i
     `- If you find the main reviewer missed a real issue: return FAIL with a SPECIFIC finding and fix instruction.`,
     `- Be skeptical. Look for vague statements, missing details, and unstated assumptions.`,
     `- A statement like "we will handle this" or "standard practices apply" is NOT a pass.`,
+    ``,
+    `## MANDATORY Anti-Hallucination Rules (same as main review)`,
+    ``,
+    `1. Only reference sections that exist in the document. NEVER fabricate section names.`,
+    `2. Every FAIL must cite specific evidence (quote or describe the gap). No evidence = no finding.`,
+    `3. Do NOT inflate severity to justify a downgrade.`,
     ``,
     `## Items to Re-evaluate (main reviewer said PASS or N/A)`,
     ``,
@@ -395,7 +409,13 @@ class ArchitectureReviewAgent extends ReviewAgentBase {
   }
 
   _buildReviewPrompt(content, requirementText) {
-    return buildArchReviewPrompt(this.checklist, content, requirementText);
+    // Optimization 5: inject tech stack validation context (web search results)
+    // into the review prompt so the reviewer can verify technology choices against
+    // real-world, up-to-date data (latest versions, known issues, deprecations).
+    const enrichedReqText = this.techStackValidationCtx
+      ? `${requirementText}\n\n${this.techStackValidationCtx}`
+      : requirementText;
+    return buildArchReviewPrompt(this.checklist, content, enrichedReqText);
   }
 
   _buildAdversarialPrompt(content, mainResults, requirementText) {

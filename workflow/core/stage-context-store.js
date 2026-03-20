@@ -33,6 +33,17 @@ class StageContextStore {
     this._verbose   = opts.verbose   ?? false;
     this._persistPending = false;
 
+    // P2-2 fix (Ghemawat): LRU eviction to control memory growth.
+    // In long-running service mode or task-based workflows with many stages,
+    // the store can grow unboundedly. These limits trigger LRU eviction.
+    //   maxEntries:   max number of stage context entries (default 20)
+    //   maxTotalChars: max total characters across all summaries (default 50_000)
+    // When either limit is exceeded, the least-recently-accessed entry is evicted.
+    this._maxEntries    = opts.maxEntries    ?? 20;
+    this._maxTotalChars = opts.maxTotalChars ?? 50_000;
+    /** @type {Map<string, number>} stageName → last access timestamp (for LRU) */
+    this._accessOrder = new Map();
+
     // Auto-load persisted context on construction so workflow resumption
     // (e.g. after a crash mid-CODE stage) can see ANALYSE + ARCHITECT summaries.
     if (this._outputDir) {
@@ -86,6 +97,10 @@ class StageContextStore {
       timestamp:         new Date().toISOString(),
     };
     this._store.set(stageName, entry);
+    this._accessOrder.set(stageName, Date.now());
+
+    // P2-2: LRU eviction check after every write
+    this._evictIfNeeded();
 
     if (this._verbose) {
       console.log(`[StageContextStore] Stored context for stage: ${stageName} (${entry.summary.length} chars)`);
@@ -105,7 +120,12 @@ class StageContextStore {
    * @returns {StageContext|null}
    */
   get(stageName) {
-    return this._store.get(stageName) || null;
+    const entry = this._store.get(stageName) || null;
+    // P2-2: Update access timestamp for LRU tracking
+    if (entry) {
+      this._accessOrder.set(stageName, Date.now());
+    }
+    return entry;
   }
 
   /**
@@ -123,6 +143,7 @@ class StageContextStore {
     const existed = this._store.has(stageName);
     if (existed) {
       this._store.delete(stageName);
+      this._accessOrder.delete(stageName);
       if (this._verbose) {
         console.log(`[StageContextStore] Deleted stale context for stage: ${stageName} (rollback invalidation)`);
       }
@@ -337,6 +358,84 @@ class StageContextStore {
     // Delegate to getAll() with dynamically computed priority order
     const dynamicPriority = candidates.map(c => c.stageName);
     return this.getAll([...exclusions], maxChars, dynamicPriority);
+  }
+
+  // ─── LRU Eviction (P2-2, Ghemawat) ────────────────────────────────────────
+
+  /**
+   * Evicts least-recently-used entries if the store exceeds size or memory limits.
+   * Called after every set() operation.
+   *
+   * Eviction strategy:
+   *   1. If entry count > maxEntries → evict LRU until within limit
+   *   2. If total summary chars > maxTotalChars → evict LRU until within limit
+   *   3. Never evicts the most recently written entry (the one that triggered eviction)
+   */
+  _evictIfNeeded() {
+    let evicted = 0;
+
+    // Sort by access time (oldest first) for LRU ordering
+    const getLruOrder = () => {
+      return [...this._accessOrder.entries()]
+        .sort((a, b) => a[1] - b[1])
+        .map(([name]) => name);
+    };
+
+    // Check entry count limit
+    while (this._store.size > this._maxEntries) {
+      const lru = getLruOrder();
+      if (lru.length === 0) break;
+      const victim = lru[0];
+      this._store.delete(victim);
+      this._accessOrder.delete(victim);
+      evicted++;
+    }
+
+    // Check total chars limit
+    while (this._getTotalChars() > this._maxTotalChars && this._store.size > 1) {
+      const lru = getLruOrder();
+      if (lru.length === 0) break;
+      const victim = lru[0];
+      this._store.delete(victim);
+      this._accessOrder.delete(victim);
+      evicted++;
+    }
+
+    if (evicted > 0 && this._verbose) {
+      console.log(`[StageContextStore] 🗑️ LRU evicted ${evicted} entry/entries (store: ${this._store.size} entries, ${this._getTotalChars()} chars)`);
+    }
+  }
+
+  /**
+   * Calculates total character count across all stored summaries and key decisions.
+   * Used for memory budget enforcement.
+   * @returns {number}
+   */
+  _getTotalChars() {
+    let total = 0;
+    for (const [, ctx] of this._store) {
+      total += (ctx.summary || '').length;
+      if (ctx.keyDecisions) {
+        for (const d of ctx.keyDecisions) total += d.length;
+      }
+      if (ctx.risks) {
+        for (const r of ctx.risks) total += (typeof r === 'string' ? r.length : 0);
+      }
+    }
+    return total;
+  }
+
+  /**
+   * Returns LRU stats for diagnostics.
+   * @returns {{ entries: number, totalChars: number, maxEntries: number, maxTotalChars: number }}
+   */
+  getLruStats() {
+    return {
+      entries: this._store.size,
+      totalChars: this._getTotalChars(),
+      maxEntries: this._maxEntries,
+      maxTotalChars: this._maxTotalChars,
+    };
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────────

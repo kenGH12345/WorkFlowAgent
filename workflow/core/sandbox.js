@@ -31,6 +31,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { fileLockManager } = require('./file-lock-manager');
 
 // ─── Operation Types ──────────────────────────────────────────────────────────
 
@@ -108,6 +109,12 @@ class DryRunSandbox {
     const currentContent = this._virtualFS.has(absPath)
       ? this._virtualFS.get(absPath)
       : (fs.existsSync(absPath) ? fs.readFileSync(absPath, 'utf-8') : null);
+
+    // Optimistic lock: acquire version stamp based on real FS content (not virtual)
+    if (fs.existsSync(absPath)) {
+      const realContent = fs.readFileSync(absPath, 'utf-8');
+      fileLockManager.acquireVersion(absPath, realContent, 'sandbox');
+    }
 
     if (currentContent !== null) {
       const patched = currentContent.replace(findStr, replaceStr);
@@ -357,6 +364,16 @@ class DryRunSandbox {
               break;
             }
             const original = fs.readFileSync(op.path, 'utf-8');
+
+            // Optimistic lock: verify file hasn't been modified externally
+            const lockCheck = fileLockManager.verifyVersion(op.path, original);
+            if (!lockCheck.valid) {
+              errors.push(`PATCH lock conflict on ${op.relPath}: ${lockCheck.reason}`);
+              console.warn(`[DryRunSandbox] \ud83d\udd12 Lock conflict: ${op.relPath} – ${lockCheck.reason}`);
+              failed++;
+              break;
+            }
+
             if (!original.includes(op.findStr)) {
               errors.push(`PATCH find-string not found in: ${op.relPath}`);
               failed++;
@@ -366,11 +383,11 @@ class DryRunSandbox {
             const tmp = op.path + '.sandbox_tmp';
             fs.writeFileSync(tmp, patched, 'utf-8');
             fs.renameSync(tmp, op.path);
-            console.log(`[DryRunSandbox] ✅ Patched: ${op.relPath}`);
+            fileLockManager.releaseVersion(op.path, patched);
+            console.log(`[DryRunSandbox] \u2705 Patched: ${op.relPath}`);
             applied++;
             break;
-          }
-          case OpType.APPEND: {
+          }          case OpType.APPEND: {
             if (!fs.existsSync(op.path)) {
               // Target file doesn't exist – create it with the append content
               const dir = path.dirname(op.path);

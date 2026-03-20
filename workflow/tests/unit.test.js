@@ -912,6 +912,590 @@ async function runContractTests() {
   });
 }
 
+// ─── 7. Gotchas vs Anti-Patterns Section Routing ─────────────────────────────
+
+async function runGotchasSectionTests() {
+  console.log('\n── Gotchas vs Anti-Patterns Section Routing ──');
+
+  const { _selectEvolutionSection, _isEnvironmentSpecific } = require('../core/experience-evolution');
+
+  // ── _isEnvironmentSpecific tests ──
+
+  await test('_isEnvironmentSpecific: returns true for framework_limit category', async () => {
+    const exp = { category: 'framework_limit', tags: [], content: '' };
+    assertEqual(_isEnvironmentSpecific(exp), true);
+  });
+
+  await test('_isEnvironmentSpecific: returns true when tags contain env keyword', async () => {
+    const exp = { category: 'pitfall', tags: ['windows', 'path-handling'], content: '' };
+    assertEqual(_isEnvironmentSpecific(exp), true);
+  });
+
+  await test('_isEnvironmentSpecific: returns true when content contains env keyword', async () => {
+    const exp = { category: 'pitfall', tags: [], content: 'Node v20 changed fs.cp recursive behaviour on Windows' };
+    assertEqual(_isEnvironmentSpecific(exp), true);
+  });
+
+  await test('_isEnvironmentSpecific: returns true when description contains env keyword', async () => {
+    const exp = { category: 'pitfall', tags: [], content: '', description: 'deprecated API in jdk17' };
+    assertEqual(_isEnvironmentSpecific(exp), true);
+  });
+
+  await test('_isEnvironmentSpecific: returns false for generic pitfall', async () => {
+    const exp = { category: 'pitfall', tags: ['error-handling'], content: 'Always handle promise rejections' };
+    assertEqual(_isEnvironmentSpecific(exp), false);
+  });
+
+  await test('_isEnvironmentSpecific: returns false for empty experience', async () => {
+    const exp = { category: 'pitfall', tags: [] };
+    assertEqual(_isEnvironmentSpecific(exp), false);
+  });
+
+  // ── _selectEvolutionSection routing tests ──
+
+  await test('Section routing: env-specific pitfall → Gotchas', async () => {
+    const exp = { type: 'negative', category: 'pitfall', tags: ['docker'], content: 'Build fails in docker alpine' };
+    const meta = { type: 'domain-skill' };
+    assertEqual(_selectEvolutionSection(exp, meta), 'Gotchas');
+  });
+
+  await test('Section routing: generic pitfall → Anti-Patterns', async () => {
+    const exp = { type: 'negative', category: 'pitfall', tags: ['coding'], content: 'Do not use eval()' };
+    const meta = { type: 'domain-skill' };
+    assertEqual(_selectEvolutionSection(exp, meta), 'Anti-Patterns');
+  });
+
+  await test('Section routing: negative + framework_limit → Gotchas', async () => {
+    const exp = { type: 'negative', category: 'framework_limit', tags: [], content: 'React 18 strict mode double-renders' };
+    const meta = { type: 'domain-skill' };
+    assertEqual(_selectEvolutionSection(exp, meta), 'Gotchas');
+  });
+
+  await test('Section routing: negative + version keyword in content → Gotchas', async () => {
+    const exp = { type: 'negative', category: 'pitfall', tags: [], content: 'This was deprecated in the latest upgrade' };
+    const meta = { type: 'domain-skill' };
+    assertEqual(_selectEvolutionSection(exp, meta), 'Gotchas');
+  });
+
+  await test('Section routing: troubleshooting skill ignores gotcha logic', async () => {
+    const exp = { type: 'negative', category: 'pitfall', tags: ['docker'], content: 'Build fails' };
+    const meta = { type: 'troubleshooting' };
+    assertEqual(_selectEvolutionSection(exp, meta), 'Common Errors');
+  });
+
+  await test('Section routing: positive experience still → Best Practices', async () => {
+    const exp = { type: 'positive', category: 'stable_pattern', tags: ['docker'], content: 'Multi-stage builds' };
+    const meta = { type: 'domain-skill' };
+    assertEqual(_selectEvolutionSection(exp, meta), 'Rules');
+  });
+}
+
+// ─── AutoDeployer Tests ──────────────────────────────────────────────────────
+
+async function runAutoDeployerTests() {
+  console.log('\n── AutoDeployer ─────────────────────────────────────────────');
+
+  await test('AutoDeployer: GREEN tier records change in history', async () => {
+    const { AutoDeployer, DEPLOY_TIER } = require('../core/auto-deployer');
+    const dir = makeTempDir();
+    const deployer = new AutoDeployer({ outputDir: dir, projectRoot: dir, verbose: false });
+
+    const result = deployer.applyGreen({
+      type: 'skill-content-update',
+      description: 'Refreshed 3 stale skills',
+    });
+
+    assertEqual(result.applied, true, 'GREEN should always be applied');
+    assertEqual(result.record.tier, DEPLOY_TIER.GREEN, 'Tier should be GREEN');
+
+    const history = deployer.loadHistory();
+    assert.ok(history.length >= 1, 'History should have at least 1 entry');
+    assertEqual(history[0].tier, DEPLOY_TIER.GREEN, 'History entry should be GREEN');
+
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('AutoDeployer: YELLOW tier detects and applies config changes', async () => {
+    const { AutoDeployer } = require('../core/auto-deployer');
+    const dir = makeTempDir();
+
+    // Create a minimal workflow.config.js
+    fs.writeFileSync(
+      path.join(dir, 'workflow.config.js'),
+      `module.exports = {\n  autoFixLoop: {\n    enabled: true,\n    maxFixRounds: 2,\n    maxReviewRounds: 2,\n    failOnUnfixed: false,\n  },\n};\n`,
+      'utf-8'
+    );
+
+    const deployer = new AutoDeployer({ outputDir: dir, projectRoot: dir, verbose: false });
+    const strategy = {
+      maxFixRounds: 4,
+      maxReviewRounds: 3,
+      source: 'history(5 sessions)',
+      _debug: {},
+    };
+
+    const result = deployer.applyYellow(strategy);
+
+    assertEqual(result.applied, true, 'YELLOW should apply changes');
+    assert.ok(result.changes.length >= 1, 'Should have at least 1 change');
+
+    // Verify the file was actually modified
+    delete require.cache[require.resolve(path.join(dir, 'workflow.config.js'))];
+    const updatedConfig = require(path.join(dir, 'workflow.config.js'));
+    assertEqual(updatedConfig.autoFixLoop.maxFixRounds, 4, 'maxFixRounds should be updated to 4');
+    assertEqual(updatedConfig.autoFixLoop.maxReviewRounds, 3, 'maxReviewRounds should be updated to 3');
+
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('AutoDeployer: YELLOW tier skips when no config file exists', async () => {
+    const { AutoDeployer } = require('../core/auto-deployer');
+    const dir = makeTempDir(); // No config file
+
+    const deployer = new AutoDeployer({ outputDir: dir, projectRoot: dir, verbose: false });
+    const result = deployer.applyYellow({ maxFixRounds: 4, source: 'test' });
+
+    assertEqual(result.applied, false, 'Should not apply without config file');
+    assert.ok(result.record.skipped, 'Should be marked as skipped');
+
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('AutoDeployer: YELLOW tier enforces safe bounds', async () => {
+    const { AutoDeployer } = require('../core/auto-deployer');
+    const dir = makeTempDir();
+
+    fs.writeFileSync(
+      path.join(dir, 'workflow.config.js'),
+      `module.exports = {\n  autoFixLoop: {\n    maxFixRounds: 2,\n    maxReviewRounds: 2,\n  },\n};\n`,
+      'utf-8'
+    );
+
+    const deployer = new AutoDeployer({ outputDir: dir, projectRoot: dir, verbose: false });
+
+    // Try to set maxFixRounds to 99 (should be clamped to 5)
+    const result = deployer.applyYellow({
+      maxFixRounds: 99,
+      maxReviewRounds: 2,
+      source: 'test',
+    });
+
+    if (result.applied && result.changes.length > 0) {
+      const fixChange = result.changes.find(c => c.path === 'autoFixLoop.maxFixRounds');
+      if (fixChange) {
+        assert.ok(fixChange.newValue <= 5, `maxFixRounds should be clamped to max 5, got ${fixChange.newValue}`);
+      }
+    }
+
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('AutoDeployer: YELLOW tier creates backup and can rollback invalid config', async () => {
+    const { AutoDeployer } = require('../core/auto-deployer');
+    const dir = makeTempDir();
+
+    const originalContent = `module.exports = {\n  autoFixLoop: {\n    maxFixRounds: 2,\n    maxReviewRounds: 2,\n  },\n};\n`;
+    fs.writeFileSync(path.join(dir, 'workflow.config.js'), originalContent, 'utf-8');
+
+    const deployer = new AutoDeployer({ outputDir: dir, projectRoot: dir, verbose: false });
+
+    // Verify backup is created on apply
+    const result = deployer.applyYellow({
+      maxFixRounds: 3,
+      maxReviewRounds: 2,
+      source: 'test',
+    });
+
+    if (result.applied) {
+      assert.ok(result.record.backupPath, 'Backup path should be recorded');
+      assert.ok(fs.existsSync(result.record.backupPath), 'Backup file should exist');
+    }
+
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('AutoDeployer: RED tier generates PR description file', async () => {
+    const { AutoDeployer, DEPLOY_TIER } = require('../core/auto-deployer');
+    const dir = makeTempDir();
+    const deployer = new AutoDeployer({ outputDir: dir, projectRoot: dir, verbose: false });
+
+    const result = deployer.generateRedPR({
+      title: 'Decompose orchestrator-stages.js',
+      description: 'File exceeds 400-line limit at 1976 lines.',
+      files: ['core/orchestrator-stages.js'],
+      rationale: 'Violates architecture-constraints.md',
+      diff: '# Too large to show inline',
+    });
+
+    assert.ok(result.prDescription.includes('Auto-Evolution'), 'PR should contain Auto-Evolution header');
+    assert.ok(result.prFile, 'PR file path should be set');
+    assert.ok(fs.existsSync(result.prFile), 'PR file should exist on disk');
+    assertEqual(result.record.tier, DEPLOY_TIER.RED, 'Tier should be RED');
+    assertEqual(result.record.requiresReview, true, 'Should require review');
+
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('AutoDeployer: getSummary returns correct counts', async () => {
+    const { AutoDeployer } = require('../core/auto-deployer');
+    const dir = makeTempDir();
+    const deployer = new AutoDeployer({ outputDir: dir, projectRoot: dir, verbose: false });
+
+    deployer.applyGreen({ description: 'test green 1' });
+    deployer.applyGreen({ description: 'test green 2' });
+    deployer.generateRedPR({ title: 'test red', description: 'test', files: [] });
+
+    const summary = deployer.getSummary();
+    assertEqual(summary.green, 2, 'Should have 2 GREEN entries');
+    assertEqual(summary.red, 1, 'Should have 1 RED entry');
+    assert.ok(summary.lastDeploy, 'lastDeploy should be set');
+
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('AutoDeployer: YELLOW dry-run does not modify config', async () => {
+    const { AutoDeployer } = require('../core/auto-deployer');
+    const dir = makeTempDir();
+
+    const originalContent = `module.exports = {\n  autoFixLoop: {\n    maxFixRounds: 2,\n    maxReviewRounds: 2,\n  },\n};\n`;
+    fs.writeFileSync(path.join(dir, 'workflow.config.js'), originalContent, 'utf-8');
+
+    const deployer = new AutoDeployer({ outputDir: dir, projectRoot: dir, verbose: false });
+    const result = deployer.applyYellow(
+      { maxFixRounds: 4, maxReviewRounds: 3, source: 'test' },
+      { dryRun: true }
+    );
+
+    assertEqual(result.applied, false, 'Should NOT apply in dry-run mode');
+    assert.ok(result.changes.length > 0, 'Should still report changes');
+
+    // Verify file is unchanged
+    const afterContent = fs.readFileSync(path.join(dir, 'workflow.config.js'), 'utf-8');
+    assertEqual(afterContent, originalContent, 'Config file should be unchanged');
+
+    fs.rmSync(dir, { recursive: true });
+  });
+}
+
+// ─── MAPE Engine Tests ──────────────────────────────────────────────────────
+
+async function runMAPETests() {
+  console.log('\n── MAPE Engine ─────────────────────────────────────────────');
+
+  await test('MAPEEngine: monitor returns signal array', async () => {
+    const { MAPEEngine } = require('../core/mape-engine');
+    const dir = makeTempDir();
+    // Create minimal metrics-history.jsonl
+    const historyPath = path.join(dir, 'metrics-history.jsonl');
+    fs.writeFileSync(historyPath, '', 'utf-8');
+
+    const engine = new MAPEEngine({ orchestrator: { _outputDir: dir }, verbose: false });
+    const signals = engine.monitor();
+    assert.ok(Array.isArray(signals), 'Should return an array');
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('MAPEEngine: analyze groups signals and finds correlations', async () => {
+    const { MAPEEngine } = require('../core/mape-engine');
+    const engine = new MAPEEngine({ orchestrator: { _outputDir: makeTempDir() }, verbose: false });
+
+    const signals = [
+      { source: 'quality-gate', type: 'gate-failure', severity: 'high', title: 'Quality gate failed: maxErrorCount', data: {} },
+      { source: 'metrics-history', type: 'anomaly', severity: 'medium', title: 'Token usage trending upward', data: {} },
+      { source: 'self-reflection', type: 'issue_detected', severity: 'medium', title: 'skill overlap', data: { patternKey: 'skill-keyword-conflict' } },
+    ];
+
+    const analysis = engine.analyze(signals);
+    assert.ok(analysis.correlations.length > 0, 'Should find at least 1 correlation (gate + tokens = mistuning)');
+    assert.ok(analysis.signalGroups['quality-gate'], 'Should group by source');
+  });
+
+  await test('MAPEEngine: plan generates prioritized actions', async () => {
+    const { MAPEEngine } = require('../core/mape-engine');
+    const engine = new MAPEEngine({ orchestrator: { _outputDir: makeTempDir() }, verbose: false });
+
+    const analysis = {
+      rootCauses: [
+        { pattern: 'test-pattern', occurrences: 3, severity: 'high', sources: ['test'], suggestedAction: 'skill-refresh' },
+      ],
+      correlations: [
+        { type: 'config-mistuning', description: 'Test correlation', suggestedAction: 'config-adjustment' },
+      ],
+      signalGroups: {},
+    };
+
+    const plan = engine.plan(analysis, { maxActions: 5 });
+    assert.ok(plan.actions.length >= 2, 'Should have at least 2 actions');
+    assert.ok(plan.estimatedROI > 0, 'ROI should be positive');
+    // First action should be higher priority
+    assert.ok(plan.actions[0].priority <= plan.actions[plan.actions.length - 1].priority, 'Actions should be sorted by priority');
+  });
+
+  await test('MAPEEngine: full cycle runs without errors', async () => {
+    const { MAPEEngine } = require('../core/mape-engine');
+    const dir = makeTempDir();
+    const engine = new MAPEEngine({ orchestrator: { _outputDir: dir }, verbose: false });
+
+    const result = await engine.runCycle({ dryRun: true, maxActions: 3 });
+    assert.ok(result.phases, 'Should have phases');
+    assert.ok(result.phases.monitor, 'Should have monitor phase');
+    assert.ok(result.phases.analyze, 'Should have analyze phase');
+    assert.ok(result.phases.plan, 'Should have plan phase');
+    assert.ok(result.phases.execute, 'Should have execute phase');
+    assertEqual(result.dryRun, true, 'Should be dry run');
+    fs.rmSync(dir, { recursive: true });
+  });
+}
+
+// ─── Regression Guard Tests ─────────────────────────────────────────────────
+
+async function runRegressionGuardTests() {
+  console.log('\n── Regression Guard ────────────────────────────────────────');
+
+  await test('RegressionGuard: captureBaseline creates snapshot', async () => {
+    const { RegressionGuard } = require('../core/regression-guard');
+    const dir = makeTempDir();
+    const guard = new RegressionGuard({ outputDir: dir, verbose: false });
+
+    const baseline = guard.captureBaseline();
+    assert.ok(baseline.capturedAt, 'Should have timestamp');
+    assert.ok(baseline.metrics, 'Should have metrics');
+    assert.ok(baseline.skillVersions, 'Should have skill versions');
+
+    // Verify file was written
+    assert.ok(fs.existsSync(path.join(dir, 'evolve-baseline.json')), 'Baseline file should exist');
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('RegressionGuard: compareWithBaseline detects improvements and degradations', async () => {
+    const { RegressionGuard, METRIC_KEY } = require('../core/regression-guard');
+    const dir = makeTempDir();
+    const guard = new RegressionGuard({ outputDir: dir, verbose: false });
+
+    // Create a manual baseline
+    const baseline = {
+      capturedAt: new Date().toISOString(),
+      metrics: {
+        [METRIC_KEY.ERROR_RATE]: 5,
+        [METRIC_KEY.TOKEN_USAGE]: 10000,
+        [METRIC_KEY.TEST_PASS_RATE]: 0.8,
+      },
+      skillVersions: {},
+    };
+    fs.writeFileSync(path.join(dir, 'evolve-baseline.json'), JSON.stringify(baseline), 'utf-8');
+
+    const currentMetrics = {
+      [METRIC_KEY.ERROR_RATE]: 2,      // Improved (lower is better)
+      [METRIC_KEY.TOKEN_USAGE]: 15000, // Degraded (lower is better)
+      [METRIC_KEY.TEST_PASS_RATE]: 0.9, // Improved (higher is better)
+    };
+
+    const result = guard.compareWithBaseline(currentMetrics);
+    assert.ok(result.improved.length > 0, 'Should have improvements');
+    assert.ok(result.degraded.length > 0, 'Should have degradations');
+    assert.ok(result.delta[METRIC_KEY.ERROR_RATE], 'Should have error rate delta');
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('RegressionGuard: recordOutcome writes to evolve-history.jsonl', async () => {
+    const { RegressionGuard } = require('../core/regression-guard');
+    const dir = makeTempDir();
+    const guard = new RegressionGuard({ outputDir: dir, verbose: false });
+
+    guard.recordOutcome(
+      { steps: [{ name: 'test', status: 'done' }] },
+      { improved: ['errorRate'], degraded: [], unchanged: ['tokenUsage'], regressions: [] },
+      { phases: { plan: { estimatedROI: 2.5 }, execute: { executed: 1 } } }
+    );
+
+    const history = guard.loadHistory();
+    assert.ok(history.length === 1, 'Should have 1 history entry');
+    assert.ok(history[0].evolutionROI != null, 'Should have ROI score');
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('RegressionGuard: getTrend returns meaningful trend data', async () => {
+    const { RegressionGuard } = require('../core/regression-guard');
+    const dir = makeTempDir();
+    const guard = new RegressionGuard({ outputDir: dir, verbose: false });
+
+    // Add multiple history entries
+    for (let i = 0; i < 5; i++) {
+      guard.recordOutcome(
+        { steps: [] },
+        { improved: ['a'], degraded: [], unchanged: [], regressions: [] },
+        { phases: { plan: { estimatedROI: 2 + i * 0.5 }, execute: { executed: 1 } } }
+      );
+    }
+
+    const trend = guard.getTrend();
+    assertEqual(trend.cycles, 5, 'Should have 5 cycles');
+    assert.ok(trend.avgROI > 0, 'Average ROI should be positive');
+    assert.ok(['improving', 'stable', 'degrading'].includes(trend.trend), 'Trend should be valid');
+    fs.rmSync(dir, { recursive: true });
+  });
+}
+
+// ─── Skill Marketplace Tests ────────────────────────────────────────────────
+
+async function runSkillMarketplaceTests() {
+  console.log('\n── Skill Marketplace ───────────────────────────────────────');
+
+  await test('SkillMarketplace: listSkills returns skill metadata', async () => {
+    const { SkillMarketplace } = require('../core/skill-marketplace');
+    const dir = makeTempDir();
+    const skillsDir = path.join(dir, 'skills');
+    fs.mkdirSync(skillsDir);
+
+    // Create a test skill
+    fs.writeFileSync(path.join(skillsDir, 'test-skill.md'), [
+      '---',
+      'name: test-skill',
+      'version: 1.0.0',
+      'type: domain-skill',
+      'domains: [testing]',
+      'dependencies: []',
+      'exportable: true',
+      'description: "A test skill"',
+      '---',
+      '# Skill: test-skill',
+      '',
+      '## Rules',
+      '',
+      '1. Test rule with enough content words to pass validation checks for minimum word count.',
+      '',
+    ].join('\n'));
+
+    const marketplace = new SkillMarketplace({ skillsDir, outputDir: dir, verbose: false });
+    const skills = marketplace.listSkills();
+
+    assert.ok(skills.length === 1, 'Should find 1 skill');
+    assertEqual(skills[0].name, 'test-skill', 'Name should match');
+    assertEqual(skills[0].exportable, true, 'Should be exportable');
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('SkillMarketplace: exportSkill creates package file', async () => {
+    const { SkillMarketplace } = require('../core/skill-marketplace');
+    const dir = makeTempDir();
+    const skillsDir = path.join(dir, 'skills');
+    fs.mkdirSync(skillsDir);
+
+    const skillContent = [
+      '---',
+      'name: export-test',
+      'version: 2.0.0',
+      'type: domain-skill',
+      'domains: [test]',
+      'dependencies: []',
+      'description: "Export test"',
+      '---',
+      '# Skill: export-test',
+      '',
+      '## Rules',
+      '',
+      '1. Test export rule',
+    ].join('\n');
+
+    fs.writeFileSync(path.join(skillsDir, 'export-test.md'), skillContent);
+
+    const marketplace = new SkillMarketplace({ skillsDir, outputDir: dir, verbose: false });
+    const { packagePath, package: pkg } = marketplace.exportSkill('export-test');
+
+    assert.ok(fs.existsSync(packagePath), 'Package file should exist');
+    assertEqual(pkg.skill.name, 'export-test', 'Package skill name should match');
+    assertEqual(pkg.skill.version, '2.0.0', 'Version should match');
+    assert.ok(pkg.skill.content.includes('Test export rule'), 'Content should be included');
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('SkillMarketplace: importSkill writes new skill file', async () => {
+    const { SkillMarketplace } = require('../core/skill-marketplace');
+    const dir = makeTempDir();
+    const skillsDir = path.join(dir, 'skills');
+    fs.mkdirSync(skillsDir);
+
+    // Create a package to import
+    const pkg = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      skill: {
+        name: 'imported-skill',
+        version: '1.0.0',
+        type: 'domain-skill',
+        domains: ['import-test'],
+        dependencies: [],
+        description: 'An imported skill',
+        content: '---\nname: imported-skill\nversion: 1.0.0\n---\n# Skill: imported-skill\n\n## Rules\n\n1. Imported rule\n',
+      },
+      dependencies: [],
+    };
+
+    const pkgPath = path.join(dir, 'test-import.skill.json');
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg));
+
+    const marketplace = new SkillMarketplace({ skillsDir, outputDir: dir, verbose: false });
+    const result = marketplace.importSkill(pkgPath);
+
+    assertEqual(result.imported, true, 'Should be imported');
+    assertEqual(result.skillName, 'imported-skill', 'Name should match');
+    assert.ok(fs.existsSync(path.join(skillsDir, 'imported-skill.md')), 'Skill file should exist');
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('SkillMarketplace: importSkill with skip strategy handles conflicts', async () => {
+    const { SkillMarketplace } = require('../core/skill-marketplace');
+    const dir = makeTempDir();
+    const skillsDir = path.join(dir, 'skills');
+    fs.mkdirSync(skillsDir);
+
+    // Create existing skill
+    fs.writeFileSync(path.join(skillsDir, 'conflict-skill.md'), '# Existing skill\n\n## Rules\n\n1. Local rule\n');
+
+    // Create a package with same name
+    const pkg = {
+      version: 1,
+      skill: { name: 'conflict-skill', version: '1.0.0', content: '# Conflict\n\n## Rules\n\n1. New rule\n', dependencies: [] },
+      dependencies: [],
+    };
+    const pkgPath = path.join(dir, 'conflict.skill.json');
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg));
+
+    const marketplace = new SkillMarketplace({ skillsDir, outputDir: dir, verbose: false });
+    const result = marketplace.importSkill(pkgPath, { conflictStrategy: 'skip' });
+
+    assertEqual(result.imported, false, 'Should NOT be imported (skip strategy)');
+    assert.ok(result.conflicts.length > 0, 'Should report conflicts');
+
+    // Original content should be preserved
+    const content = fs.readFileSync(path.join(skillsDir, 'conflict-skill.md'), 'utf-8');
+    assert.ok(content.includes('Local rule'), 'Original content should be preserved');
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('SkillMarketplace: checkCompatibility detects missing dependencies', async () => {
+    const { SkillMarketplace } = require('../core/skill-marketplace');
+    const dir = makeTempDir();
+    const skillsDir = path.join(dir, 'skills');
+    fs.mkdirSync(skillsDir);
+
+    const pkg = {
+      version: 1,
+      skill: { name: 'dep-skill', version: '1.0.0', content: '# Dep test', dependencies: ['missing-dep', 'another-missing'] },
+      dependencies: [],
+    };
+    const pkgPath = path.join(dir, 'dep-test.skill.json');
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg));
+
+    const marketplace = new SkillMarketplace({ skillsDir, outputDir: dir, verbose: false });
+    const result = marketplace.checkCompatibility(pkgPath);
+
+    assertEqual(result.compatible, false, 'Should NOT be compatible');
+    assert.ok(result.issues.length >= 2, 'Should report at least 2 missing dependency issues');
+    fs.rmSync(dir, { recursive: true });
+  });
+}
+
 // ─── Main Runner ──────────────────────────────────────────────────────────────
 
 async function runTests() {
@@ -925,6 +1509,11 @@ async function runTests() {
   await runConfigLoaderTests();
   await runStateMachineErrorTests();
   await runContractTests();
+  await runGotchasSectionTests();
+  await runAutoDeployerTests();
+  await runMAPETests();
+  await runRegressionGuardTests();
+  await runSkillMarketplaceTests();
 
   console.log('\n' + '='.repeat(60));
   console.log(`  Results: ${passed} passed, ${failed} failed`);

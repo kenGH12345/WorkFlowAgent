@@ -44,6 +44,8 @@ const PATHS = {
   PR_DESCRIPTION_MD: path.join(WORKFLOW_ROOT, 'output', 'pr-description.md'),
   /** Dry-run sandbox report (written when dryRun: true) */
   DRYRUN_REPORT_MD: path.join(WORKFLOW_ROOT, 'output', 'dry-run-report.md'),
+  /** HTML session report (interactive visualisation) */
+  HTML_REPORT: path.join(WORKFLOW_ROOT, 'output', 'session-report.html'),
   /** LLM query expansion synonym/alias table (auto-accumulated, persistent) */
   SYNONYM_TABLE_JSON: path.join(WORKFLOW_ROOT, 'output', 'synonym-table.json'),
   /** Prompt A/B variant registry (auto-managed by PromptSlotManager) */
@@ -55,6 +57,7 @@ const PATHS = {
 const ARTIFACTS = {
   REQUIREMENT_MD: 'requirement.md',
   ARCHITECTURE_MD: 'architecture.md',
+  EXECUTION_PLAN_MD: 'execution-plan.md',
   CODE_DIFF: 'code.diff',
   TEST_REPORT_MD: 'test-report.md',
 };
@@ -62,8 +65,16 @@ const ARTIFACTS = {
 // ─── LLM / Token Thresholds ────────────────────────────────────────────────────
 
 const LLM = {
-  /** Token count above which a hallucination-risk warning is emitted */
-  HALLUCINATION_RISK_THRESHOLD: 8000,
+  /**
+   * Token count above which a hallucination-risk warning is emitted.
+   *
+   * Rationale (R1-1 audit): previously 8000, which was far too conservative for
+   * modern 128K–200K context-window models. At 8K, the degradation logic in
+   * prompt-builder.js frequently stripped valuable skill/ADR context, reducing
+   * output quality. 16K keeps a healthy safety margin while allowing the full
+   * 3-layer skill injection + ADR digest + code graph to fit without degradation.
+   */
+  HALLUCINATION_RISK_THRESHOLD: 16000,
   /** Approximate chars-per-token ratio used for quick estimation */
   CHARS_PER_TOKEN: 4,
 };
@@ -91,11 +102,13 @@ const HOOK_EVENTS = {
   TASK_INTERRUPTED:   'task_interrupted',    // A task was interrupted
   EXPERIENCE_RECORDED:'experience_recorded', // A new experience was saved
   SKILL_EVOLVED:      'skill_evolved',       // A skill was evolved
+  SKILL_AUTO_CREATED:  'skill_auto_created',  // A new skill was auto-created from orphan experience (P1)
   COMPLAINT_FILED:    'complaint_filed',     // A complaint was filed
   COMPLAINT_RESOLVED: 'complaint_resolved',  // A complaint was resolved
   // Observability events
   STAGE_STARTED:      'stage_started',       // A workflow stage started
   STAGE_ENDED:        'stage_ended',         // A workflow stage ended
+  STAGE_ARTIFACT_PRODUCED: 'stage_artifact_produced', // A stage produced an output artifact
   LLM_CALL_RECORDED:  'llm_call_recorded',   // An LLM call was recorded
   // CI integration events
   CI_PIPELINE_STARTED:  'ci_pipeline_started',
@@ -117,6 +130,13 @@ const HOOK_EVENTS = {
   // Prompt A/B testing events
   PROMPT_VARIANT_PROMOTED:  'prompt_variant_promoted',   // A variant outperformed the active and was promoted
   PROMPT_VARIANT_ROLLEDBACK:'prompt_variant_rolledback', // Active variant rolled back to baseline after failures
+  // HTML report events
+  HTML_REPORT_GENERATED:    'html_report_generated',     // HTML session report generated
+  // Optimistic lock events
+  FILE_LOCK_CONFLICT:       'file_lock_conflict',        // Optimistic lock conflict detected during parallel edit
+  // Agent Negotiation Protocol events (P1-2, ADR-40)
+  NEGOTIATE_REQUEST:        'negotiate_request',         // Downstream agent raises a concern about upstream artifact
+  NEGOTIATE_RESPONSE:       'negotiate_response',        // Orchestrator responds with a resolution
 };
 
 module.exports = {

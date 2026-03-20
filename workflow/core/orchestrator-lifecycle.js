@@ -19,11 +19,80 @@
 'use strict';
 
 const fs = require('fs');
+const path = require('path');
 const { PATHS, HOOK_EVENTS } = require('./constants');
 const { STATE_ORDER } = require('./types');
 const { SkillWatcher } = require('./skill-watcher');
 const { getCachedLoader, onLoaderReady } = require('./prompt-builder');
 const { ComplaintStatus } = require('./complaint-wall');
+
+// ─── P1 Recovery Hook: Recoverable Error Classification ────────────────────
+// Defines which error types are safe to auto-retry in _runStage().
+// Transient errors (network timeouts, rate limits, temporary file locks)
+// should be retried; logic errors and fatal failures should not.
+//
+// Classification approach:
+//   1. Error code matching (ETIMEDOUT, ECONNRESET, etc.)
+//   2. Error message pattern matching (rate_limit, 429, 503, etc.)
+//   3. Error class matching (known transient error classes)
+
+const RECOVERABLE_ERROR_CODES = new Set([
+  'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED',
+  'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH', 'EAI_AGAIN',
+  'ENOTFOUND', 'EBUSY', 'EMFILE', 'ENFILE',
+]);
+
+const RECOVERABLE_MESSAGE_PATTERNS = [
+  /rate.?limit/i,
+  /too many requests/i,
+  /\b429\b/,
+  /\b503\b/,
+  /\b502\b/,
+  /service.?unavailable/i,
+  /gateway.?timeout/i,
+  /request.?timeout/i,
+  /connection.?reset/i,
+  /network.?error/i,
+  /socket.?hang.?up/i,
+  /ECONNRESET/i,
+  /ETIMEDOUT/i,
+  /temporarily.?unavailable/i,
+  /overloaded/i,
+  /capacity/i,
+  /throttl/i,
+  /quota.?exceeded/i,
+];
+
+/**
+ * Determines if an error is transient/recoverable and safe to auto-retry.
+ *
+ * @param {Error} err
+ * @returns {{ recoverable: boolean, category: string }}
+ */
+function classifyError(err) {
+  if (!err) return { recoverable: false, category: 'unknown' };
+
+  // Check error code (Node.js system errors)
+  if (err.code && RECOVERABLE_ERROR_CODES.has(err.code)) {
+    return { recoverable: true, category: `system:${err.code}` };
+  }
+
+  // Check HTTP status code (LLM API errors)
+  const statusCode = err.status || err.statusCode || err.response?.status;
+  if (statusCode === 429 || statusCode === 502 || statusCode === 503 || statusCode === 504) {
+    return { recoverable: true, category: `http:${statusCode}` };
+  }
+
+  // Check error message patterns
+  const msg = err.message || '';
+  for (const pattern of RECOVERABLE_MESSAGE_PATTERNS) {
+    if (pattern.test(msg)) {
+      return { recoverable: true, category: `message:${pattern.source.slice(0, 30)}` };
+    }
+  }
+
+  return { recoverable: false, category: 'fatal' };
+}
 
 module.exports = {
 
@@ -105,7 +174,121 @@ module.exports = {
       );
     }
 
+    // 6. ADR-30 P1: Experience Store cold-start preheating
+    // When the experience store is empty (new project), search external knowledge
+    // sources for common experiences and inject them as seed entries. This solves
+    // the cold-start problem where getContextBlock() returns nothing until the
+    // first few workflow runs accumulate real experiences.
+    // Fire-and-forget: must not block workflow startup.
+    if (this.experienceStore) {
+      const stats = this.experienceStore.getStats();
+      if (stats.total < 3) {
+        const { preheatExperienceStore } = require('./context-budget-manager');
+        // Detect tech stack from AGENTS.md / skill files for targeted preheating
+        const techStack = this._detectTechStackForPreheat();
+        preheatExperienceStore(this, { techStack, projectType: this._detectProjectType() })
+          .then(r => {
+            if (r.success && r.seeded > 0) {
+              console.log(`[Orchestrator] 🌱 Experience cold-start preheated: ${r.seeded} seed experiences injected.`);
+            }
+          })
+          .catch(err => {
+            console.warn(`[Orchestrator] ⚠️  Experience preheat failed (non-fatal): ${err.message}`);
+          });
+      }
+    }
+
+    // 7-9. Initialise island modules (Logger, NegotiationEngine, ExperienceRouter)
+    await this._initIslandModules(resumeState);
+
     return resumeState;
+  },
+
+  // ── Step 7: P1-4 Structured Logger: emit first structured log entry ────────
+  // ── Step 8: P1-2 NegotiationEngine: reset counters for new run ────────────
+  // ── Step 9: P2-1 ExperienceRouter: auto-import from other projects ────────
+  // These are integrated at the end of _initWorkflow so all prerequisites
+  // (AGENTS.md, ExperienceStore, techStack) are available.
+
+  /**
+   * Initialises the "island" modules that were previously created but not
+   * connected to the lifecycle. Called at the end of _initWorkflow().
+   *
+   * @param {string} resumeState
+   */
+  async _initIslandModules(resumeState) {
+    // Step 7: Structured Logger — first structured log entry
+    if (this.logger) {
+      this.logger.info('Orchestrator', 'Workflow initialised', {
+        projectId: this.projectId,
+        resumeState,
+        outputDir: this._outputDir,
+      });
+    }
+
+    // Step 8: NegotiationEngine — reset round counters for fresh run
+    if (this.negotiation) {
+      this.negotiation.reset();
+      if (this.logger) {
+        this.logger.info('Negotiation', 'Round counters reset for new workflow run');
+      }
+    }
+
+    // Step 9: ExperienceRouter — update tech stack and auto-import
+    if (this.experienceRouter) {
+      // Update tech stack from AGENTS.md (now loaded) so discovery uses accurate tags
+      const detectedTechStack = this._detectTechStackForPreheat();
+      if (detectedTechStack.length > 0) {
+        this.experienceRouter._techStack = new Set(detectedTechStack.map(t => t.toLowerCase()));
+      }
+
+      // Fire-and-forget: auto-import relevant experiences from other projects
+      try {
+        const importResult = this.experienceRouter.autoImport();
+        if (importResult.imported > 0 && this.logger) {
+          this.logger.info('ExperienceRouter', `Auto-imported ${importResult.imported} experience(s)`, {
+            sources: importResult.sources,
+            skipped: importResult.skipped,
+          });
+        }
+      } catch (routerErr) {
+        console.warn(`[Orchestrator] ⚠️  ExperienceRouter auto-import failed (non-fatal): ${routerErr.message}`);
+      }
+    }
+  },
+
+  /**
+   * ADR-30 P1: Detects the project's tech stack from AGENTS.md and skill files.
+   * Used to construct targeted web search queries for experience preheating.
+   * @returns {string[]} Array of tech stack terms (e.g. ['React', 'TypeScript', 'Next.js'])
+   */
+  _detectTechStackForPreheat() {
+    const techPattern = /\b(?:React|Vue|Angular|Next\.js|Nuxt|Svelte|Express|Fastify|Koa|NestJS|Django|Flask|FastAPI|Spring\s?Boot|Laravel|Rails|Prisma|TypeORM|Sequelize|Mongoose|TailwindCSS|Bootstrap|Redis|MongoDB|PostgreSQL|MySQL|SQLite|GraphQL|gRPC|Docker|Kubernetes|TypeScript|JavaScript|Python|Java|Go|Rust|Lua|C#|Unity|Flutter|Dart|Swift|Kotlin|Electron|Tauri)\b/gi;
+    let source = this._agentsMdContent || '';
+    // Also scan skill filenames for domain hints
+    try {
+      const PATHS = require('./constants').PATHS;
+      const skillFiles = require('fs').readdirSync(PATHS.SKILLS_DIR).filter(f => f.endsWith('.md'));
+      source += ' ' + skillFiles.map(f => f.replace('.md', '').replace(/-/g, ' ')).join(' ');
+    } catch (_) { /* non-fatal */ }
+    const matches = source.match(techPattern) || [];
+    return [...new Set(matches.map(t => t.trim()))].slice(0, 6);
+  },
+
+  /**
+   * ADR-30 P1: Detects the project type (frontend/backend/fullstack/game/mobile).
+   * @returns {string} Project type string
+   */
+  _detectProjectType() {
+    const content = (this._agentsMdContent || '').toLowerCase();
+    if (/\bgame\b|\bunity\b|\bgodot\b|\bunreal\b|\bcocos\b/.test(content)) return 'game';
+    if (/\bmobile\b|\bflutter\b|\breact\s?native\b|\bswiftui\b|\bkotlin\b/.test(content)) return 'mobile';
+    if (/\bfrontend\b|\breact\b|\bvue\b|\bangular\b|\bsvelte\b/.test(content)) {
+      if (/\bbackend\b|\bapi\b|\bserver\b|\bdatabase\b/.test(content)) return 'fullstack';
+      return 'frontend';
+    }
+    if (/\bbackend\b|\bapi\b|\bserver\b|\bmicroservice\b/.test(content)) return 'backend';
+    return 'general';
   },
 
   /**
@@ -242,11 +425,170 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
       this.obs.recordPromptVariantUsage(this.promptSlotManager.getStats());
     }
 
+    // ── Adapter Telemetry: snapshot block lifecycle stats into Observability ──
+    if (this._adapterTelemetry) {
+      try {
+        const telemetryReport = this._adapterTelemetry.getReport();
+        this.obs.recordBlockTelemetry(telemetryReport);
+        if (telemetryReport.recommendations.length > 0) {
+          console.log(`[Orchestrator] 📊 Adapter telemetry: ${telemetryReport.recommendations.length} recommendation(s):`);
+          for (const rec of telemetryReport.recommendations.slice(0, 5)) {
+            console.log(`  → ${rec}`);
+          }
+        }
+        if (telemetryReport.summary.totalSavedByCompression > 0) {
+          console.log(`[Orchestrator] 🗜️  Total compression savings: ${telemetryReport.summary.totalSavedByCompression} chars across ${telemetryReport.summary.totalBlocks} block(s).`);
+        }
+      } catch (telErr) {
+        console.warn(`[Orchestrator] ⚠️  Adapter telemetry report failed (non-fatal): ${telErr.message}`);
+      }
+    }
+
+    // ── P1 Self-Reflection: Quality Gate Validation + Proactive Audit ────────
+    // This is the integration point where SelfReflectionEngine hooks into the
+    // workflow lifecycle. It runs AFTER all stages complete but BEFORE the
+    // Observability flush, so gating results are captured in the session report.
+    if (this._selfReflection) {
+      try {
+        // Step 1: Flush current metrics snapshot for validation
+        const preFlushMetrics = this.obs.getMetricsSnapshot ? this.obs.getMetricsSnapshot() : null;
+
+        // Step 2: Run quality gate validation against current session
+        if (preFlushMetrics) {
+          const gatingResult = this._selfReflection.validateRun(preFlushMetrics);
+          this.obs.recordReflectionGating(gatingResult);
+
+          if (!gatingResult.passed) {
+            console.warn(`[Orchestrator] ❌ Self-Reflection: ${gatingResult.gates.filter(g => !g.passed).length} quality gate(s) failed.`);
+          }
+        }
+
+        // Step 3: Run proactive health audit (cross-session anomaly detection)
+        const auditResult = this._selfReflection.auditHealth();
+        if (auditResult.findings.length > 0) {
+          console.log(`[Orchestrator] 🔍 Self-Reflection health audit: ${auditResult.findings.length} finding(s)`);
+        }
+
+        // Step 4: Flush reflection data to disk
+        this._selfReflection.flush();
+      } catch (srErr) {
+        console.warn(`[Orchestrator] ⚠️  Self-Reflection integration failed (non-fatal): ${srErr.message}`);
+      }
+    }
+
+    // ── P0 Prompt Tracing: flush prompt trace digests to prompt-traces.jsonl ──
+    // Must run BEFORE obs.flush() so the promptTraceSummary in run-metrics.json
+    // accurately reflects the number of traces that were persisted.
+    try {
+      const tracesWritten = this.obs.flushPromptTraces();
+      if (tracesWritten > 0) {
+        console.log(`[Orchestrator] 📝 Prompt traces: ${tracesWritten} trace(s) persisted for replay & debugging.`);
+      }
+    } catch (ptErr) {
+      console.warn(`[Orchestrator] ⚠️  Prompt trace flush failed (non-fatal): ${ptErr.message}`);
+    }
+
+    // ── Skill Lifecycle: sync usage stats to SkillEvolutionEngine registry ──
+    // Transfers per-session skill injection/effectiveness data from Observability
+    // to the persistent SkillEvolutionEngine registry, enabling cross-session
+    // effectiveness tracking, stale skill detection, and retirement.
+    if (this.skillEvolution && this.obs._skillInjectedCounts) {
+      try {
+        for (const [skillName, count] of this.obs._skillInjectedCounts) {
+          this.skillEvolution.recordUsage(skillName, count);
+        }
+        for (const skillName of this.obs._skillEffectiveSet) {
+          this.skillEvolution.recordEffective(skillName);
+        }
+        this.skillEvolution.flushLifecycleStats();
+
+        // Run stale skill detection (dry-run by default — logs findings)
+        const { stale } = this.skillEvolution.retireStaleSkills({ dryRun: true });
+        if (stale.length > 0) {
+          console.log(`[Orchestrator] 📦 Stale skill detection: ${stale.length} skill(s) underperforming:`);
+          for (const s of stale) {
+            const hr = ((s.effectiveCount || 0) / (s.usageCount || 1) * 100).toFixed(0);
+            console.log(`[Orchestrator]   - ${s.name}: ${hr}% effective (${s.usageCount} uses)`);
+          }
+        }
+
+        // ── ADR-32 P4: Stale Skill Auto-Refresh ──────────────────────────
+        // Skills that haven't been evolved in >90 days are auto-enriched from
+        // external knowledge, similar to CDN cache refresh. This completes the
+        // self-evolution loop: stale detection → auto re-enrichment → fresh knowledge.
+        // Fire-and-forget: must not block the finalize pipeline.
+        if (this.skillEvolution) {
+          try {
+            const STALE_DAYS = 90;
+            const now = Date.now();
+            const refreshCandidates = [];
+
+            for (const meta of this.skillEvolution.registry.values()) {
+              if (meta.retiredAt) continue;
+              const lastEvolved = meta.lastEvolvedAt ? new Date(meta.lastEvolvedAt).getTime() : 0;
+              const created = meta.createdAt ? new Date(meta.createdAt).getTime() : 0;
+              const latestActivity = Math.max(lastEvolved, created);
+              const daysSince = latestActivity > 0 ? (now - latestActivity) / (24 * 60 * 60 * 1000) : Infinity;
+
+              if (daysSince > STALE_DAYS && (meta.usageCount || 0) > 0) {
+                refreshCandidates.push(meta.name);
+              }
+            }
+
+            if (refreshCandidates.length > 0) {
+              console.log(`[Orchestrator] 🔄 Auto-refreshing ${refreshCandidates.length} stale skill(s): [${refreshCandidates.slice(0, 5).join(', ')}${refreshCandidates.length > 5 ? '...' : ''}]`);
+              // Refresh top 3 stale skills (fire-and-forget, rate-limited by _enrichmentState)
+              const { enrichSkillFromExternalKnowledge } = require('./context-budget-manager');
+              for (const skillName of refreshCandidates.slice(0, 3)) {
+                enrichSkillFromExternalKnowledge(this, skillName, { maxSearchResults: 3, maxFetchPages: 2 })
+                  .then(r => {
+                    if (r.success && r.sectionsAdded > 0) {
+                      console.log(`[Orchestrator] 🔄→📝 Auto-refreshed stale skill "${skillName}": ${r.sectionsAdded} entries updated.`);
+                    }
+                  })
+                  .catch(() => { /* non-fatal */ });
+              }
+            }
+          } catch (refreshErr) {
+            console.warn(`[Orchestrator] ⚠️ Stale skill auto-refresh failed (non-fatal): ${refreshErr.message}`);
+          }
+        }
+      } catch (skillSyncErr) {
+        console.warn(`[Orchestrator] ⚠️  Skill lifecycle sync failed (non-fatal): ${skillSyncErr.message}`);
+      }
+    }
+
     // ── Defect #3 fix: flush metrics BEFORE printDashboard ──────────────────
     try {
       this.obs.flush();
     } catch (flushErr) {
       console.warn(`[Orchestrator] ⚠️  Observability flush failed (non-fatal): ${flushErr.message}`);
+    }
+
+    // ── P1 ADR-34: YELLOW Tier Auto-Deploy (config param adjustment) ─────────
+    // After metrics are flushed, re-derive the adaptive strategy from updated
+    // history and auto-apply any config parameter changes to workflow.config.js.
+    // This closes the loop: run workflow → collect metrics → adjust config → next run.
+    if (this.autoDeployer) {
+      try {
+        const Observability = require('./observability');
+        const cfgAutoFix = (this._config && this._config.autoFixLoop) || {};
+        const postRunStrategy = Observability.deriveStrategy(this._outputDir, {
+          maxFixRounds:    cfgAutoFix.maxFixRounds    ?? 2,
+          maxReviewRounds: cfgAutoFix.maxReviewRounds ?? 2,
+          maxExpInjected:  cfgAutoFix.maxExpInjected  ?? 5,
+          projectId:       this.projectId,
+        });
+
+        if (postRunStrategy.source !== 'defaults') {
+          const yellowResult = this.autoDeployer.applyYellow(postRunStrategy);
+          if (yellowResult.applied && yellowResult.changes.length > 0) {
+            console.log(`[Orchestrator] 🟡 Auto-Deploy: ${yellowResult.changes.length} config param(s) updated for next run.`);
+          }
+        }
+      } catch (adErr) {
+        console.warn(`[Orchestrator] ⚠️  Auto-Deploy (YELLOW) failed (non-fatal): ${adErr.message}`);
+      }
     }
 
     // Print Observability dashboard (session metrics summary)
@@ -256,13 +598,60 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
       console.warn(`[Orchestrator] ⚠️  Observability dashboard failed (non-fatal): ${dashErr.message}`);
     }
 
-    // Print accumulated risk summary
+    // Generate HTML visualisation report (interactive session audit trail)
+    try {
+      const reportPath = this.obs.generateHTMLReport();
+      console.log(`[Orchestrator] 📊 HTML session report: ${reportPath}`);
+    } catch (htmlErr) {
+      console.warn(`[Orchestrator] ⚠️  HTML report generation failed (non-fatal): ${htmlErr.message}`);
+    }
+
+    // ── P3 Cross-Stage Risk Correlation Analysis ─────────────────────────────
+    // Inspired by the white-box audit methodology's "attack chain" thinking:
+    // individual risks across different stages can combine into compound risks
+    // greater than the sum of their parts (Swiss Cheese Model).
+    //
+    // This analysis runs BEFORE the RISK SUMMARY so correlated risks are
+    // included in the final report and visible to the user.
     const risks = this.stateMachine.getRisks ? this.stateMachine.getRisks() : [];
-    if (risks.length > 0) {
+    if (risks.length >= 2) {
+      try {
+        const correlatedRisks = _analyseRiskCorrelations(risks, this.stageCtx);
+        if (correlatedRisks.length > 0) {
+          console.warn(`\n${'─'.repeat(60)}`);
+          console.warn(`  🔗 RISK CORRELATION ANALYSIS (${correlatedRisks.length} chain(s) found)`);
+          console.warn(`${'─'.repeat(60)}`);
+          for (const chain of correlatedRisks) {
+            console.warn(`  ⛓️  [${chain.severity.toUpperCase()}] ${chain.label}`);
+            console.warn(`      Contributing factors:`);
+            for (const factor of chain.factors) {
+              console.warn(`        → [${factor.stage}] ${factor.description.slice(0, 120)}`);
+            }
+            console.warn(`      Impact: ${chain.impact}`);
+            if (chain.recommendation) {
+              console.warn(`      Recommendation: ${chain.recommendation}`);
+            }
+            // Record the correlated risk as a new risk entry for traceability
+            this.stateMachine.recordRisk(chain.severity,
+              `[RiskCorrelation] ${chain.label}: ${chain.factors.map(f => f.description.slice(0, 60)).join(' + ')}. Impact: ${chain.impact}`,
+              false
+            );
+          }
+          console.warn(`${'─'.repeat(60)}`);
+          this.stateMachine.flushRisks();
+        }
+      } catch (corrErr) {
+        console.warn(`[Orchestrator] ⚠️  Risk correlation analysis failed (non-fatal): ${corrErr.message}`);
+      }
+    }
+
+    // Print accumulated risk summary (now includes correlated risks from P3 above)
+    const allRisks = this.stateMachine.getRisks ? this.stateMachine.getRisks() : [];
+    if (allRisks.length > 0) {
       console.warn(`\n${'─'.repeat(60)}`);
-      console.warn(`  ⚠️  RISK SUMMARY (${risks.length} item(s))`);
+      console.warn(`  ⚠️  RISK SUMMARY (${allRisks.length} item(s))`);
       console.warn(`${'─'.repeat(60)}`);
-      for (const r of risks) {
+      for (const r of allRisks) {
         console.warn(`  [${r.severity?.toUpperCase() ?? 'UNKNOWN'}] ${r.description}`);
       }
       console.warn(`${'─'.repeat(60)}\n`);
@@ -282,6 +671,90 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
         pendingCount: this.sandbox.pendingCount,
         ops: this.sandbox.getPendingOps().map(op => ({ type: op.type, path: op.relPath })),
       });
+    }
+
+    // ── Optimistic lock: report conflicts and reset ────────────────────────
+    try {
+      const { fileLockManager } = require('./file-lock-manager');
+      const lockStats = fileLockManager.getStats();
+      if (lockStats.conflicts > 0) {
+        console.warn(`\n${'─'.repeat(60)}`);
+        console.warn(`  🔒 OPTIMISTIC LOCK SUMMARY`);
+        console.warn(`  Tracked files: ${lockStats.trackedFiles} | Conflicts: ${lockStats.conflicts}`);
+        for (const c of fileLockManager.getConflicts().slice(-5)) {
+          console.warn(`  [${c.acquiredBy}→${c.conflictBy}] ${path.basename(c.file)}`);
+        }
+        console.warn(`${'─'.repeat(60)}\n`);
+      }
+      fileLockManager.reset();
+    } catch (err) { console.warn(`[Orchestrator] fileLockManager.reset() failed: ${err.message}`); }
+
+    // ── DocGen: Auto-generate CHANGELOG.md ──────────────────────────────────
+    // After all stages complete, generate a CHANGELOG entry from git log
+    // and append it to CHANGELOG.md. This runs before git PR workflow so the
+    // CHANGELOG is included in the PR commit.
+    try {
+      if (this.services && this.services.has('mcpRegistry')) {
+        const registry = this.services.resolve('mcpRegistry');
+        let docGenAdapter;
+        try { docGenAdapter = registry.get('doc-gen'); } catch (_) { /* not registered */ }
+        if (docGenAdapter && docGenAdapter.isConnected) {
+          const changelogResult = await docGenAdapter.generateChangelog();
+          if (changelogResult.markdown && changelogResult.entries.length > 0) {
+            const changelogPath = docGenAdapter.appendChangelog(changelogResult.markdown);
+            if (changelogPath) {
+              console.log(`[Orchestrator] 📝 CHANGELOG.md auto-updated: ${changelogResult.entries.length} commit(s) for v${changelogResult.version}.`);
+            }
+          }
+        }
+      }
+    } catch (clErr) {
+      console.warn(`[Orchestrator] ⚠️  CHANGELOG auto-generation failed (non-fatal): ${clErr.message}`);
+    }
+
+    // ── P1-2: Flush NegotiationEngine log ────────────────────────────────────
+    // Persist negotiation entries (if any) so they're available for audit.
+    if (this.negotiation) {
+      try {
+        const negLog = this.negotiation.getLog();
+        if (negLog.length > 0) {
+          this.negotiation.flush();
+          console.log(`[Orchestrator] 🤝 NegotiationEngine: ${negLog.length} negotiation(s) persisted.`);
+        }
+      } catch (negErr) {
+        console.warn(`[Orchestrator] ⚠️  NegotiationEngine flush failed (non-fatal): ${negErr.message}`);
+      }
+    }
+
+    // ── P2-1: ExperienceRouter — publish high-value experiences ──────────────
+    // After ExperienceStore is flushed, publish to the cross-project registry
+    // so other projects can discover and import this project's experiences.
+    if (this.experienceRouter) {
+      try {
+        const pubResult = this.experienceRouter.publish();
+        if (pubResult.published > 0) {
+          console.log(`[Orchestrator] 🌐 ExperienceRouter: published ${pubResult.published} experience(s) to cross-project registry.`);
+        }
+      } catch (pubErr) {
+        console.warn(`[Orchestrator] ⚠️  ExperienceRouter publish failed (non-fatal): ${pubErr.message}`);
+      }
+    }
+
+    // ── P1-4: Structured Logger — flush and close ───────────────────────────
+    // Must be last: all other modules should have logged by now.
+    if (this.logger) {
+      try {
+        this.logger.info('Orchestrator', 'Workflow finalisation complete', {
+          mode,
+          projectId: this.projectId,
+        });
+        const entryCount = this.logger.flush();
+        if (entryCount > 0) {
+          console.log(`[Orchestrator] 📝 Structured Logger: ${entryCount} log entries written to workflow.log.jsonl`);
+        }
+      } catch (logErr) {
+        console.warn(`[Orchestrator] ⚠️  Logger flush failed (non-fatal): ${logErr.message}`);
+      }
     }
 
     // ── Git PR workflow ──────────────────────────────────────────────────────
@@ -389,9 +862,23 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
 
   // ─── Stage Runners ────────────────────────────────────────────────────────────
 
+
   /**
    * Runs a single stage if not already completed.
    * Skips the stage if the current state is already past it.
+   *
+   * P1 Recovery Hook: Transient errors (network timeouts, LLM rate limits,
+   * temporary file system issues) are automatically retried with exponential
+   * backoff. Fatal errors (logic errors, assertion failures) are immediately
+   * propagated. This prevents long-running workflows from aborting due to
+   * momentary infrastructure hiccups.
+   *
+   * Retry policy:
+   *   - Max retries: 2 (configurable via this._adaptiveStrategy)
+   *   - Backoff: exponential (2s, 6s) with jitter
+   *   - Only transient errors are retried (classifyError())
+   *   - Each retry is recorded in Observability for cross-session analysis
+   *   - Recovery events are recorded as experiences for future learning
    */
   async _runStage(fromState, toState, stageRunner, resumeState) {
     const resumeIdx = STATE_ORDER.indexOf(resumeState);
@@ -406,31 +893,134 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
       return;
     }
 
+    // Recovery Hook configuration
+    const MAX_STAGE_RETRIES = (this._adaptiveStrategy && this._adaptiveStrategy.maxStageRetries) || 2;
+    const BASE_BACKOFF_MS = 2000; // 2 seconds base
+
     // Observability: track stage timing
     const stageLabel = `${fromState}→${toState}`;
     this.obs.stageStart(stageLabel);
-    let stageStatus = 'ok';
-    try {
-      const stageResult = await stageRunner();
-      const alreadyTransitioned = stageResult && stageResult.__alreadyTransitioned === true;
-      const artifactPath = alreadyTransitioned ? stageResult.artifactPath : stageResult;
-      if (!alreadyTransitioned) {
-        await this.stateMachine.transition(artifactPath, `Stage ${fromState} → ${toState} completed`);
-      } else {
-        // P0-C fix: use jumpTo(toState) to forcibly advance the state machine
-        const currentState = this.stateMachine.getState();
-        if (currentState !== toState) {
-          console.log(`[Orchestrator] P0-C: State machine at "${currentState}" after rollback chain; jumping to "${toState}" to stay in sync.`);
-          await this.stateMachine.jumpTo(toState, `P0-C sync after rollback chain in stage ${fromState}→${toState}`);
-        }
-      }
-    } catch (err) {
-      stageStatus = 'error';
-      this.obs.recordError(stageLabel, err.message);
-      throw err;
-    } finally {
-      this.obs.stageEnd(stageLabel, stageStatus);
+    // P1-4: Structured Logger integration – log stage lifecycle
+    if (this.logger) {
+      this.logger.info('Stage', `Stage started: ${stageLabel}`, { fromState, toState });
     }
+    let stageStatus = 'ok';
+    let lastErr = null;
+
+    try {
+    for (let attempt = 0; attempt <= MAX_STAGE_RETRIES; attempt++) {
+      try {
+        // On retry attempts, log the retry with backoff info
+        if (attempt > 0) {
+          const backoffMs = BASE_BACKOFF_MS * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 1000);
+          console.log(`[Orchestrator] 🔄 Recovery Hook: retrying stage ${stageLabel} (attempt ${attempt + 1}/${MAX_STAGE_RETRIES + 1}, backoff ${backoffMs}ms)...`);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+
+          // Record retry event in Observability
+          if (this.obs.recordStageRetry) {
+            this.obs.recordStageRetry(stageLabel, attempt, lastErr ? lastErr.message : 'unknown');
+          }
+        }
+
+        const stageResult = await stageRunner();
+        const alreadyTransitioned = stageResult && stageResult.__alreadyTransitioned === true;
+        const artifactPath = alreadyTransitioned ? stageResult.artifactPath : stageResult;
+        if (!alreadyTransitioned) {
+          await this.stateMachine.transition(artifactPath, `Stage ${fromState} → ${toState} completed`);
+        } else {
+          // P0-C fix: use jumpTo(toState) to forcibly advance the state machine
+          const currentState = this.stateMachine.getState();
+          if (currentState !== toState) {
+            console.log(`[Orchestrator] P0-C: State machine at "${currentState}" after rollback chain; jumping to "${toState}" to stay in sync.`);
+            await this.stateMachine.jumpTo(toState, `P0-C sync after rollback chain in stage ${fromState}→${toState}`);
+          }
+        }
+
+        // If we succeeded on a retry, record the recovery as a positive experience
+        if (attempt > 0) {
+          console.log(`[Orchestrator] ✅ Recovery Hook: stage ${stageLabel} succeeded on attempt ${attempt + 1} (recovered from: ${lastErr ? lastErr.message.slice(0, 80) : 'unknown'})`);
+          try {
+            if (this.experienceStore) {
+              const { ExperienceType, ExperienceCategory } = require('./experience-store');
+              this.experienceStore.record({
+                type: ExperienceType.POSITIVE,
+                category: ExperienceCategory.STABLE_PATTERN,
+                title: `Stage ${stageLabel} recovered after ${attempt} retry(ies)`,
+                content: `Stage ${stageLabel} failed with transient error "${lastErr ? lastErr.message.slice(0, 200) : 'unknown'}" but recovered successfully after ${attempt} retry(ies) with exponential backoff.`,
+                skill: 'workflow-orchestration',
+                tags: ['recovery-hook', 'transient-error', 'retry-success'],
+              });
+            }
+          } catch (_) { /* experience recording is non-fatal */ }
+        }
+
+        // ── Stage Output Report: show artifact summary to user ──────────
+        // This makes the pipeline transparent — users see what each stage produced
+        // instead of waiting blindly until the workflow completes.
+        try {
+          const { reportStageOutput } = require('./stage-output-reporter');
+          const _outputDir = this._outputDir || PATHS.OUTPUT_DIR;
+          reportStageOutput(toState, _outputDir, {
+            artifactPath: typeof artifactPath === 'string' ? artifactPath : undefined,
+            hookEmit: this.hooks ? this.hooks.emit.bind(this.hooks) : undefined,
+          });
+        } catch (_reportErr) { /* non-fatal: don't let reporting break the pipeline */ }
+
+        // Success – break out of retry loop
+        return;
+
+      } catch (err) {
+        lastErr = err;
+
+        // Classify the error: is it transient (recoverable) or fatal?
+        const { recoverable, category } = classifyError(err);
+
+        if (!recoverable || attempt >= MAX_STAGE_RETRIES) {
+          // Fatal error OR retry budget exhausted: propagate immediately
+          stageStatus = 'error';
+          this.obs.recordError(stageLabel, err.message);
+
+          if (attempt > 0) {
+            // We retried but still failed – record the failure pattern
+            console.warn(`[Orchestrator] ❌ Recovery Hook: stage ${stageLabel} failed after ${attempt + 1} attempt(s). Error category: ${category}. Giving up.`);
+            try {
+              if (this.experienceStore) {
+                const { ExperienceType, ExperienceCategory } = require('./experience-store');
+                this.experienceStore.record({
+                  type: ExperienceType.NEGATIVE,
+                  category: ExperienceCategory.PITFALL,
+                  title: `Stage ${stageLabel} failed after ${attempt + 1} attempt(s): ${category}`,
+                  content: `Stage ${stageLabel} encountered error: "${err.message.slice(0, 200)}". Retried ${attempt} time(s) but did not recover. Error category: ${category}.`,
+                  skill: 'workflow-orchestration',
+                  tags: ['recovery-hook', 'retry-exhausted', category],
+                });
+              }
+            } catch (_) { /* experience recording is non-fatal */ }
+          }
+
+          throw err;
+        }
+
+        // Transient error with retries remaining: log and continue to next attempt
+        console.warn(`[Orchestrator] ⚠️  Recovery Hook: transient error in stage ${stageLabel} (category: ${category}). Will retry (attempt ${attempt + 1}/${MAX_STAGE_RETRIES + 1}).`);
+        console.warn(`[Orchestrator]    Error: ${err.message.slice(0, 200)}`);
+      }
+    }
+
+    // Should not reach here (loop always returns or throws), but guard against edge cases
+    if (lastErr) {
+      stageStatus = 'error';
+      this.obs.recordError(stageLabel, lastErr.message);
+      throw lastErr;
+    }
+  } finally {
+    this.obs.stageEnd(stageLabel, stageStatus);
+    // P1-4: Structured Logger – log stage completion
+    if (this.logger) {
+      const logFn = stageStatus === 'error' ? 'error' : 'info';
+      this.logger[logFn]('Stage', `Stage ended: ${stageLabel} (${stageStatus})`, { fromState, toState, status: stageStatus });
+    }
+  }
   },
 
   /**
@@ -438,16 +1028,274 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
    *
    * @param {string} trigger - Label for logging (e.g. 'post-developer')
    */
-  _rebuildCodeGraphAsync(trigger = 'manual') {
+  _rebuildCodeGraphAsync(trigger = 'manual', { patchFiles = null, writeOutput = true, quickScan = false } = {}) {
     setImmediate(async () => {
       try {
-        console.log(`[Orchestrator] 🔄 Code graph update triggered (${trigger})...`);
-        const result = await this.codeGraph.build();
-        console.log(`[Orchestrator] ✅ Code graph updated: ${result.symbolCount} symbols, ${result.edgeCount} edges`);
+        const buildOpts = { writeOutput };
+        if (Array.isArray(patchFiles) && patchFiles.length > 0) {
+          buildOpts.patchFiles = patchFiles;
+        }
+        if (quickScan) {
+          buildOpts.quickScan = true;
+        }
+        const modeLabel = quickScan ? 'quick-scan' : (patchFiles ? `${patchFiles.length} patch files` : 'full');
+        console.log(`[Orchestrator] 🔄 Code graph update triggered (${trigger}, ${modeLabel})...`);
+        const result = await this.codeGraph.build(buildOpts);
+        console.log(`[Orchestrator] ✅ Code graph updated: ${result.symbolCount} symbols, ${result.edgeCount} edges${result.patchMode ? ' (patch mode)' : ''}`);
         this.obs.recordCodeGraphResult(result);
+
+        // LSP Enhancement: if an LSP adapter is connected, use it to replace
+        // regex-based symbols with compiler-accurate data AND enhance call edges
+        // for hotspot symbols via findReferences (Hybrid Strategy).
+        let lspEnhanced = false;
+        try {
+          if (this.services && this.services.has('mcpRegistry')) {
+            const registry = this.services.resolve('mcpRegistry');
+            let lspAdapter;
+            try { lspAdapter = registry.get('lsp'); } catch (_) { /* no LSP adapter */ }
+            if (lspAdapter && lspAdapter.isConnected) {
+              // P1: Inject LSP adapter into CodeGraph for query-time on-demand enrichment
+              this.codeGraph.setLSPAdapter(lspAdapter);
+
+              const lspResult = await lspAdapter.enhanceCodeGraph(this.codeGraph, {
+                maxFiles: 30,
+                enhanceCallEdges: true,
+                maxHotspots: 150,
+                minCalledBy: 2,
+              });
+              if (lspResult.enhanced > 0 || lspResult.callEdgesEnhanced > 0) {
+                console.log(`[Orchestrator] 🔬 LSP enhanced ${lspResult.enhanced} files with compiler-accurate symbols, ${lspResult.callEdgesEnhanced || 0} hotspot call edges refined.`);
+                lspEnhanced = true;
+              }
+            }
+          }
+        } catch (lspErr) {
+          console.warn(`[Orchestrator] LSP code graph enhancement failed (non-fatal): ${lspErr.message}`);
+        }
+
+        // If LSP enhanced the code graph (symbols or call edges), re-write output
+        // so the disk file contains the improved data. Without this, LSP changes
+        // would only exist in memory and be lost on restart.
+        // Skip re-write when writeOutput=false (e.g. post-developer): the FINISHED
+        // stage full rebuild will persist the final version anyway.
+        if (lspEnhanced && writeOutput) {
+          try {
+            this.codeGraph._writeOutput();
+            console.log(`[Orchestrator] 📄 Code graph re-written after LSP enhancement.`);
+          } catch (writeErr) {
+            console.warn(`[Orchestrator] Code graph re-write after LSP failed (non-fatal): ${writeErr.message}`);
+          }
+        } else if (lspEnhanced && !writeOutput) {
+          console.log(`[Orchestrator] 📝 LSP enhancement applied in-memory (disk write deferred to FINISHED stage).`);
+        }
       } catch (err) {
         console.warn(`[Orchestrator] Code graph update failed (non-fatal): ${err.message}`);
       }
     });
   },
 };
+
+// ─── P3: Cross-Stage Risk Correlation Analysis ──────────────────────────────
+// Module-level function (not exported, used internally by _finalizeWorkflow).
+//
+// Implements the "attack chain" pattern from the white-box audit methodology:
+// traverses all recorded risks and detects causal relationships between risks
+// in different stages. A risk in Stage A can amplify or enable a risk in Stage B.
+//
+// Correlation patterns detected:
+//   1. Error Cascade:         Missing error handling + unhandled exception = total failure
+//   2. Security Amplification: Auth/validation issue + direct data access = data breach
+//   3. Quality Erosion:       Multiple rollback failures across stages = systemic weakness
+//   4. Architecture-Code Gap: Architecture concern + matching code issue = design debt
+//   5. Test Coverage Gap:     Untested risk area + known defect in that area = blind spot
+
+/**
+ * Analyses recorded risks for cross-stage causal correlations.
+ *
+ * @param {{ severity: string, description: string, timestamp: string }[]} risks
+ * @param {object} [stageCtx] - StageContextStore for additional stage metadata
+ * @returns {{ severity: string, label: string, factors: object[], impact: string, recommendation: string }[]}
+ */
+function _analyseRiskCorrelations(risks, stageCtx) {
+  if (!risks || risks.length < 2) return [];
+
+  const correlations = [];
+
+  // Group risks by inferred stage
+  const stageRisks = new Map();
+  for (const risk of risks) {
+    const stage = _inferStageFromRisk(risk.description);
+    if (!stageRisks.has(stage)) stageRisks.set(stage, []);
+    stageRisks.get(stage).push(risk);
+  }
+
+  const stages = [...stageRisks.keys()];
+
+  // ── Pattern 1: Error Cascade ──────────────────────────────────────────────
+  // Missing error handling in one stage + failure in another = cascade risk
+  const errorHandlingRisks = risks.filter(r =>
+    /error.?handl|exception|unhandled|uncaught|no.?retry|no.?fallback/i.test(r.description)
+  );
+  const failureRisks = risks.filter(r =>
+    /fail|crash|abort|timeout|broken/i.test(r.description) && r.severity === 'high'
+  );
+  if (errorHandlingRisks.length > 0 && failureRisks.length > 0) {
+    const ehStage = _inferStageFromRisk(errorHandlingRisks[0].description);
+    const fStage = _inferStageFromRisk(failureRisks[0].description);
+    if (ehStage !== fStage) {
+      correlations.push({
+        severity: 'high',
+        label: 'Error Cascade: missing error handling + downstream failure',
+        factors: [
+          { stage: ehStage, description: errorHandlingRisks[0].description },
+          { stage: fStage, description: failureRisks[0].description },
+        ],
+        impact: 'A failure in one component propagates unchecked to downstream stages, potentially causing total workflow failure.',
+        recommendation: 'Add error boundaries and fallback mechanisms at stage boundaries. Ensure each stage can gracefully handle upstream failures.',
+      });
+    }
+  }
+
+  // ── Pattern 2: Security Amplification ─────────────────────────────────────
+  // Auth/validation weakness + direct data access = amplified security risk
+  const authRisks = risks.filter(r =>
+    /auth|validat|sanitiz|inject|xss|csrf|permission|access.?control/i.test(r.description)
+  );
+  const dataRisks = risks.filter(r =>
+    /sql|database|query|file.?access|direct.?access|input|user.?data/i.test(r.description)
+  );
+  if (authRisks.length > 0 && dataRisks.length > 0) {
+    correlations.push({
+      severity: 'high',
+      label: 'Security Amplification: validation gap + data access exposure',
+      factors: [
+        { stage: _inferStageFromRisk(authRisks[0].description), description: authRisks[0].description },
+        { stage: _inferStageFromRisk(dataRisks[0].description), description: dataRisks[0].description },
+      ],
+      impact: 'A validation bypass combined with direct data access creates a potential data breach or injection vector.',
+      recommendation: 'Implement defense-in-depth: validate at API boundary AND before data access. Never trust upstream validation alone.',
+    });
+  }
+
+  // ── Pattern 3: Quality Erosion (Multiple Rollbacks) ───────────────────────
+  // If multiple stages had rollback failures, the system is showing systemic weakness
+  const rollbackRisks = risks.filter(r =>
+    /rollback|unresolved.*after|failed.*after.*round|quality.?gate.*fail/i.test(r.description)
+  );
+  if (rollbackRisks.length >= 2) {
+    const affectedStages = [...new Set(rollbackRisks.map(r => _inferStageFromRisk(r.description)))];
+    if (affectedStages.length >= 2) {
+      correlations.push({
+        severity: 'high',
+        label: `Quality Erosion: rollback failures across ${affectedStages.length} stages`,
+        factors: rollbackRisks.slice(0, 3).map(r => ({
+          stage: _inferStageFromRisk(r.description),
+          description: r.description,
+        })),
+        impact: 'Multiple stages failing quality gates indicates a systemic issue – likely the original requirement is ambiguous or the complexity exceeds current capability.',
+        recommendation: 'Consider re-analysing the original requirement with tighter scope. Break the task into smaller, independently verifiable subtasks.',
+      });
+    }
+  }
+
+  // ── Pattern 4: Architecture-Code Gap ──────────────────────────────────────
+  // Architecture risk + related code issue = design debt confirmed
+  const archRisks = stageRisks.get('ARCHITECT') || [];
+  const codeRisks = stageRisks.get('CODE') || [];
+  if (archRisks.length > 0 && codeRisks.length > 0) {
+    // Check for keyword overlap between arch and code risks
+    for (const ar of archRisks.slice(0, 3)) {
+      const archKeywords = _extractKeywords(ar.description);
+      for (const cr of codeRisks.slice(0, 3)) {
+        const codeKeywords = _extractKeywords(cr.description);
+        const overlap = archKeywords.filter(k => codeKeywords.includes(k));
+        if (overlap.length >= 2) {
+          correlations.push({
+            severity: ar.severity === 'high' || cr.severity === 'high' ? 'high' : 'medium',
+            label: `Architecture-Code Gap: shared concern "${overlap.slice(0, 2).join(', ')}"`,
+            factors: [
+              { stage: 'ARCHITECT', description: ar.description },
+              { stage: 'CODE', description: cr.description },
+            ],
+            impact: `The same concern (${overlap.join(', ')}) appears in both architecture and code risks, confirming the design decision was not fully resolved before implementation.`,
+            recommendation: 'Address this at the architecture level first. Code-level fixes for architecture problems create technical debt.',
+          });
+          break; // One correlation per arch risk is enough
+        }
+      }
+    }
+  }
+
+  // ── Pattern 5: Test Coverage Gap ──────────────────────────────────────────
+  // Known risk in any stage + test failure in related area = blind spot
+  const testRisks = stageRisks.get('TEST') || [];
+  const nonTestHighRisks = risks.filter(r =>
+    r.severity === 'high' && _inferStageFromRisk(r.description) !== 'TEST'
+  );
+  if (testRisks.length > 0 && nonTestHighRisks.length > 0) {
+    const testKeywords = testRisks.flatMap(r => _extractKeywords(r.description));
+    for (const hr of nonTestHighRisks.slice(0, 3)) {
+      const hrKeywords = _extractKeywords(hr.description);
+      const overlap = hrKeywords.filter(k => testKeywords.includes(k));
+      if (overlap.length >= 1) {
+        correlations.push({
+          severity: 'medium',
+          label: `Test Coverage Gap: known risk "${overlap[0]}" with test issues`,
+          factors: [
+            { stage: _inferStageFromRisk(hr.description), description: hr.description },
+            { stage: 'TEST', description: testRisks[0].description },
+          ],
+          impact: 'A known high-severity risk area also has test failures, suggesting the risk is not adequately covered by the test suite.',
+          recommendation: 'Add targeted test cases specifically covering the identified risk area.',
+        });
+        break; // One coverage gap correlation is enough
+      }
+    }
+  }
+
+  // Deduplicate: max 5 correlations, prioritised by severity
+  const severityOrder = { high: 0, medium: 1, low: 2 };
+  return correlations
+    .sort((a, b) => (severityOrder[a.severity] ?? 9) - (severityOrder[b.severity] ?? 9))
+    .slice(0, 5);
+}
+
+/**
+ * Infers which stage a risk description belongs to based on keyword heuristics.
+ *
+ * @param {string} description
+ * @returns {string} Stage name (ANALYSE | ARCHITECT | CODE | TEST | UNKNOWN)
+ */
+function _inferStageFromRisk(description) {
+  const d = description.toLowerCase();
+  if (d.includes('[archreview]') || d.includes('architecture') || d.includes('coverage')) return 'ARCHITECT';
+  if (d.includes('[codereview]') || d.includes('code review') || d.includes('[realtest]') || d.includes('code-development')) return 'CODE';
+  if (d.includes('[testreport]') || d.includes('test') || d.includes('[testcase')) return 'TEST';
+  if (d.includes('[securitycve]') || d.includes('[codequality]')) return 'CODE';
+  if (d.includes('requirement') || d.includes('clarif')) return 'ANALYSE';
+  if (d.includes('entropy') || d.includes('ci ')) return 'TEST';
+  return 'UNKNOWN';
+}
+
+/**
+ * Extracts meaningful keywords from a risk description for correlation matching.
+ * Filters out common stop words and short tokens.
+ *
+ * @param {string} description
+ * @returns {string[]} Lowercased keywords
+ */
+function _extractKeywords(description) {
+  const STOP_WORDS = new Set([
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+    'should', 'may', 'might', 'shall', 'can', 'need', 'must', 'that',
+    'this', 'these', 'those', 'with', 'from', 'into', 'for', 'and', 'but',
+    'or', 'not', 'no', 'of', 'in', 'on', 'at', 'to', 'by', 'up', 'out',
+    'after', 'before', 'above', 'below', 'between', 'through', 'during',
+    'issue', 'issues', 'remain', 'remains', 'remaining', 'see', 'also',
+    'high', 'medium', 'low', 'severity', 'failed', 'still',
+  ]);
+  return (description.match(/[a-z][a-z0-9_-]+/gi) || [])
+    .map(w => w.toLowerCase())
+    .filter(w => w.length >= 3 && !STOP_WORDS.has(w));
+}

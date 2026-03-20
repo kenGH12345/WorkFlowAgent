@@ -86,6 +86,56 @@ workflow/
 
 ---
 
+## `/wf init` Command (MUST USE TERMINAL)
+
+When the user sends `/wf init` or `/wf init --path <dir>`, you **MUST** run the initialisation
+script via terminal. **Do NOT** manually read files and generate a "project status report" yourself.
+
+```bash
+node workflow/init-project.js --path <project-root>
+```
+
+This one command handles **everything**: tech detection, config generation, AGENTS.md, experience
+store, skill registration, and **code-graph construction** (symbol index + call relationships).
+
+> ⚠️ This is not optional. The `/wf init` command MUST be executed as a terminal command.
+
+### Auto-Detection (Zero Config)
+
+The init script **auto-detects** `projectName`, `techStack`, `sourceExtensions`, and `ignoreDirs`
+from the project files at runtime. These are NOT stored in `workflow.config.js` — they are
+re-detected fresh every time. Users never need to manually configure them.
+
+### Path Anchoring Rule (CRITICAL)
+
+When `--path` is provided, the init script scans from that **exact root directory**, not from
+any subdirectory. **Never** substitute a subdirectory path for the `--path` argument.
+
+- ✅ `--path /path/to/MyProject` → scans the entire project from root
+- ❌ `--path /path/to/MyProject/src/sub-module` → only scans one sub-module (WRONG)
+
+---
+
+## `/wf <requirement>` Workflow Execution (CRITICAL)
+
+When the user sends `/wf <requirement>` (anything that is NOT `init` or `analyze`), this triggers
+the **full multi-agent workflow pipeline**: ANALYSE → ARCHITECT → PLAN → CODE → TEST.
+
+**You MUST:**
+1. Begin your response with `> 🔄 启用wf工作流`
+2. Actually execute the pipeline via `orchestrator.run(requirement)` or the equivalent terminal command
+3. Produce real workflow artifacts: `requirement.md`, `architecture.md`, `execution-plan.md`, code diff, test report
+
+**You MUST NOT:**
+- Just read code and give a verbal analysis
+- Skip the pipeline and directly write code
+- Treat `/wf` as a regular chat question
+
+> ⚠️ The `/wf` command is a **workflow trigger**, not a code analysis request.
+> If the environment is not initialized, run `/wf init` first, then execute the workflow.
+
+---
+
 ## Git PR Workflow (New)
 
 Enable in `workflow.config.js` → `git.enabled: true` or pass `git: { enabled: true }` to the constructor.

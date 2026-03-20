@@ -63,6 +63,26 @@ const ITEM_TO_DIMENSION = {
   'CONST':  REVIEW_DIMENSIONS.STANDARDS,
 };
 
+// ─── Security Coverage Matrix (P1: Coverage Self-Check) ──────────────────────
+
+/**
+ * 10-dimension security coverage matrix, inspired by code-audit Skill article.
+ * After a review pass, each dimension is checked: was it actually evaluated?
+ * Dimensions with zero coverage are flagged as blind spots.
+ */
+const SECURITY_COVERAGE_DIMENSIONS = [
+  { id: 'COV-INJ',    name: 'Injection',           checklistPrefixes: ['SEC-001'],          keywords: ['sql', 'nosql', 'injection', 'query', 'concatenat'] },
+  { id: 'COV-AUTH',   name: 'AuthN/AuthZ',         checklistPrefixes: ['SEC-004'],          keywords: ['auth', 'permission', 'role', 'token', 'session', 'login'] },
+  { id: 'COV-SECRET', name: 'Secrets Management',   checklistPrefixes: ['SEC-002'],          keywords: ['secret', 'password', 'key', 'token', 'credential', 'env'] },
+  { id: 'COV-INPUT',  name: 'Input Validation',     checklistPrefixes: ['SEC-003'],          keywords: ['input', 'valid', 'sanitiz', 'escape', 'xss', 'csrf'] },
+  { id: 'COV-ERRLEAK',name: 'Error Info Leak',      checklistPrefixes: ['ERR-003'],          keywords: ['stack', 'trace', 'leak', 'internal', 'debug'] },
+  { id: 'COV-RACE',   name: 'Race Condition',       checklistPrefixes: [],                   keywords: ['race', 'concurren', 'atomic', 'lock', 'mutex', 'async'] },
+  { id: 'COV-DOS',    name: 'Resource Exhaustion',  checklistPrefixes: ['PERF-001','PERF-002'], keywords: ['memory', 'leak', 'loop', 'timeout', 'limit', 'ddos'] },
+  { id: 'COV-CRYPTO', name: 'Cryptography',         checklistPrefixes: [],                   keywords: ['encrypt', 'decrypt', 'hash', 'crypto', 'tls', 'ssl', 'bcrypt'] },
+  { id: 'COV-DEP',    name: 'Dependency Security',  checklistPrefixes: [],                   keywords: ['dependency', 'vulnerab', 'cve', 'npm audit', 'outdated'] },
+  { id: 'COV-LOGIC',  name: 'Business Logic',       checklistPrefixes: ['REQ-001','REQ-002'], keywords: ['business', 'logic', 'workflow', 'rule', 'bypass', 'privilege'] },
+];
+
 /**
  * Default checklist items.
  * Each item has: id, category, severity, description, hint.
@@ -236,6 +256,24 @@ You are performing a structured checklist code review.`,
     `Evaluate the code diff below against each checklist item.`,
     `For each item, determine: PASS, FAIL, or N/A (not applicable to this diff).`,
     ``,
+    `## MANDATORY Anti-Hallucination Rules`,
+    ``,
+    `You MUST follow these rules. Violation of ANY rule invalidates your entire review:`,
+    `1. **File paths must be real**: Only reference file paths that appear in the diff headers (--- a/... +++ b/...). NEVER guess or fabricate a file path.`,
+    `2. **Code evidence required**: Every FAIL finding MUST cite the exact line number or code snippet from the diff. A FAIL without evidence is INVALID.`,
+    `3. **No phantom findings**: If you cannot locate the exact code construct in the diff, do NOT report it. "I believe there might be..." is FORBIDDEN.`,
+    `4. **No hallucinated APIs**: Fix instructions must only reference real APIs/functions visible in the diff or standard library. NEVER invent an API.`,
+    `5. **Severity must be earned**: CRITICAL requires a provable exploit path. HIGH requires a confirmed runtime failure. Do NOT inflate severity.`,
+    ``,
+    `## Confidence-Tiered Evidence Requirements`,
+    ``,
+    `For Security items (SEC-*) with result FAIL:`,
+    `- severity HIGH/CRITICAL: You MUST include a "dataFlowTrace" field showing: source → [transforms] → sink`,
+    `- severity MEDIUM: Include file:line and code snippet`,
+    `- severity LOW: Include file reference and description`,
+    ``,
+    `For all other FAIL items: include file:line and a concrete code reference.`,
+    ``,
     `## Checklist`,
     ``,
     itemList,
@@ -250,13 +288,16 @@ You are performing a structured checklist code review.`,
     `Return a JSON array. Each element must have:`,
     `- "id": checklist item ID (e.g. "SEC-001")`,
     `- "result": "PASS" | "FAIL" | "N/A"`,
-    `- "finding": one sentence. If FAIL, describe the specific issue and location.`,
+    `- "finding": one sentence. If FAIL, describe the specific issue and location (file:line).`,
     `- "fixInstruction": if FAIL, one concrete instruction for the developer to fix it. Otherwise null.`,
+    `- "dataFlowTrace": (REQUIRED for SEC-* FAIL with severity high/critical) string showing "source → ... → sink". Otherwise null.`,
+    `- "evidence": (REQUIRED for all FAIL) the exact code snippet or line reference from the diff. Otherwise null.`,
     ``,
     `Example:`,
     `[`,
-    `  { "id": "SEC-001", "result": "PASS", "finding": "Parameterised queries used throughout.", "fixInstruction": null },`,
-    `  { "id": "ERR-001", "result": "FAIL", "finding": "fetchUser() at line 42 has no try/catch.", "fixInstruction": "Wrap the await fetchUser() call in a try/catch block and handle the error." }`,
+    `  { "id": "SEC-001", "result": "PASS", "finding": "Parameterised queries used throughout.", "fixInstruction": null, "dataFlowTrace": null, "evidence": null },`,
+    `  { "id": "SEC-003", "result": "FAIL", "finding": "User input req.body.name used directly in SQL query at routes/user.js:42.", "fixInstruction": "Use parameterised query: db.query('SELECT * FROM users WHERE name = ?', [req.body.name])", "dataFlowTrace": "req.body.name (HTTP POST) → routes/user.js:42 db.query() → SQL execution (sink)", "evidence": "db.query('SELECT * FROM users WHERE name = ' + req.body.name)" },`,
+    `  { "id": "ERR-001", "result": "FAIL", "finding": "fetchUser() at line 42 has no try/catch.", "fixInstruction": "Wrap the await fetchUser() call in a try/catch block and handle the error.", "dataFlowTrace": null, "evidence": "const user = await fetchUser(id); // line 42, no error handling" }`,
     `]`,
     ``,
     `Return ONLY the JSON array. No markdown fences, no extra text.`,
@@ -327,9 +368,17 @@ You are performing an adversarial security-focused second-opinion code review. Y
     ``,
     `For each item below, determine whether the main reviewer's PASS/N/A verdict was CORRECT or WRONG.`,
     `- If you agree the item genuinely passes: return PASS with a brief confirmation.`,
-    `- If you find the main reviewer missed a real issue: return FAIL with a SPECIFIC finding (file + line if possible) and fix instruction.`,
+    `- If you find the main reviewer missed a real issue: return FAIL with a SPECIFIC finding (file + line) and fix instruction.`,
     `- Be skeptical. Look for subtle bugs, missing edge cases, and security oversights.`,
     `- A comment like "// TODO: add validation" is NOT a pass for input validation.`,
+    ``,
+    `## MANDATORY Anti-Hallucination Rules (same as main review)`,
+    ``,
+    `1. Only reference file paths from the diff headers. NEVER fabricate paths.`,
+    `2. Every FAIL must cite exact line/snippet evidence. No evidence = no finding.`,
+    `3. Do NOT report issues you cannot prove from the diff content.`,
+    `4. For SEC-* FAIL with high/critical severity: include dataFlowTrace (source → sink).`,
+    `5. Do NOT inflate severity to justify a downgrade.`,
     ``,
     `## Items to Re-evaluate (main reviewer said PASS or N/A)`,
     ``,
@@ -348,6 +397,8 @@ You are performing an adversarial security-focused second-opinion code review. Y
     `- "result": "PASS" | "FAIL"`,
     `- "finding": one sentence. If FAIL, describe the SPECIFIC issue the main reviewer missed.`,
     `- "fixInstruction": if FAIL, one concrete instruction. Otherwise null.`,
+    `- "dataFlowTrace": (REQUIRED for SEC-* FAIL with severity high/critical) string showing "source → ... → sink". Otherwise null.`,
+    `- "evidence": (REQUIRED for all FAIL) exact code snippet or line reference. Otherwise null.`,
     ``,
     `Return ONLY the JSON array. No markdown fences, no extra text.`,
   ].join('\n');
@@ -477,6 +528,175 @@ class CodeReviewAgent extends ReviewAgentBase {
       `\n# --- End of Findings ---\n\n` + content;
   }
 
+  // ─── P1: Coverage Self-Check Matrix ──────────────────────────────────────────
+
+  /**
+   * Computes a 10-dimension security coverage matrix based on review results.
+   * Each dimension is checked against:
+   *   1. Whether its mapped checklist items were evaluated (not N/A)
+   *   2. Whether the diff content contains keywords relevant to this dimension
+   *
+   * Returns:
+   *   - covered:    dimensions that were actively reviewed
+   *   - notCovered: dimensions that were entirely N/A or not evaluated
+   *   - blindSpots: dimensions where the diff DOES contain relevant keywords
+   *                 but the review marked them N/A (potential false negatives)
+   *
+   * @param {object[]} reviewResults  - Array of { id, result, finding, ... }
+   * @param {string}   codeDiff       - The code diff being reviewed
+   * @returns {{ covered: object[], notCovered: object[], blindSpots: object[], coveragePercent: number }}
+   */
+  computeCoverageMatrix(reviewResults, codeDiff = '') {
+    const diffLower = (codeDiff || '').toLowerCase();
+    const resultMap = new Map(reviewResults.map(r => [r.id, r]));
+
+    const covered = [];
+    const notCovered = [];
+    const blindSpots = [];
+
+    for (const dim of SECURITY_COVERAGE_DIMENSIONS) {
+      // Check if any mapped checklist items were actively evaluated (PASS or FAIL)
+      const mappedResults = dim.checklistPrefixes
+        .map(prefix => resultMap.get(prefix))
+        .filter(Boolean);
+
+      const wasEvaluated = mappedResults.some(r => r.result === 'PASS' || r.result === 'FAIL');
+
+      // Check if diff content contains keywords for this dimension
+      const keywordHits = dim.keywords.filter(kw => diffLower.includes(kw));
+      const isRelevantToDiff = keywordHits.length > 0;
+
+      if (wasEvaluated) {
+        covered.push({ ...dim, keywordHits, evaluated: true });
+      } else if (isRelevantToDiff) {
+        // Diff has relevant content, but dimension was NOT evaluated → blind spot!
+        blindSpots.push({ ...dim, keywordHits, evaluated: false });
+      } else {
+        notCovered.push({ ...dim, keywordHits: [], evaluated: false });
+      }
+    }
+
+    const total = SECURITY_COVERAGE_DIMENSIONS.length;
+    const coveragePercent = total > 0
+      ? Math.round(((covered.length) / total) * 100)
+      : 100;
+
+    return { covered, notCovered, blindSpots, coveragePercent };
+  }
+
+  // ─── P1: Attack Chain / Defect Chain Analysis ────────────────────────────────
+
+  /**
+   * Analyses combinations of FAIL findings to identify potential attack chains
+   * (security) and defect chains (code quality). This goes beyond individual
+   * vulnerability identification to find compound risks.
+   *
+   * Known chain patterns:
+   *   - SEC-003 + SEC-001 → Input validation bypass + Injection = Authenticated SQLi
+   *   - ERR-003 + SEC-002 → Error info leak + Exposed secrets = Credential harvesting
+   *   - PERF-001 + PERF-002 + ERR-001 → N+1 + Memory leak + No error handling = Cascading failure
+   *   - STYLE-001 + STYLE-002 + EDGE-001 → Dead code + Magic numbers + No null guard = Unmaintainable code
+   *
+   * @param {object[]} reviewResults - Array of { id, result, finding, ... }
+   * @returns {{ chains: object[], chainCount: number }}
+   */
+  analyseDefectChains(reviewResults) {
+    const failures = reviewResults.filter(r => r.result === 'FAIL');
+    const failIds = new Set(failures.map(f => f.id));
+    const chains = [];
+
+    // ── Security Attack Chains ─────────────────────────────────────────────
+    const ATTACK_CHAIN_PATTERNS = [
+      {
+        name: 'Authenticated SQL Injection',
+        type: 'security',
+        severity: 'critical',
+        requires: [['SEC-003'], ['SEC-001']],  // Input validation bypass + SQL injection
+        impact: 'An attacker can bypass input validation and execute arbitrary SQL queries, potentially extracting or modifying all database contents.',
+      },
+      {
+        name: 'Credential Harvesting via Error Leak',
+        type: 'security',
+        severity: 'critical',
+        requires: [['ERR-003'], ['SEC-002']],  // Error info leak + Exposed secrets
+        impact: 'Internal error messages expose secrets or credentials, allowing attacker to authenticate as the system.',
+      },
+      {
+        name: 'Authentication Bypass with Injection',
+        type: 'security',
+        severity: 'critical',
+        requires: [['SEC-004'], ['SEC-001']],  // Missing auth + SQL injection
+        impact: 'Missing authentication on routes combined with injection allows unauthenticated remote code execution.',
+      },
+      {
+        name: 'Input-Driven Denial of Service',
+        type: 'security',
+        severity: 'high',
+        requires: [['SEC-003'], ['PERF-001', 'PERF-002']],  // No input validation + performance issues
+        impact: 'Unvalidated input triggers N+1 queries or memory leaks, enabling denial of service.',
+      },
+
+      // ── Code Quality Defect Chains ───────────────────────────────────────
+      {
+        name: 'Cascading Failure Chain',
+        type: 'reliability',
+        severity: 'high',
+        requires: [['ERR-001'], ['PERF-001', 'PERF-002']],  // No error handling + performance issues
+        impact: 'Performance issues trigger errors that are not handled, causing cascading failures across the system.',
+      },
+      {
+        name: 'Silent Data Corruption',
+        type: 'reliability',
+        severity: 'high',
+        requires: [['ERR-002'], ['EDGE-001', 'EDGE-002']],  // Silent error swallowing + missing null/empty guards
+        impact: 'Errors are silently swallowed while null/empty edge cases produce incorrect data, leading to undetected data corruption.',
+      },
+      {
+        name: 'Maintenance Nightmare Chain',
+        type: 'maintainability',
+        severity: 'medium',
+        requires: [['STYLE-001', 'STYLE-002'], ['STYLE-003']],  // Dead code/magic numbers + bad naming
+        impact: 'Combination of dead code, magic numbers, and poor naming makes the codebase effectively unmaintainable.',
+      },
+      {
+        name: 'Interface Contract Breakage',
+        type: 'reliability',
+        severity: 'high',
+        requires: [['INTF-001', 'INTF-002'], ['EXPORT-001']],  // Interface mismatch + missing exports
+        impact: 'Callers expect fields/exports that do not exist, causing runtime TypeError/ReferenceError in production.',
+      },
+      {
+        name: 'Scope Creep with Missing Tests',
+        type: 'quality',
+        severity: 'medium',
+        requires: [['REQ-002'], ['EDGE-001', 'EDGE-002', 'EDGE-003']],  // Scope creep + missing edge case handling
+        impact: 'Unplanned features lack edge case handling, introducing untested code paths that are likely to fail.',
+      },
+    ];
+
+    for (const pattern of ATTACK_CHAIN_PATTERNS) {
+      // Check if ALL required groups have at least one match in failures
+      const matched = pattern.requires.every(group =>
+        group.some(id => failIds.has(id))
+      );
+      if (matched) {
+        const involvedFailures = failures.filter(f =>
+          pattern.requires.some(group => group.includes(f.id))
+        );
+        chains.push({
+          ...pattern,
+          involvedFindings: involvedFailures.map(f => ({
+            id: f.id,
+            finding: f.finding,
+          })),
+          entryPoint: involvedFailures[0]?.finding || 'Unknown',
+        });
+      }
+    }
+
+    return { chains, chainCount: chains.length };
+  }
+
   // ─── Report Formatting (Code-specific) ──────────────────────────────────────
 
   formatReport(result) {
@@ -568,6 +788,54 @@ class CodeReviewAgent extends ReviewAgentBase {
       }
     }
 
+    // ── P1: Security Coverage Matrix ─────────────────────────────────────────
+    if (result.coverageMatrix) {
+      const cm = result.coverageMatrix;
+      lines.push(`## 🛡️ Security Coverage Matrix`);
+      lines.push(``);
+      lines.push(`> Coverage: **${cm.coveragePercent}%** (${cm.covered.length}/${cm.covered.length + cm.notCovered.length + cm.blindSpots.length} dimensions)`);
+      lines.push(``);
+      lines.push(`| Dimension | Status | Keywords Found |`);
+      lines.push(`|-----------|--------|----------------|`);
+      for (const d of cm.covered) {
+        lines.push(`| ${d.name} | ✅ Covered | ${d.keywordHits.join(', ') || '-'} |`);
+      }
+      for (const d of cm.blindSpots) {
+        lines.push(`| ${d.name} | ⚠️ **BLIND SPOT** | ${d.keywordHits.join(', ')} |`);
+      }
+      for (const d of cm.notCovered) {
+        lines.push(`| ${d.name} | ➖ N/A | - |`);
+      }
+      lines.push(``);
+      if (cm.blindSpots.length > 0) {
+        lines.push(`> ⚠️ **${cm.blindSpots.length} blind spot(s) detected**: The diff contains keywords related to these dimensions, but they were not actively reviewed. Consider adding targeted checklist items or running a deep security audit.`);
+        lines.push(``);
+      }
+    }
+
+    // ── P1: Attack Chain / Defect Chain Analysis ──────────────────────────────
+    if (result.defectChains && result.defectChains.chainCount > 0) {
+      lines.push(`## ⛓️ Defect Chain Analysis`);
+      lines.push(``);
+      lines.push(`> **${result.defectChains.chainCount} chain(s) detected** — individual findings combine into compound risks.`);
+      lines.push(``);
+      for (let i = 0; i < result.defectChains.chains.length; i++) {
+        const chain = result.defectChains.chains[i];
+        const severityIcon = { critical: '🔴', high: '🟠', medium: '🟡', low: '🟢' }[chain.severity] || '⚪';
+        lines.push(`### Chain ${i + 1}: ${severityIcon} ${chain.name} \`${chain.type}\``);
+        lines.push(``);
+        lines.push(`**Severity**: ${chain.severity.toUpperCase()}`);
+        lines.push(``);
+        lines.push(`**Involved Findings**:`);
+        for (const f of chain.involvedFindings) {
+          lines.push(`- \`${f.id}\`: ${f.finding}`);
+        }
+        lines.push(``);
+        lines.push(`**Combined Impact**: ${chain.impact}`);
+        lines.push(``);
+      }
+    }
+
     if (result.needsHumanReview) {
       lines.push(`---`);
       lines.push(`> ⚠️ **High-severity issues remain.** These have been recorded as workflow risks.`);
@@ -593,4 +861,10 @@ class CodeReviewAgent extends ReviewAgentBase {
  * @property {string}   [skipReason]
  */
 
-module.exports = { CodeReviewAgent, DEFAULT_CHECKLIST, REVIEW_DIMENSIONS, ITEM_TO_DIMENSION };
+module.exports = {
+  CodeReviewAgent,
+  DEFAULT_CHECKLIST,
+  REVIEW_DIMENSIONS,
+  ITEM_TO_DIMENSION,
+  SECURITY_COVERAGE_DIMENSIONS,
+};

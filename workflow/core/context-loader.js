@@ -62,18 +62,25 @@ const BUILTIN_SKILL_KEYWORDS = {
   'flutter-dev':          ['flutter', 'dart', 'widget', 'riverpod', 'provider', 'bloc', 'pubspec'],
   'javascript-dev':       ['javascript', 'js', 'node', 'npm', 'typescript', 'ts', 'react', 'vue', 'express'],
   'go-crud':              ['go', 'golang', 'gin', 'gorm', 'grpc', 'protobuf'],
-  'java-dev':             ['java', 'spring', 'maven', 'gradle', 'jvm', 'kotlin'],
+  'java-dev':             ['java', 'spring', 'maven', 'gradle', 'jvm', 'kotlin', 'ktor', 'quarkus'],
   'lua-scripting':        ['lua', 'luajit', 'coroutine', 'metatables', 'unity lua', 'xlua'],
   'unity-csharp':         ['unity', 'c#', 'csharp', 'monobehaviour', 'scriptableobject', 'ecs'],
   'api-design':           ['api', 'rest', 'graphql', 'endpoint', 'swagger', 'openapi', 'http'],
   'architecture-design':  ['architecture', 'design pattern', 'module', 'dependency', 'coupling', 'solid'],
   'code-review':          ['review', 'refactor', 'clean code', 'lint', 'quality', 'smell'],
-  'test-report':          ['test', 'unit test', 'integration test', 'coverage', 'jest', 'pytest', 'mocha'],
+  'test-report':          ['test', 'unit test', 'integration test', 'coverage', 'jest', 'pytest', 'mocha', 'rspec', 'phpunit', 'kotest'],
   'project-onboarding':   ['onboard', 'setup', 'init', 'new project', 'getting started'],
   'workflow-orchestration':['workflow', 'orchestrat', 'agent', 'pipeline', 'stage'],
   'troubleshooting':      ['error', 'bug', 'fix', 'crash', 'fail', 'issue', 'debug', 'troubleshoot', 'exception'],
   'standards':            ['standard', 'convention', 'naming', 'style', 'format', 'lint'],
   'code-development':     ['code', 'develop', 'implement', 'build', 'program'],
+  // ── Language-specific skills (auto-matched when skill files exist) ─────
+  'php-dev':              ['php', 'laravel', 'symfony', 'composer', 'wordpress', 'eloquent', 'doctrine', 'blade'],
+  'ruby-dev':             ['ruby', 'rails', 'sinatra', 'hanami', 'gemfile', 'bundler', 'activerecord', 'rspec', 'rack'],
+  'swift-dev':            ['swift', 'swiftui', 'uikit', 'vapor', 'xcode', 'ios', 'macos', 'coredata', 'combine'],
+  'cpp-dev':              ['c++', 'cpp', 'cmake', 'qt', 'boost', 'opencv', 'unreal', 'conan', 'vcpkg'],
+  'scala-dev':            ['scala', 'akka', 'play framework', 'spark', 'sbt', 'slick', 'cats', 'zio'],
+  'elixir-dev':           ['elixir', 'phoenix', 'liveview', 'ecto', 'mix', 'otp', 'erlang', 'genserver'],
   // ── AEF Best Practice Skills ──────────────────────────────────────────────
   'bp-coding-best-practices':  ['coding', 'clean code', 'naming', 'guard clause', 'RAII', 'readability', 'safety'],
   'bp-architecture-design':    ['architecture', 'module', 'dependency', 'data flow', 'trade-off', 'coupling'],
@@ -82,17 +89,23 @@ const BUILTIN_SKILL_KEYWORDS = {
   'bp-performance-optimization':['performance', 'optimize', 'cache', 'latency', 'throughput', 'profiling', 'memory'],
   'self-refinement':           ['refine', 'reflect', 'improve', 'learn', 'mistake', 'correct', 'feedback'],
   'spec-template':             ['spec', 'specification', 'feature', 'requirement', 'design document'],
+  'execution-planning':        ['plan', 'execution', 'task breakdown', 'dependency', 'phase', 'milestone', 'acceptance criteria', 'decompose'],
+  // ── P2 Skills (ECC-inspired) ──────────────────────────────────────────────
+  'security-audit':            ['security', 'audit', 'vulnerability', 'penetration', 'cve', 'owasp', 'injection', 'xss', 'csrf', 'auth', 'encrypt', 'secret', 'token', 'credential'],
+  'database-design':           ['database', 'db', 'sql', 'nosql', 'migration', 'schema', 'index', 'query', 'table', 'column', 'foreign key', 'orm', 'model', 'entity', 'transaction', 'mongodb', 'postgresql', 'mysql', 'redis', 'sqlite'],
+  'frontend-review':           ['frontend', 'react', 'vue', 'angular', 'svelte', 'css', 'html', 'dom', 'browser', 'webpack', 'vite', 'accessibility', 'a11y', 'responsive', 'spa', 'component', 'render', 'state management', 'hook', 'redux', 'zustand'],
 };
 
 // ─── Role → Mandatory docs mapping ───────────────────────────────────────────
 // These docs are ALWAYS injected for the given role, regardless of task content.
 
 const ROLE_MANDATORY_DOCS = {
-  analyst:    ['docs/architecture-constraints.md', 'output/spec.md'],
-  architect:  ['docs/architecture-constraints.md', 'docs/decision-log.md', 'output/spec.md'],
-  developer:  ['docs/architecture-constraints.md', 'output/code-graph.md', 'output/spec.md'],
-  tester:     ['docs/architecture-constraints.md', 'output/spec.md'],
-  'coding-agent': ['docs/architecture-constraints.md', 'output/code-graph.md'],
+  analyst:    ['docs/architecture-constraints.md', 'output/spec.md', 'output/project-profile.md'],
+  architect:  ['docs/architecture-constraints.md', 'docs/decision-log.md', 'output/spec.md', 'output/project-profile.md'],
+  planner:    ['docs/architecture-constraints.md', 'output/spec.md', 'output/architecture.md', 'output/project-profile.md'],
+  developer:  ['docs/architecture-constraints.md', 'output/code-graph.md', 'output/spec.md', 'output/project-profile.md'],
+  tester:     ['docs/architecture-constraints.md', 'output/spec.md', 'output/project-profile.md'],
+  'coding-agent': ['docs/architecture-constraints.md', 'output/code-graph.md', 'output/project-profile.md'],
   'init-agent':   [],
 };
 
@@ -113,6 +126,8 @@ class ContextLoader {
     alwaysLoadSkills = [],
     globalSkills    = [],    // Level 1: always loaded for every task
     projectSkills   = [],    // Level 2: loaded for all tasks in the project
+    retiredSkills   = null,  // Set<string> of retired skill names to exclude
+    codeGraph       = null,  // P0: externally-provided CodeGraph instance (avoids re-creation)
   } = {}) {
     this._workflowRoot     = workflowRoot;
     this._projectRoot      = projectRoot || null;
@@ -122,8 +137,12 @@ class ContextLoader {
     this._alwaysLoadSkills = alwaysLoadSkills;
     this._globalSkills     = globalSkills;
     this._projectSkills    = projectSkills;
+    /** @type {Set<string>} Retired skill names – excluded from matching and loading */
+    this._retiredSkills    = retiredSkills instanceof Set ? retiredSkills : new Set(retiredSkills || []);
     /** @type {Set<string>} Track loaded skills to avoid duplicates across layers */
     this._loadedSkillsInResolve = new Set();
+    /** @type {CodeGraph|null} Shared CodeGraph instance (avoids redundant disk I/O) */
+    this._codeGraph        = codeGraph || null;
 
     // ── File Read Cache (D1+D3 optimisation) ──────────────────────────────────
     // Caches file contents in memory to avoid redundant disk I/O within the same
@@ -214,6 +233,32 @@ class ContextLoader {
           sources.push('code-graph.md');
           budget -= estimateTokens(truncated);
         }
+        // For developer/coding-agent: also inject reusable symbols digest from hotspot analysis.
+        // This ensures Agents prefer existing utilities/base classes when writing new code.
+        // P0 optimisation: reuse externally-provided CodeGraph instance (this._codeGraph)
+        // instead of creating a new instance each time. This avoids redundant disk I/O
+        // and JSON.parse of the potentially 100MB+ code-graph.json file.
+        if ((role === 'developer' || role === 'coding-agent') && budget > 0) {
+          try {
+            let cg = this._codeGraph;
+            if (!cg) {
+              const { CodeGraph } = require('./code-graph');
+              const outputDir = this._projectRoot
+                ? path.join(this._projectRoot, 'output')
+                : path.dirname(docPath);
+              cg = new CodeGraph({ projectRoot: this._projectRoot || '.', outputDir });
+            }
+            const reusableDigest = cg.getReusableSymbolsDigest({ maxItems: 12, minCalledBy: 3 });
+            if (reusableDigest) {
+              const digestTokens = estimateTokens(reusableDigest);
+              if (digestTokens <= budget) {
+                sections.push(reusableDigest);
+                sources.push('reusable-symbols (hotspot)');
+                budget -= digestTokens;
+              }
+            }
+          } catch (_) { /* non-fatal: hotspot analysis is optional enhancement */ }
+        }
       } else {
         const tokens = estimateTokens(content);
         const truncated = this._truncate(content, Math.min(tokens, budget));
@@ -301,6 +346,10 @@ class ContextLoader {
     const scores = [];
 
     for (const [skillName, keywords] of Object.entries(this._skillKeywords)) {
+      // Gap 1 fix: skip retired skills — they should not be injected into prompts.
+      // retiredAt is set by SkillEvolutionEngine.retireStaleSkills().
+      if (this._retiredSkills.has(skillName)) continue;
+
       const skillPath = path.join(this._skillsDir, `${skillName}.md`);
       // Use _readFileCached to benefit from the cache (also pre-warms the cache
       // for _loadSkill which will be called next for matching skills).
@@ -521,6 +570,11 @@ class ContextLoader {
    * @returns {{ section: string, source: string, tokens: number, dependencies: string[] }|null}
    */
   _loadSkill(skillName, tokenBudget, isDep = false) {
+    // Gap 1 fix: double-check retired status at load time (defence-in-depth).
+    // This catches retired skills loaded via alwaysLoadSkills / globalSkills paths
+    // that bypass _matchSkills.
+    if (this._retiredSkills.has(skillName)) return null;
+
     const skillPath = path.join(this._skillsDir, `${skillName}.md`);
     const content = this._readFileCached(skillPath);
     if (!content) return null;
@@ -531,6 +585,15 @@ class ContextLoader {
     // Parse frontmatter for metadata
     const { meta, body } = this._parseFrontmatter(content);
     const dependencies = meta.dependencies || [];
+
+    // Gap 2 fix: validate skill content structure before injection.
+    // Skip skills that fail quality checks to avoid wasting token budget on
+    // poorly-formed or near-empty skill files.
+    const validation = this._validateSkillContent(content, meta);
+    if (!validation.valid) {
+      console.log(`[ContextLoader] ⚠️ Skipping skill "${skillName}": ${validation.reason}`);
+      return null;
+    }
 
     // Use frontmatter max_tokens if available, capped by tokenBudget
     const effectiveBudget = meta.max_tokens
@@ -560,13 +623,75 @@ class ContextLoader {
       '_No rules defined yet',
       '_No SOP defined yet',
       '_No best practices defined yet',
+      '_No errors documented yet',
+      '_No root causes documented yet',
+      '_No fix recipes documented yet',
+      '_No prevention rules defined yet',
+      '_No coding standards defined yet',
+      '_No naming conventions defined yet',
+      '_No directory structure rules defined yet',
+      '_No commit conventions defined yet',
+      '_No checklist defined yet',
+      '_No anti-patterns defined yet',
+      '_No context hints defined yet',
     ];
     // If ALL sections are placeholders, skip the file
     const nonPlaceholderLines = content
       .split('\n')
-      .filter(l => l.trim() && !l.startsWith('#') && !l.startsWith('>') && !l.startsWith('|'))
+      .filter(l => l.trim() && !l.startsWith('#') && !l.startsWith('>') && !l.startsWith('|') && !l.startsWith('---'))
       .filter(l => !placeholderPhrases.some(p => l.includes(p)));
     return nonPlaceholderLines.length < 3;
+  }
+
+  // ─── Gap 2: Skill Content Structure Validation ──────────────────────────
+
+  /**
+   * Validates that a skill file has meaningful content structure.
+   * Returns true if the skill passes all quality checks.
+   *
+   * Checks:
+   *   1. Minimum word count (at least 20 words of real content)
+   *   2. At least one ## section heading
+   *   3. If YAML frontmatter exists, it must have `name` field
+   *
+   * @param {string} content - Full skill file content
+   * @param {object} meta - Parsed frontmatter metadata
+   * @returns {{ valid: boolean, reason: string }}
+   */
+  _validateSkillContent(content, meta) {
+    if (!content || !content.trim()) {
+      return { valid: false, reason: 'empty content' };
+    }
+
+    // Check 1: minimum word count (exclude headings, frontmatter, table rows)
+    const bodyLines = content
+      .split('\n')
+      .filter(l => {
+        const t = l.trim();
+        return t && !t.startsWith('#') && !t.startsWith('>') && !t.startsWith('|')
+          && !t.startsWith('---') && !t.startsWith('_No ');
+      });
+    const wordCount = bodyLines.join(' ').split(/\s+/).filter(w => w.length > 0).length;
+    if (wordCount < 8) {
+      return { valid: false, reason: `insufficient content (${wordCount} words, need ≥8)` };
+    }
+
+    // Check 2: if skill has YAML frontmatter (structured skill), require at least one ## heading.
+    // Simple skills without frontmatter (e.g. hand-written notes) are allowed without sections.
+    const hasFrontmatter = meta && Object.keys(meta).length > 0;
+    if (hasFrontmatter) {
+      const hasSections = /^## /m.test(content);
+      if (!hasSections) {
+        return { valid: false, reason: 'structured skill (has frontmatter) missing ## section headings' };
+      }
+
+      // Check 3: frontmatter must have name field for structured skills
+      if (!meta.name) {
+        return { valid: false, reason: 'frontmatter missing required "name" field' };
+      }
+    }
+
+    return { valid: true, reason: '' };
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────────

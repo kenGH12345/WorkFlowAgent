@@ -21,11 +21,11 @@
  * Usage:
  *   node workflow/gen-experiences.js
  *   node workflow/gen-experiences.js --path D:\MyProject
- *   node workflow/gen-experiences.js --path D:\MyProject --ext .cs,.lua --dry-run
+ *   node workflow/gen-experiences.js --path D:\MyProject --ext .js,.ts --dry-run
  *
  * Options:
  *   --path <dir>     Target project root (default: process.cwd())
- *   --ext <exts>     File extensions, comma-separated (default: .cs,.lua)
+ *   --ext <exts>     File extensions, comma-separated (default: all supported)
  *   --max-files <n>  Max files per extension (default: 200)
  *   --dry-run        Print what would be recorded without writing
  *   --help           Show help
@@ -479,7 +479,7 @@ Usage: node workflow/gen-experiences.js [options]
 
 Options:
   --path, -p <dir>       Target project root (default: cwd)
-  --ext,  -e <exts>      File extensions, comma-separated (default: .cs,.lua)
+  --ext,  -e <exts>      File extensions, comma-separated (default: all supported)
   --max-files, -m <n>    Max files per extension (default: 200)
   --dry-run              Print what would be recorded without writing
   --help, -h             Show help
@@ -497,7 +497,7 @@ Options:
 
   const extensions = args.ext
     ? args.ext.split(',').map(e => e.trim().startsWith('.') ? e.trim() : `.${e.trim()}`)
-    : (config.sourceExtensions || ['.cs', '.lua']);
+    : (config.sourceExtensions || ['.js', '.ts', '.py', '.go', '.java', '.cs', '.lua', '.dart']);
   const maxFiles = args.maxFiles;
   const dryRun = args.dryRun;
 
@@ -525,7 +525,7 @@ Options:
   // Process all files by extension
   for (const ext of extensions) {
     const files = filesByExt[ext] || [];
-    const label = ext === '.cs' ? 'C#' : ext === '.lua' ? 'Lua' : ext;
+    const label = { '.cs': 'C#', '.lua': 'Lua', '.js': 'JavaScript', '.ts': 'TypeScript', '.py': 'Python', '.go': 'Go', '.java': 'Java', '.dart': 'Dart' }[ext] || ext;
     console.log(`[gen-experiences] Processing ${files.length} ${label} files...`);
     for (const { fullPath, content } of files) {
       const relativePath = path.relative(projectRoot, fullPath).replace(/\\/g, '/');

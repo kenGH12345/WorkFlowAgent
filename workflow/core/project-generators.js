@@ -37,18 +37,29 @@ function generateConfigFromProfile(projectRoot, profile, projectName) {
  *
  * You can customise this file at any time.
  * Re-run: node workflow/init-project.js  to apply changes.
+ *
+ * NOTE: projectName, techStack, sourceExtensions, and ignoreDirs are
+ * intentionally omitted. They are auto-detected at runtime by detectTechStack()
+ * and do not need to be configured manually. If you want to override them,
+ * uncomment and edit the overrides section below.
  */
 
 'use strict';
 
 module.exports = {
-  // ─── Project Identity ────────────────────────────────────────────────────
-  projectName: '${projectName}',
-  techStack: '${profile.techStack}',
+  // ─── Runtime-Detected (uncomment to override) ─────────────────────────────
+  // These are auto-detected at init time. Only set them if the detection is wrong.
+  // projectName: '${projectName}',
+  // techStack: '${profile.techStack}',
+  // sourceExtensions: [${extList}],
+  // ignoreDirs: [${ignoreDirsList}],
 
-  // ─── Source Scanning ─────────────────────────────────────────────────────
-  sourceExtensions: [${extList}],
-  ignoreDirs: [${ignoreDirsList}],
+  // ─── Code Graph ──────────────────────────────────────────────────────────────
+  // CodeGraph auto-scans ALL supported languages (.js, .ts, .cs, .lua, .go, .py, .dart).
+  // No extensions config needed. Use scopeDirs for large monorepos only.
+  codeGraph: {
+    scopeDirs: [],             // Large monorepo only: ['packages/core', 'lua']. Empty = full scan
+  },
 
   // ─── Automated Verification Loop ─────────────────────────────────────────
   ${testCommandLine}
@@ -58,6 +69,12 @@ module.exports = {
     maxFixRounds: 2,
     failOnUnfixed: false,
   },
+
+  // ─── Project Architecture Profile ─────────────────────────────────────────
+  // Auto-populated by ProjectProfiler during init. Contains deep analysis of
+  // frameworks, architecture patterns, data layer, communication, testing, etc.
+  // Consumed by Architect/Developer agents for context-aware decisions.
+  projectProfile: null,  // Will be populated by init-project.js → ProjectProfiler
 
   // ─── Built-in Skills ─────────────────────────────────────────────────────
   builtinSkills: ${skillsJson},
@@ -115,6 +132,10 @@ function _generateInitSh(config, projectRoot) {
     startCmd = './mvnw spring-boot:run &';
     smokeTest = 'sleep 5 && curl -sf http://localhost:8080/actuator/health || echo "Warning: health check failed"';
     stopCmd = 'pkill -f "spring-boot" || true';
+  } else if (stack.includes('flutter') || stack.includes('dart')) {
+    startCmd = '# Flutter projects use device/emulator — ensure a device is connected\nflutter devices\nflutter run -d chrome --web-port 8080 &';
+    smokeTest = 'sleep 5 && curl -sf http://localhost:8080 || echo "Warning: Flutter web app health check failed (ensure device/emulator is connected)"';
+    stopCmd = 'pkill -f "flutter run" || true';
   } else if (stack.includes('unity')) {
     startCmd = '# Unity projects do not have a dev server – open in Unity Editor';
     smokeTest = 'echo "Unity project – manual testing required"';
@@ -172,6 +193,52 @@ echo "=================================================="
 `;
 }
 
+// ─── CLI Init Runner ─────────────────────────────────────────────────────────
+
+/**
+ * Runs the tech stack's native CLI scaffolding command to create the standard
+ * project structure. This delegates to official CLI tools (e.g. `flutter create`,
+ * `cargo init`, `dotnet new`) — they are always up-to-date and produce the
+ * correct directory layout. We never manually create scaffold directories.
+ *
+ * @param {string} projectRoot
+ * @param {object} profile - Tech profile from TECH_PROFILES (must have cliInitCommand)
+ * @param {string} projectName
+ * @param {object} [opts]
+ * @param {boolean} [opts.dryRun=false]
+ * @returns {{ success: boolean, command: string, output?: string, error?: string }}
+ */
+function _runCliInit(projectRoot, profile, projectName, opts = {}) {
+  const { dryRun = false } = opts;
+
+  if (!profile || typeof profile.cliInitCommand !== 'function') {
+    return { success: false, command: '', error: 'Profile has no cliInitCommand' };
+  }
+
+  const command = profile.cliInitCommand(projectRoot, projectName);
+
+  if (dryRun) {
+    return { success: true, command, output: '[dry-run] Would execute command' };
+  }
+
+  try {
+    const { execSync } = require('child_process');
+    const output = execSync(command, {
+      cwd: projectRoot,
+      stdio: 'pipe',
+      timeout: 120_000, // 2-minute timeout for network-dependent CLIs
+      encoding: 'utf-8',
+    });
+    return { success: true, command, output: (output || '').slice(0, 500) };
+  } catch (err) {
+    return {
+      success: false,
+      command,
+      error: `CLI init failed: ${err.message}\nHint: Ensure the CLI tool is installed (e.g. flutter, cargo, dotnet, npm).`,
+    };
+  }
+}
+
 // ─── Feature List Generator ───────────────────────────────────────────────────
 
 /**
@@ -221,4 +288,4 @@ function _generateFeatureListTemplate(config) {
   ];
 }
 
-module.exports = { generateConfigFromProfile, _generateInitSh, _generateFeatureListTemplate };
+module.exports = { generateConfigFromProfile, _generateInitSh, _generateFeatureListTemplate, _runCliInit };

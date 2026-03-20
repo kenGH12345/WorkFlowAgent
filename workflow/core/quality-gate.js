@@ -13,14 +13,22 @@ const { ExperienceType, ExperienceCategory } = require('./experience-store');
  *
  * This class extracts the DECISION logic into a dedicated layer:
  *   - evaluate(reviewResult, stage) → { pass, rollback, needsHumanReview }
+ *   - evaluateMultiDimensional(reviewResult, stage, opts) → { ... extended }
  *   - recordExperience(decision, stage, reviewResult) → void
+ *
+ * P2 Multi-Dimensional QualityGate (Audit Method Borrowing):
+ *   Inspired by the white-box audit methodology's four-step verification:
+ *   1. Severity Distribution – not just `failed` count, but severity gradient
+ *   2. Correction Trend     – is the trend improving? (5→2→1 is encouraging)
+ *   3. Category Coverage     – which TYPES of issues were fixed? cherry-picking easy ones?
+ *   4. Four-Level Decision   – pass / pass-with-conditions / retry / escalate
  *
  * The Orchestrator's _runXxx functions remain responsible for:
  *   - Calling the Agent (execution layer)
  *   - Injecting context (execution layer)
  *   - Driving the state machine (control layer)
  *
- * see CHANGELOG: P0-A
+ * see CHANGELOG: P0-A, P2-MultiDim
  */
 class QualityGate {
   /**
@@ -91,6 +99,152 @@ class QualityGate {
       rollback:         false,
       needsHumanReview: true,
       reason:           `${stageName} review failed after ${rollbackCount} rollback(s): ${reviewResult.failed} high-severity issue(s) remain. Human review required.`,
+    };
+  }
+
+  /**
+   * Multi-dimensional quality evaluation.
+   *
+   * P2 Enhancement (Audit Method Borrowing):
+   * Evaluates across 3 dimensions instead of the single `failed > 0` binary:
+   *
+   *   1. **Severity Distribution**: Counts critical / high / medium / low separately.
+   *      A single critical blocks; multiple highs block; mediums only warn.
+   *
+   *   2. **Correction Trend**: Analyses the improvement trajectory across rounds.
+   *      If failed goes from 5→3→1, the trend is positive even if 1 remains.
+   *      A positive trend can soften the decision from rollback → pass-with-conditions.
+   *
+   *   3. **Category Coverage**: Checks which TYPES of issues were addressed.
+   *      If the correction only fixed "style" issues but left "logic" issues,
+   *      the coverage is skewed and the decision is harder.
+   *
+   * Returns a 4-level decision (vs evaluate()'s 3-level):
+   *   - pass:                 Clean pass, no issues
+   *   - pass-with-conditions: Low/medium issues remain but trend is positive
+   *   - retry:                High-severity issues remain, rollback budget available
+   *   - escalate:             Rollback budget exhausted or trend is negative
+   *
+   * @param {object} reviewResult - Output from SelfCorrectionEngine or ReviewAgent
+   * @param {string} stageName    - e.g. 'ARCHITECT', 'CODE', 'TEST'
+   * @param {object} [opts]
+   * @param {number} [opts.rollbackCount=0]  - Previous rollback count
+   * @param {number[]} [opts.failedHistory]   - Failed counts from prior rounds [5, 3, 1]
+   * @param {object} [opts.severityBreakdown] - { critical:0, high:0, medium:0, low:0 }
+   * @returns {{ pass, rollback, needsHumanReview, passWithConditions, reason, dimensions }}
+   */
+  evaluateMultiDimensional(reviewResult, stageName, opts = {}) {
+    const rollbackCount = opts.rollbackCount ?? 0;
+    const failedHistory = opts.failedHistory ?? [];
+    const severity = opts.severityBreakdown ?? _inferSeverityBreakdown(reviewResult);
+
+    // ── Dimension 1: Severity Distribution ─────────────────────────────────
+    const hasCritical = (severity.critical ?? 0) > 0;
+    const hasHigh     = (severity.high ?? 0) > 0;
+    const hasMedium   = (severity.medium ?? 0) > 0;
+    const hasLow      = (severity.low ?? 0) > 0;
+    const totalIssues = (severity.critical ?? 0) + (severity.high ?? 0) + (severity.medium ?? 0) + (severity.low ?? 0);
+
+    // Severity score: critical=10, high=5, medium=2, low=1
+    const severityScore = (severity.critical ?? 0) * 10
+                        + (severity.high ?? 0) * 5
+                        + (severity.medium ?? 0) * 2
+                        + (severity.low ?? 0) * 1;
+
+    // ── Dimension 2: Correction Trend ──────────────────────────────────────
+    // Build full history including current round
+    const fullHistory = [...failedHistory, reviewResult.failed ?? 0];
+    let trend = 'unknown';
+    if (fullHistory.length >= 2) {
+      const diffs = [];
+      for (let i = 1; i < fullHistory.length; i++) {
+        diffs.push(fullHistory[i] - fullHistory[i - 1]);
+      }
+      const avgDiff = diffs.reduce((a, b) => a + b, 0) / diffs.length;
+      if (avgDiff < -0.5) trend = 'improving';
+      else if (avgDiff > 0.5) trend = 'degrading';
+      else trend = 'stable';
+    }
+
+    // ── Dimension 3: Category Coverage ──────────────────────────────────────
+    // Check which categories of issues remain vs. which were fixed
+    const fixedIssues = _extractFixedIssues(reviewResult.history);
+    const remainingTypes = new Set((reviewResult.riskNotes || []).map(n => {
+      if (n.includes('logic') || n.includes('contradiction')) return 'logic';
+      if (n.includes('security') || n.includes('vulnerability')) return 'security';
+      if (n.includes('performance') || n.includes('perf')) return 'performance';
+      if (n.includes('style') || n.includes('format')) return 'style';
+      return 'general';
+    }));
+    const fixedTypes = new Set(fixedIssues.map(f => {
+      const d = f.description.toLowerCase();
+      if (d.includes('logic') || d.includes('contradiction')) return 'logic';
+      if (d.includes('security') || d.includes('vulnerability')) return 'security';
+      if (d.includes('performance') || d.includes('perf')) return 'performance';
+      if (d.includes('style') || d.includes('format')) return 'style';
+      return 'general';
+    }));
+    // Cherry-pick detection: if only "easy" categories (style, general) were fixed
+    // but "hard" categories (logic, security) remain unfixed
+    const hardRemaining = [...remainingTypes].filter(t => t === 'logic' || t === 'security');
+    const cherryPicked = hardRemaining.length > 0 && fixedTypes.size > 0 && !fixedTypes.has('logic') && !fixedTypes.has('security');
+
+    // ── Build dimensions report ────────────────────────────────────────────
+    const dimensions = {
+      severity: { ...severity, score: severityScore, total: totalIssues },
+      trend: { direction: trend, history: fullHistory },
+      coverage: { remainingTypes: [...remainingTypes], fixedTypes: [...fixedTypes], cherryPicked },
+    };
+
+    // ── Four-Level Decision Logic ──────────────────────────────────────────
+
+    // Level 1: PASS – zero issues or all remaining are low-severity
+    if (totalIssues === 0 || (!hasCritical && !hasHigh && !hasMedium)) {
+      return {
+        pass: true, rollback: false, needsHumanReview: false, passWithConditions: false,
+        reason: `${stageName} multi-dim gate: PASS (${totalIssues === 0 ? '0 issues' : `${totalIssues} low-severity only`})`,
+        dimensions,
+      };
+    }
+
+    // Level 2: PASS-WITH-CONDITIONS – medium issues remain, but:
+    //   - No critical/high AND
+    //   - Trend is improving (or at least stable) AND
+    //   - No cherry-picking detected
+    if (!hasCritical && !hasHigh && trend !== 'degrading' && !cherryPicked) {
+      return {
+        pass: true, rollback: false, needsHumanReview: false, passWithConditions: true,
+        reason: `${stageName} multi-dim gate: PASS-WITH-CONDITIONS (${severity.medium ?? 0} medium, trend=${trend}, no critical blockers)`,
+        dimensions,
+      };
+    }
+
+    // Level 2b: PASS-WITH-CONDITIONS – high issues remain BUT trend is strongly improving
+    // AND rollback already attempted at least once. The system is converging.
+    if (hasHigh && !hasCritical && trend === 'improving' && rollbackCount >= 1 && severityScore <= 10) {
+      return {
+        pass: true, rollback: false, needsHumanReview: false, passWithConditions: true,
+        reason: `${stageName} multi-dim gate: PASS-WITH-CONDITIONS (trend=improving after ${rollbackCount} rollback(s), severityScore=${severityScore} ≤ 10, converging)`,
+        dimensions,
+      };
+    }
+
+    // Level 3: RETRY – critical/high issues, rollback budget available
+    if (rollbackCount < this.maxRollbacks) {
+      const degradeNote = trend === 'degrading' ? ' [WARNING: trend is degrading]' : '';
+      const cherryNote = cherryPicked ? ' [WARNING: cherry-picking detected – hard issues avoided]' : '';
+      return {
+        pass: false, rollback: true, needsHumanReview: false, passWithConditions: false,
+        reason: `${stageName} multi-dim gate: RETRY (severityScore=${severityScore}, trend=${trend}, rollback ${rollbackCount + 1}/${this.maxRollbacks})${degradeNote}${cherryNote}`,
+        dimensions,
+      };
+    }
+
+    // Level 4: ESCALATE – budget exhausted
+    return {
+      pass: false, rollback: false, needsHumanReview: true, passWithConditions: false,
+      reason: `${stageName} multi-dim gate: ESCALATE (severityScore=${severityScore}, trend=${trend}, ${rollbackCount} rollback(s) exhausted)`,
+      dimensions,
     };
   }
 
@@ -214,6 +368,48 @@ class QualityGate {
 module.exports = { QualityGate };
 
 // ─── Module-private helpers ───────────────────────────────────────────────────
+
+/**
+ * Infers a severity breakdown from a reviewResult when one is not explicitly provided.
+ * Looks at riskNotes for severity markers like "(high)", "(critical)".
+ * Falls back to: all `failed` items counted as high, remainder as medium.
+ *
+ * @param {object} reviewResult
+ * @returns {{ critical: number, high: number, medium: number, low: number }}
+ */
+function _inferSeverityBreakdown(reviewResult) {
+  const breakdown = { critical: 0, high: 0, medium: 0, low: 0 };
+  const riskNotes = reviewResult.riskNotes || [];
+
+  if (riskNotes.length > 0) {
+    for (const note of riskNotes) {
+      const lower = note.toLowerCase();
+      if (lower.includes('(critical)') || lower.includes('[critical]')) {
+        breakdown.critical++;
+      } else if (lower.includes('(high)') || lower.includes('[high]')) {
+        breakdown.high++;
+      } else if (lower.includes('(medium)') || lower.includes('[medium]')) {
+        breakdown.medium++;
+      } else if (lower.includes('(low)') || lower.includes('[low]')) {
+        breakdown.low++;
+      } else {
+        // Default: if needsHumanReview flag is set, treat as high; otherwise medium
+        if (reviewResult.needsHumanReview) breakdown.high++;
+        else breakdown.medium++;
+      }
+    }
+  } else {
+    // No riskNotes: use the binary failed count
+    const failed = reviewResult.failed ?? 0;
+    if (reviewResult.needsHumanReview) {
+      breakdown.high = failed;
+    } else {
+      breakdown.medium = failed;
+    }
+  }
+
+  return breakdown;
+}
 
 /**
  * Defect A fix: Extracts a flat list of fixed issues from a correction history array.

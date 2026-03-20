@@ -118,7 +118,18 @@ const AGENT_CONTRACTS = {
     minLength: 100,
     description: 'requirements.md for ArchitectAgent',
   },
-  // ARCHITECT → DEVELOPER: architecture.md must have a design/component section
+  // ARCHITECT → PLANNER: architecture.md must have a design/component section
+  planner: {
+    requiredSections: [
+      // English variants
+      '## Architecture', '## Component', '## Design', '## System', '# Architecture', 'architecture',
+      // Chinese variants (P2-NEW-2)
+      '## 架构', '## 系统架构', '## 组件', '## 模块', '## 设计', '## 技术栈', '架构设计', '技术栈',
+    ],
+    minLength: 200,
+    description: 'architecture.md for PlannerAgent',
+  },
+  // PLANNER → DEVELOPER: architecture.md (passed through) must have a design/component section
   developer: {
     requiredSections: [
       // English variants
@@ -127,7 +138,7 @@ const AGENT_CONTRACTS = {
       '## 架构', '## 系统架构', '## 组件', '## 模块', '## 设计', '## 技术栈', '架构设计', '技术栈',
     ],
     minLength: 200,
-    description: 'architecture.md for DeveloperAgent',
+    description: 'architecture.md for DeveloperAgent (via PlannerAgent)',
   },
   // DEVELOPER → TESTER: code.diff must look like a diff
   tester: {
@@ -184,7 +195,8 @@ function validateAgentContract(receiverRole, filePath) {
     // Map receiverRole to the sender's role (the file was produced by the sender)
     const senderRoleMap = {
       architect: 'analyst',
-      developer: 'architect',
+      planner:   'architect',
+      developer: 'planner',
       tester:    'developer',
     };
     const senderRole = senderRoleMap[receiverRole.toLowerCase()];

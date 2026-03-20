@@ -59,6 +59,23 @@ const ARCHITECT_SCHEMA = {
 };
 
 /**
+ * PLANNER output schema.
+ * Embedded as a JSON block at the top of execution-plan.md.
+ */
+const PLANNER_SCHEMA = {
+  role: 'planner',
+  version: '1.0',
+  fields: {
+    tasks:         { type: 'array',  description: 'Ordered list of implementation tasks',    required: true },
+    dependencies:  { type: 'array',  description: 'Task dependency relationships',           required: false },
+    phases:        { type: 'array',  description: 'Implementation phases grouping',          required: true },
+    totalEstimate: { type: 'string', description: 'Total estimated complexity',              required: false },
+    keyDecisions:  { type: 'array',  description: 'Planning decisions made',                 required: false },
+    risks:         { type: 'array',  description: 'Identified execution risks',              required: false },
+  },
+};
+
+/**
  * DEVELOPER output schema.
  * Embedded as a JSON block at the top of code.diff.
  */
@@ -93,6 +110,7 @@ const TESTER_SCHEMA = {
 const SCHEMAS = {
   analyst:   ANALYST_SCHEMA,
   architect: ARCHITECT_SCHEMA,
+  planner:   PLANNER_SCHEMA,
   developer: DEVELOPER_SCHEMA,
   tester:    TESTER_SCHEMA,
 };
@@ -274,6 +292,7 @@ module.exports = {
   SCHEMAS,
   ANALYST_SCHEMA,
   ARCHITECT_SCHEMA,
+  PLANNER_SCHEMA,
   DEVELOPER_SCHEMA,
   TESTER_SCHEMA,
   extractJsonBlock,

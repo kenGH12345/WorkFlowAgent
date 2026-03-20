@@ -12,7 +12,7 @@
  *   - Quality gate evaluation + rollback coordination
  *   - EvoMap feedback loop (experience hit-rate tracking)
  *   - Store ARCHITECT context for downstream stages
- *   - Bus publish (ARCHITECT → DEVELOPER)
+ *   - Bus publish (ARCHITECT → PLANNER)
  */
 
 'use strict';

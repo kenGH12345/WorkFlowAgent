@@ -5,12 +5,12 @@
  * Usage:
  *   node workflow/gen-agents.js                          # 扫描当前工作目录
  *   node workflow/gen-agents.js --path D:\MyProject      # 扫描指定项目
- *   node workflow/gen-agents.js --path D:\MyProject --ext .cs,.lua,.ts
+ *   node workflow/gen-agents.js --path D:\MyProject --ext .js,.ts,.py
  *   node workflow/gen-agents.js --path D:\MyProject --max-files 120
  *
  * Options:
  *   --path <dir>        目标项目根目录（默认：process.cwd()）
- *   --ext <exts>        扫描的文件扩展名，逗号分隔（默认：.cs,.lua）
+ *   --ext <exts>        扫描的文件扩展名，逗号分隔（默认：all supported）
  *   --max-files <n>     每种扩展名最多扫描文件数（默认：80）
  *   --help              显示帮助
  */
@@ -47,14 +47,14 @@ Usage: node workflow/gen-agents.js [options]
 
 Options:
   --path, -p <dir>       目标项目根目录（默认：当前工作目录）
-  --ext,  -e <exts>      扫描扩展名，逗号分隔（默认：.cs,.lua）
+  --ext,  -e <exts>      扫描扩展名，逗号分隔（默认：all supported）
   --max-files, -m <n>    每种扩展名最多扫描文件数（默认：80）
   --help, -h             显示帮助
 
 Examples:
   node workflow/gen-agents.js
   node workflow/gen-agents.js --path D:\\MyProject
-  node workflow/gen-agents.js --path D:\\MyProject --ext .cs,.lua,.ts
+  node workflow/gen-agents.js --path D:\\MyProject --ext .js,.ts,.py
   node workflow/gen-agents.js --path ../OtherProject --max-files 120
 `);
 }
@@ -75,9 +75,10 @@ async function main() {
     : process.cwd();
 
   // Parse extensions
+  // Default extensions: auto-detect from project, fallback to all supported languages
   const extensions = args.ext
     ? args.ext.split(',').map(e => e.trim().startsWith('.') ? e.trim() : `.${e.trim()}`)
-    : ['.cs', '.lua'];
+    : ['.js', '.ts', '.py', '.go', '.java', '.cs', '.lua', '.dart'];
 
   const maxFiles = args.maxFiles || 80;
 
@@ -106,7 +107,7 @@ async function main() {
     console.log(`[gen-agents] Scanning code symbols (${extensions.join(', ')})...`);
     const { summary: symbolsSummary } = scanCodeSymbols(projectRoot, {
       extensions,
-      ignoreDirs: ['node_modules', '.git', 'dist', 'build', 'output', 'Library', 'Temp', 'obj', 'Packages'],
+      ignoreDirs: ['node_modules', '.git', 'dist', 'build', 'output'],
       maxFiles,
     });
 

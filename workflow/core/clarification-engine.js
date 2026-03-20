@@ -240,6 +240,93 @@ You believe that quality must be built in, not inspected in. You are performing 
  * @param {string} stageLabel  - e.g. 'Architecture', 'Test Report'
  * @returns {string} prompt
  */
+/**
+ * Builds a correlation analysis prompt for the final round of self-correction.
+ *
+ * Correlation mode (P1 Audit Method Borrowing – Round Objective Progression):
+ *   After detection (breadth) and verification (depth), this third objective
+ *   performs cross-signal correlation analysis. It looks for CAUSAL CHAINS:
+ *   signals that individually seem low/medium severity but combine into a
+ *   high-severity systemic issue.
+ *
+ *   Inspired by the white-box audit methodology's "Phase 3: Correlation Analysis"
+ *   which combines independent findings into attack chains.
+ *
+ * @param {string} text        - Document text to correlate
+ * @param {string} stageLabel  - e.g. 'Architecture', 'Test Report'
+ * @param {object[]} priorSignals - Signals from previous rounds (for context)
+ * @returns {string} prompt
+ */
+function buildSemanticCorrelationPrompt(text, stageLabel, priorSignals = []) {
+  const MAX_DOC_CHARS = 5000;
+  let docText = text;
+  if (text.length > MAX_DOC_CHARS) {
+    const half = MAX_DOC_CHARS / 2;
+    const omitted = text.length - MAX_DOC_CHARS;
+    docText = `${text.slice(0, half)}\n\n... [${omitted} chars omitted for token budget] ...\n\n${text.slice(-half)}`;
+  }
+
+  const priorBlock = priorSignals.length > 0
+    ? [
+        `## Prior Signals (from earlier rounds)`,
+        ``,
+        `The following individual issues were detected in previous rounds:`,
+        ...priorSignals.slice(0, 8).map((s, i) => `${i + 1}. [${s.severity}] ${s.type}: ${s.label}`),
+        ``,
+        `Your task is to find CONNECTIONS between these signals that create compound risks.`,
+        ``,
+      ].join('\n')
+    : '';
+
+  return [
+    `You are **James Reason** – author of *Swiss Cheese Model* and the world's foremost`,
+    `expert on systemic failure analysis. You understand that catastrophic failures`,
+    `rarely come from a single cause – they emerge when multiple small gaps align.`,
+    ``,
+    `You are performing a **correlation analysis** on a ${stageLabel} document.`,
+    `Your job is NOT to find new individual issues (previous rounds already did that).`,
+    `Your job IS to find **causal chains** – combinations of signals that together`,
+    `create a systemic risk greater than the sum of individual parts.`,
+    ``,
+    priorBlock,
+    `## Correlation Patterns to Look For`,
+    ``,
+    `1. **Risk Amplification** – Issue A in one area makes Issue B in another area much worse`,
+    `   (e.g. "missing input validation" + "direct SQL query" = SQL injection)`,
+    `2. **Hidden Dependency** – Two seemingly independent components share a fragile assumption`,
+    `   (e.g. both assume a config value exists, but neither validates it)`,
+    `3. **Error Cascade** – A failure in component A propagates to B, C, D with no circuit breaker`,
+    `   (e.g. no error handling + no retry + no fallback = total system failure)`,
+    `4. **Contradictory Constraints** – Two requirements/design decisions conflict under edge cases`,
+    `   (e.g. "must be stateless" + "must maintain session" = architectural tension)`,
+    `5. **Single Point of Failure** – Multiple critical paths converge on one unprotected resource`,
+    ``,
+    `## Document to Analyse`,
+    ``,
+    docText,
+    ``,
+    `## Output Format`,
+    ``,
+    `Return a JSON array. Each element represents a CORRELATED risk chain:`,
+    `- "type": "correlation"`,
+    `- "severity": "high" | "medium" (correlations are always medium+ by definition)`,
+    `- "label": short descriptive label for the compound risk`,
+    `- "layer": "What-if" (correlations are always hypothetical compound scenarios)`,
+    `- "evidence": one sentence describing which signals/components interact`,
+    `- "instruction": one concrete instruction to break the causal chain`,
+    `- "chain": array of 2-3 contributing factor descriptions (strings)`,
+    ``,
+    `## Critical Rules`,
+    ``,
+    `- Only report COMPOUND risks, not individual issues already found.`,
+    `- Each correlation must involve at least 2 distinct components or concerns.`,
+    `- Maximum 3 correlations. Focus on the highest-impact chains.`,
+    `- If no meaningful correlations exist, return an empty array: []`,
+    ``,
+    `Return ONLY the JSON array. No markdown fences, no extra text.`,
+  ].join('\n');
+}
+
 function buildSemanticVerificationPrompt(text, stageLabel) {
   const MAX_DOC_CHARS = 6000;
   let docText = text;
@@ -442,7 +529,10 @@ class SelfCorrectionEngine {
       const signals = await this._detectSignals(current, stageLabel);
 
       if (signals.length === 0) {
-        this._log(`\n[SelfCorrection] ✅ Round ${round - 1}: No issues detected. Artifact is clean.\n`);
+        // R1-6 audit: when round=1, round-1=0 which is confusing in logs.
+        // Use "after N scan(s)" phrasing which is always clear.
+        const scanLabel = round === 1 ? 'Initial scan' : `After ${round - 1} correction(s)`;
+        this._log(`\n[SelfCorrection] ✅ ${scanLabel}: No issues detected. Artifact is clean.\n`);
         return { content: current, rounds: round - 1, signals: [], history, needsHumanReview: false };
       }
 
@@ -536,13 +626,59 @@ class SelfCorrectionEngine {
       };
     }
 
-    // Final check after all rounds.
-    // Independence principle: use a VERIFICATION prompt (adversarial reviewer persona)
-    // rather than the same detection prompt, so the LLM cannot simply confirm its own
-    // previous corrections. This breaks the self-validation loop where the same model
-    // that fixed an issue also declares it fixed. see CHANGELOG: P1-A
+    // ── P1 Round Objective Progression (Audit Method Borrowing) ──────────────
+    // Three-objective final evaluation, inspired by the white-box audit methodology:
+    //
+    //   Round N+1 (Verification – depth):  Adversarial second-reviewer persona.
+    //     Catches issues the self-correction loop glossed over.
+    //
+    //   Round N+2 (Correlation – cross-signal):  Causal chain analysis.
+    //     Combines individual signals into compound systemic risks.
+    //     Only runs when there are enough prior signals to correlate.
+    //
+    // The verification round always runs. The correlation round runs when:
+    //   1. semanticMode is enabled (requires LLM)
+    //   2. There are ≥2 signals across all history rounds to correlate
+    //   3. maxRounds > 1 (trivial tasks with maxRounds=1 skip correlation)
+
+    // Collect all signals from history for correlation context
+    const allPriorSignals = history.reduce((acc, h) => {
+      if (Array.isArray(h.signals)) acc.push(...h.signals);
+      return acc;
+    }, []);
+
+    // Objective 2: Verification (adversarial depth scan)
+    this._log(`\n[SelfCorrection] 🎯 Round objective: VERIFICATION (adversarial depth scan)`);
     let remainingSignals = await this._detectSignals(current, stageLabel, { verificationMode: true });
     let highSeverityRemaining = remainingSignals.filter(s => s.severity === 'high');
+
+    // Objective 3: Correlation (cross-signal causal chain analysis)
+    // Only run when there are enough prior signals to form meaningful correlations
+    const shouldRunCorrelation = this.semanticMode
+      && this.maxRounds > 1
+      && (allPriorSignals.length + remainingSignals.length) >= 2;
+
+    if (shouldRunCorrelation) {
+      this._log(`[SelfCorrection] 🎯 Round objective: CORRELATION (cross-signal causal chain analysis)`);
+      const correlationSignals = await this._detectSignals(
+        current, stageLabel,
+        { correlationMode: true, priorSignals: [...allPriorSignals, ...remainingSignals] }
+      );
+
+      if (correlationSignals.length > 0) {
+        this._log(`[SelfCorrection] 🔗 Correlation analysis found ${correlationSignals.length} compound risk(s):`);
+        correlationSignals.forEach(s => {
+          const chain = s.chain ? ` (chain: ${s.chain.join(' → ')})` : '';
+          this._log(`  • [${s.severity}] ${s.label}${chain}`);
+        });
+        // Merge correlation signals into remaining signals
+        // Correlation signals are always at least medium severity
+        remainingSignals = [...remainingSignals, ...correlationSignals];
+        highSeverityRemaining = remainingSignals.filter(s => s.severity === 'high');
+      } else {
+        this._log(`[SelfCorrection] 🔗 Correlation analysis: no compound risks found.`);
+      }
+    }
 
     // If high-severity issues remain, attempt deep investigation before giving up
     if (highSeverityRemaining.length > 0 && this.investigationTools) {
@@ -685,6 +821,26 @@ class SelfCorrectionEngine {
       } else {
         this._log(`  [Investigate] ⏭️  No queryExperience tool configured. Skipping.`);
       }
+
+      // 4. Web search – fallback to internet when local knowledge is insufficient.
+      //    Only triggers when: (a) webSearch tool is available AND (b) previous
+      //    steps yielded fewer than 2 findings for this signal (i.e. local knowledge gap).
+      if (typeof tools.webSearch === 'function' && findings.length < 2) {
+        try {
+          const evidenceSnippet = (signal.evidence || '').slice(0, 60).trim();
+          const webQuery = evidenceSnippet
+            ? `${signal.type} solution: ${evidenceSnippet}`
+            : `${signal.type} ${stageLabel} best practice fix`;
+          this._log(`  [Investigate] 🌐 Web search for: "${webQuery.slice(0, 100)}"`);
+          const webResult = await tools.webSearch(webQuery);
+          if (webResult) {
+            findings.push(`### Web Search Results for [${signal.label}]\n${webResult}`);
+            this._log(`  [Investigate] ✅ Web search returned results.`);
+          }
+        } catch (err) {
+          this._log(`  [Investigate] ⚠️  Web search failed: ${err.message}`);
+        }
+      }
     }
 
     if (findings.length === 0) {
@@ -710,28 +866,36 @@ class SelfCorrectionEngine {
    * Detects signals in the given text.
    * Uses semantic (LLM) mode if enabled, falls back to regex on failure.
    *
+   * P1 Round Objective Progression: supports three detection modes:
+   *   - detection (default):  breadth scan – find all individual issues
+   *   - verification:         depth scan – adversarial re-check of prior fixes
+   *   - correlation:          cross-signal analysis – find causal chains
+   *
    * @param {string}  text
    * @param {string}  stageLabel
    * @param {object}  [opts]
-   * @param {boolean} [opts.verificationMode=false] - When true, uses an adversarial
-   *   reviewer persona instead of the standard detection prompt. This breaks the
-   *   self-validation loop: the same LLM that corrected the artifact cannot simply
-   *   confirm its own corrections – it must now act as a sceptical second reviewer.
+   * @param {boolean} [opts.verificationMode=false] - Adversarial second reviewer
+   * @param {boolean} [opts.correlationMode=false]  - Cross-signal causal chain analysis
+   * @param {object[]} [opts.priorSignals=[]]        - Signals from earlier rounds (for correlation)
    * @returns {Promise<object[]>} signals
    */
-  async _detectSignals(text, stageLabel, { verificationMode = false } = {}) {
+  async _detectSignals(text, stageLabel, { verificationMode = false, correlationMode = false, priorSignals = [] } = {}) {
     if (!this.semanticMode) {
-      // Regex mode: fast, no LLM call
+      // Regex mode: fast, no LLM call (correlation not supported in regex mode)
       return detectSignals(text);
     }
 
     // Semantic mode: LLM understands context
-    const modeLabel = verificationMode ? 'verification (adversarial)' : 'detection';
+    const modeLabel = correlationMode
+      ? 'correlation (cross-signal)'
+      : verificationMode ? 'verification (adversarial)' : 'detection';
     this._log(`[SelfCorrection] 🧠 Running semantic signal ${modeLabel} (LLM)...`);
     try {
-      const prompt = verificationMode
-        ? buildSemanticVerificationPrompt(text, stageLabel)
-        : buildSemanticDetectionPrompt(text, stageLabel);
+      const prompt = correlationMode
+        ? buildSemanticCorrelationPrompt(text, stageLabel, priorSignals)
+        : verificationMode
+          ? buildSemanticVerificationPrompt(text, stageLabel)
+          : buildSemanticDetectionPrompt(text, stageLabel);
       const response = await this.llmCall(prompt);
       const signals = parseSemanticSignals(response);
 
@@ -743,9 +907,9 @@ class SelfCorrectionEngine {
 
       return signals;
     } catch (err) {
-      // Fallback to regex on LLM failure
-      this._log(`[SelfCorrection] ⚠️  Semantic ${modeLabel} failed (${err.message}). Falling back to regex.`);
-      return detectSignals(text);
+      // Fallback to regex on LLM failure (correlation mode falls back to empty)
+      this._log(`[SelfCorrection] ⚠️  Semantic ${modeLabel} failed (${err.message}). Falling back to ${correlationMode ? 'empty' : 'regex'}.`);
+      return correlationMode ? [] : detectSignals(text);
     }
   }
 

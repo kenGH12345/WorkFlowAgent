@@ -4,6 +4,7 @@ const fs   = require('fs');
 const path = require('path');
 const { PATHS } = require('./constants');
 const { WorkflowState } = require('./types');
+const { fileLockManager } = require('./file-lock-manager');
 
 /**
  * Helper methods for Orchestrator.
@@ -34,7 +35,7 @@ function _buildInvestigationTools(stageLabel) {
 
     // Dynamically add artifacts from all upstream stages (via StageContextStore)
     if (self.stageCtx) {
-    const stageOrder = [WorkflowState.ANALYSE, WorkflowState.ARCHITECT, WorkflowState.CODE, WorkflowState.TEST];
+    const stageOrder = [WorkflowState.ANALYSE, WorkflowState.ARCHITECT, WorkflowState.PLAN, WorkflowState.CODE, WorkflowState.TEST];
     const currentStageIdx = stageOrder.indexOf(
       stageLabel === 'Architecture' ? WorkflowState.ARCHITECT
       : stageLabel === 'Code'       ? WorkflowState.CODE
@@ -130,11 +131,62 @@ function _buildInvestigationTools(stageLabel) {
       console.log(`  [Investigation:queryGraph] Looking up symbol: "${symbolName}"`);
       try {
         const md = self.codeGraph.querySymbolsAsMarkdown([symbolName]);
-        if (!md || md.includes('_No matching') || md.includes('_Code graph not')) return null;
-        console.log(`  [Investigation:queryGraph] Found symbol info for "${symbolName}".`);
-        return md;
+        if (md && !md.includes('_No matching') && !md.includes('_Code graph not')) {
+          console.log(`  [Investigation:queryGraph] Found symbol info for "${symbolName}".`);
+          return md;
+        }
+        // P1: Fallback to semantic search — natural-language queries like
+        // "context loader" or "build prompt" benefit from the TF-IDF engine.
+        const searchResults = self.codeGraph.search(symbolName, { limit: 3 });
+        if (searchResults.length > 0) {
+          const names = searchResults.map(s => s.name);
+          const searchMd = self.codeGraph.querySymbolsAsMarkdown(names);
+          if (searchMd && !searchMd.includes('_No matching')) {
+            console.log(`  [Investigation:queryGraph] Found ${searchResults.length} symbol(s) via semantic search for "${symbolName}".`);
+            return searchMd;
+          }
+        }
+        console.log(`  [Investigation:queryGraph] No results for "${symbolName}".`);
+        return null;
       } catch (err) {
         console.warn(`  [Investigation:queryGraph] Failed: ${err.message}`);
+        return null;
+      }
+    },
+
+    /**
+     * Web search tool – queries the internet for external knowledge when local
+     * experience and code graph are insufficient to resolve an issue.
+     * Only available when WebSearchAdapter is registered in MCPRegistry.
+     *
+     * @param {string} query - Search query string
+     * @returns {Promise<string|null>} Formatted search results or null
+     */
+    webSearch: async (query) => {
+      if (!self.services || !self.services.has('mcpRegistry')) {
+        console.log(`  [Investigation:webSearch] No MCPRegistry available. Skipping web search.`);
+        return null;
+      }
+      try {
+        const registry = self.services.resolve('mcpRegistry');
+        const wsAdapter = registry.get('websearch');
+        if (!wsAdapter) {
+          console.log(`  [Investigation:webSearch] WebSearchAdapter not registered. Skipping.`);
+          return null;
+        }
+        console.log(`  [Investigation:webSearch] 🌐 Searching web for: "${query.slice(0, 100)}"`);
+        const result = await wsAdapter.search(query, { maxResults: 3 });
+        if (!result || !result.results || result.results.length === 0) {
+          console.log(`  [Investigation:webSearch] No web results found.`);
+          return null;
+        }
+        const formatted = result.results.map((r, i) =>
+          `${i + 1}. **${r.title}**\n   URL: ${r.url}\n   ${(r.snippet || '').slice(0, 200)}`
+        ).join('\n\n');
+        console.log(`  [Investigation:webSearch] ✅ Found ${result.results.length} web result(s) (provider: ${result.provider}).`);
+        return formatted;
+      } catch (err) {
+        console.warn(`  [Investigation:webSearch] Web search failed: ${err.message}`);
         return null;
       }
     },
@@ -194,6 +246,10 @@ function _applyFileReplacements(llmResponse) {
   let failed = 0;
   const errors = [];
   const modifiedFiles = []; // P2-B: track which files were modified
+  const lockConflicts = []; // Optimistic lock: track conflict details
+
+  // Determine agentId for lock tracking (from task-based worker context if available)
+  const agentId = this._currentAgentId || 'sequential';
 
   // ── Format 2: [LINE_RANGE] blocks (preferred – immune to whitespace mismatch) ──
   const lineRangeRegex = /\[LINE_RANGE\]([\s\S]*?)\[\/LINE_RANGE\]/g;
@@ -241,6 +297,9 @@ function _applyFileReplacements(llmResponse) {
         ? (this.sandbox.readFile(absPath) || fs.readFileSync(absPath, 'utf-8'))
         : fs.readFileSync(absPath, 'utf-8');
 
+      // Optimistic lock: acquire version stamp before editing
+      fileLockManager.acquireVersion(absPath, original, agentId);
+
       const fileLines = original.split('\n');
       if (endLine > fileLines.length) {
         errors.push(`[LINE_RANGE] end_line ${endLine} exceeds file length ${fileLines.length} in ${relPath}`);
@@ -257,7 +316,19 @@ function _applyFileReplacements(llmResponse) {
         this.sandbox.patchFile(absPath, original, updated);
         console.log(`[Orchestrator] 🧪 [DryRun] Would patch lines ${startLine}–${endLine}: ${relPath}`);
       } else {
+        // Optimistic lock: re-read and verify before writing
+        const preWriteContent = fs.readFileSync(absPath, 'utf-8');
+        const lockCheck = fileLockManager.verifyVersion(absPath, preWriteContent, agentId);
+        if (!lockCheck.valid) {
+          const msg = `[LINE_RANGE] Optimistic lock conflict on ${relPath}: ${lockCheck.reason}`;
+          errors.push(msg);
+          lockConflicts.push({ file: relPath, reason: lockCheck.reason });
+          console.warn(`[Orchestrator] 🔒 ${msg}`);
+          failed++;
+          continue;
+        }
         fs.writeFileSync(absPath, updated, 'utf-8');
+        fileLockManager.releaseVersion(absPath, updated, agentId);
         console.log(`[Orchestrator] ✏️  Patched lines ${startLine}–${endLine}: ${relPath}`);
       }
       modifiedFiles.push(relPath); // P2-B: track modified file
@@ -323,6 +394,9 @@ function _applyFileReplacements(llmResponse) {
         ? (this.sandbox.readFile(absPath) || fs.readFileSync(absPath, 'utf-8'))
         : fs.readFileSync(absPath, 'utf-8');
 
+      // Optimistic lock: acquire version stamp before editing
+      fileLockManager.acquireVersion(absPath, original, agentId);
+
       if (!original.includes(findStr)) {
         errors.push(`"find:" text not found in ${relPath}. First 80 chars: "${findStr.slice(0, 80).replace(/\n/g, '↵')}"`);
         failed++;
@@ -333,6 +407,17 @@ function _applyFileReplacements(llmResponse) {
         this.sandbox.patchFile(absPath, findStr, replaceStr);
         console.log(`[Orchestrator] 🧪 [DryRun] Would patch: ${relPath}`);
       } else {
+        // Optimistic lock: re-read and verify before writing
+        const preWriteContent = fs.readFileSync(absPath, 'utf-8');
+        const lockCheck = fileLockManager.verifyVersion(absPath, preWriteContent, agentId);
+        if (!lockCheck.valid) {
+          const msg = `Optimistic lock conflict on ${relPath}: ${lockCheck.reason}`;
+          errors.push(msg);
+          lockConflicts.push({ file: relPath, reason: lockCheck.reason });
+          console.warn(`[Orchestrator] 🔒 ${msg}`);
+          failed++;
+          continue;
+        }
         // Only replace the FIRST occurrence. see CHANGELOG: P1-3
         const occurrences = original.split(findStr).length - 1;
         if (occurrences > 1) {
@@ -341,6 +426,7 @@ function _applyFileReplacements(llmResponse) {
         const updated = original.replace(findStr, replaceStr);
         console.log(`[Orchestrator] ✏️  Patched: ${relPath}${occurrences > 1 ? ` (1 of ${occurrences} occurrence(s) replaced)` : ''}`);
         fs.writeFileSync(absPath, updated, 'utf-8');
+        fileLockManager.releaseVersion(absPath, updated, agentId);
       }
       modifiedFiles.push(relPath); // P2-B: track modified file
       applied++;
@@ -356,7 +442,12 @@ function _applyFileReplacements(llmResponse) {
     failed++;
   }
 
-  return { applied, failed, errors, modifiedFiles };
+  // Log optimistic lock conflicts summary if any
+  if (lockConflicts.length > 0) {
+    console.warn(`[Orchestrator] 🔒 Optimistic lock: ${lockConflicts.length} conflict(s) detected. Files: ${lockConflicts.map(c => c.file).join(', ')}`);
+  }
+
+  return { applied, failed, errors, modifiedFiles, lockConflicts };
 }
 
 module.exports = { _buildInvestigationTools, _registerBuiltinSkills, _applyFileReplacements };

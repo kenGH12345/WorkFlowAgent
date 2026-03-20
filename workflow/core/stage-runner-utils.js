@@ -188,15 +188,28 @@ async function runEvoMapFeedback(orch, { injectedExpIds, errorContext, stageLabe
   console.log(`[Orchestrator] 🎯 Experience hit-rate (${stageLabel}): ${matchedCount}/${injectedExpIds.length} matched`);
 
   // Centralized evolution trigger via ExperienceStore.triggerEvolutions()
-  const evolvedCount = await orch.experienceStore.triggerEvolutions(
+  // P1 Enhancement: triggerEvolutions now returns { evolved, created } instead of just a number.
+  // 'created' tracks newly auto-created skills from orphan experiences.
+  const evoResult = await orch.experienceStore.triggerEvolutions(
     evolutionTriggers,
     orch.skillEvolution,
     orch.hooks,
     stageLabel,
   );
-  console.log(`[Orchestrator] 📊 Marked ${matchedCount}/${injectedExpIds.length} experience(s) as effective (${stageLabel} passed). Evolution triggers: ${evolvedCount}`);
+  // Backward-compatible: handle both old (number) and new ({ evolved, created }) return format
+  const evolvedCount = typeof evoResult === 'number' ? evoResult : (evoResult.evolved || 0);
+  const createdCount = typeof evoResult === 'object' ? (evoResult.created || 0) : 0;
+  console.log(`[Orchestrator] 📊 Marked ${matchedCount}/${injectedExpIds.length} experience(s) as effective (${stageLabel} passed). Evolution triggers: ${evolvedCount}${createdCount > 0 ? `, new skills: ${createdCount}` : ''}`);
 
-  return { matchedCount, evolvedCount };
+  // Skill Lifecycle: mark all skills that were injected during this stage as effective.
+  // This is the key feedback signal: skills injected into prompts for stages that
+  // pass QualityGate are confirmed as contributing to successful outcomes.
+  // The skill names are aggregated by Observability across all LLM calls this session.
+  if (orch.obs._skillInjectedCounts && orch.obs._skillInjectedCounts.size > 0) {
+    orch.obs.markSkillEffective([...orch.obs._skillInjectedCounts.keys()]);
+  }
+
+  return { matchedCount, evolvedCount, createdCount };
 }
 
 // ─── Exports ────────────────────────────────────────────────────────────────

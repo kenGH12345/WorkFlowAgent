@@ -148,7 +148,9 @@ class BaseAgent {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     
     // Atomic write: write to temp file first, then rename
-    const tempFilePath = `${outputFilePath}.tmp.${Date.now()}`;
+    // R3-1 audit: added random suffix to prevent collision when parallel agents
+    // finish in the same millisecond (task-based mode with concurrency > 1).
+    const tempFilePath = `${outputFilePath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
     fs.writeFileSync(tempFilePath, content, 'utf-8');
     fs.renameSync(tempFilePath, outputFilePath);
 

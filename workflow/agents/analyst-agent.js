@@ -13,9 +13,82 @@
 
 'use strict';
 
+const path = require('path');
 const { BaseAgent } = require('./base-agent');
 const { AgentRole } = require('../core/types');
 const { buildJsonBlockInstruction } = require('../core/agent-output-schema');
+
+// ─── Anchor File Extraction ──────────────────────────────────────────────────
+
+/**
+ * Extracts anchor file references from user requirement text.
+ *
+ * Supports multiple formats that IDE Copilot may use:
+ *   1. @file:path/to/file.ext or @path/to/file.ext
+ *   2. Explicit file names with common extensions (e.g. "FarmRobotSettingSubUICtrl.lua")
+ *   3. Markdown-style references [filename](path)
+ *   4. Backtick-wrapped file references `path/to/file.ext`
+ *
+ * @param {string} text - User requirement text
+ * @returns {{ anchorFiles: string[], anchorNames: string[] }}
+ *   anchorFiles  – full paths or identifiable file references
+ *   anchorNames  – just the base names (for display and search hinting)
+ */
+function extractAnchorFiles(text) {
+  const anchorFiles = [];
+  const seen = new Set();
+
+  // Pattern 1: @file:path or @path/to/file.ext (IDE @ reference)
+  const atFilePattern = /@(?:file:)?([\w\\/.\-]+\.\w{1,10})/g;
+  let match;
+  while ((match = atFilePattern.exec(text)) !== null) {
+    const filePath = match[1].trim();
+    if (!seen.has(filePath.toLowerCase())) {
+      seen.add(filePath.toLowerCase());
+      anchorFiles.push(filePath);
+    }
+  }
+
+  // Pattern 2: Explicit file names with known extensions
+  // Matches things like: FarmRobotSettingSubUICtrl.lua, UserService.ts, config.yaml
+  const fileNamePattern = /(?:^|[\s"'`(,])([A-Za-z_][\w\-.]*\.(?:lua|js|ts|tsx|jsx|py|java|cs|cpp|c|h|go|rs|rb|php|swift|kt|vue|svelte|yaml|yml|json|xml|sql|sh|bat|ps1|css|scss|less|html))(?=[\s"'`),;]|$)/gm;
+  while ((match = fileNamePattern.exec(text)) !== null) {
+    const fileName = match[1].trim();
+    if (!seen.has(fileName.toLowerCase())) {
+      seen.add(fileName.toLowerCase());
+      anchorFiles.push(fileName);
+    }
+  }
+
+  // Pattern 3: Markdown-style [name](path) references
+  const mdLinkPattern = /\[([^\]]+)\]\(([^)]+\.\w{1,10})\)/g;
+  while ((match = mdLinkPattern.exec(text)) !== null) {
+    const filePath = match[2].trim();
+    if (!seen.has(filePath.toLowerCase())) {
+      seen.add(filePath.toLowerCase());
+      anchorFiles.push(filePath);
+    }
+  }
+
+  // Pattern 4: Backtick-wrapped paths that look like files
+  const backtickPattern = /`([\w\\/.\-]+\.\w{1,10})`/g;
+  while ((match = backtickPattern.exec(text)) !== null) {
+    const filePath = match[1].trim();
+    // Accept if: has path separator, starts with uppercase, or has a source-code extension
+    const hasPath = filePath.includes('/') || filePath.includes('\\');
+    const hasCodeExt = /\.(lua|js|ts|tsx|jsx|py|java|cs|cpp|c|h|go|rs|rb|php|swift|kt|vue|svelte|yaml|yml|json|xml|sql|sh|bat|css|scss|html)$/i.test(filePath);
+    if (hasPath || hasCodeExt || /^[A-Z]/.test(filePath)) {
+      if (!seen.has(filePath.toLowerCase())) {
+        seen.add(filePath.toLowerCase());
+        anchorFiles.push(filePath);
+      }
+    }
+  }
+
+  const anchorNames = anchorFiles.map(f => path.basename(f).replace(/\.[^.]+$/, ''));
+
+  return { anchorFiles, anchorNames };
+}
 
 class AnalystAgent extends BaseAgent {
   constructor(llmCall, hookEmitter, opts = {}) {
@@ -36,6 +109,34 @@ class AnalystAgent extends BaseAgent {
       : '';
     // P0-NEW-1: inject structured JSON output instruction
     const jsonInstruction = buildJsonBlockInstruction('analyst');
+
+    // ── Anchor File Extraction ────────────────────────────────────────────
+    // Extract user-referenced files (@file or explicit names) from the requirement.
+    // These are injected as an "Anchor Files" section so the LLM focuses its
+    // codebase research on these files and their direct dependencies, instead
+    // of performing broad exploratory searches across the entire project.
+    const { anchorFiles, anchorNames } = extractAnchorFiles(inputContent);
+    let anchorSection = '';
+    if (anchorFiles.length > 0) {
+      console.log(`[AnalystAgent] \uD83D\uDCCC Anchor files extracted: [${anchorFiles.join(', ')}]`);
+      anchorSection = `\n## Anchor Files (User-Referenced)\nThe user has explicitly referenced the following files. **Focus your codebase research on these files and their direct dependencies ONLY.** Do NOT search broadly across the project.\n${anchorFiles.map(f => `- \`${f}\``).join('\n')}\n\n**Search strategy**: Start by reading these anchor files. Then identify their imports/dependencies and callers. Do NOT search for unrelated files.\n`;
+    } else {
+      // No explicit file references — extract entity names for focused search
+      const entityPattern = /\b([A-Z][a-zA-Z0-9]{2,}(?:[A-Z][a-z]+)+)\b/g;
+      const entities = [];
+      const entitySeen = new Set();
+      let m;
+      while ((m = entityPattern.exec(inputContent)) !== null) {
+        if (!entitySeen.has(m[1])) {
+          entitySeen.add(m[1]);
+          entities.push(m[1]);
+        }
+      }
+      if (entities.length > 0) {
+        console.log(`[AnalystAgent] \uD83D\uDD0D Inferred entity names: [${entities.slice(0, 8).join(', ')}]`);
+        anchorSection = `\n## Inferred Entities\nNo explicit file references found. The following entity names were extracted from the requirement. **Search for these specific names only** — do NOT perform broad exploratory searches.\n${entities.slice(0, 8).map(e => `- \`${e}\``).join('\n')}\n`;
+      }
+    }
 
     return `You are **Alistair Cockburn** – the world's foremost authority on use cases and requirements engineering.
 You invented the use-case methodology, co-authored the Agile Manifesto, and wrote *Writing Effective Use Cases* (Addison-Wesley, 2000).
@@ -70,7 +171,17 @@ ${jsonInstruction}
 
 ## User Requirement
 ${inputContent}
-${expSection}
+${anchorSection}${expSection}
+## Codebase Research Rules (CRITICAL)
+- If Anchor Files are listed above: read ONLY those files and their direct imports/callers. Do NOT search for other files.
+- If Inferred Entities are listed above: search for ONLY those entity names. Do NOT broaden the search.
+- **Search budget**: at most 6 file searches and 4 file reads. Stop once you have enough context to write the requirement.
+- **Relevance gate**: before reading any file, ask: "Is this directly needed to understand the user's requirement?" If no, skip it.
+- Do NOT perform broad pattern searches like "Show.*Food" or "Close.*Menu" that match unrelated files.
+
+## Output Language
+**You MUST write the entire requirement document in Chinese (简体中文).** All section headings, descriptions, user stories, acceptance criteria, and explanations must be in Chinese. Only keep technical terms, proper nouns, file names, and code identifiers in English.
+
 ## Instructions
 First output the JSON metadata block (as instructed above), then write the full Markdown document.
 Remember: NO technical details, NO code, NO architecture.
@@ -123,4 +234,4 @@ Remember: NO technical details, NO code, NO architecture.
   }
 }
 
-module.exports = { AnalystAgent };
+module.exports = { AnalystAgent, extractAnchorFiles };

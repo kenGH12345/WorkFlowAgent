@@ -80,7 +80,7 @@ class CIIntegration {
       }).trim();
       if (remote.includes('github.com'))  return 'github';
       if (remote.includes('gitlab.com') || remote.includes('gitlab')) return 'gitlab';
-    } catch (_) {}
+    } catch (err) { console.warn(`[CIIntegration] Failed to detect git remote: ${err.message}`); }
     return 'local';
   }
 

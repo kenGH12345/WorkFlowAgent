@@ -88,6 +88,11 @@ class RollbackCoordinator {
     }
 
     console.log(`[RollbackCoordinator] ⏪ Rollback complete: ${fromStage} → ${ROLLBACK_TARGET[fromStage] || 'previous stage'}`);
+
+    // R5-3 audit: invalidate subtask cache on full-stage rollback.
+    // Without this, a subsequent analyseRollbackStrategy() call may return
+    // SUBTASK_RETRY using stale cached results from the failed run.
+    this.invalidateSubtaskCache(fromStage);
   }
 
   // ── Defect C fix: Fine-grained subtask-level rollback ───────────────────────
@@ -239,12 +244,12 @@ const STAGE_SUBTASKS = {
 /**
  * Maps the failing stage to the Bus sender role whose messages are now stale.
  * When ARCHITECT fails, ANALYST's output is stale (ARCHITECT will re-consume it).
- * When CODE fails, ARCHITECT's output is stale (DEVELOPER will re-consume it).
+ * When CODE fails, PLANNER's output is stale (DEVELOPER will re-consume it via PLAN→CODE chain).
  * When TEST fails, DEVELOPER's output is stale (TESTER will re-consume it).
  */
 const ROLLBACK_BUS_SENDER = {
   [WorkflowState.ARCHITECT]: AgentRole.ANALYST,
-  [WorkflowState.CODE]:      AgentRole.ARCHITECT,
+  [WorkflowState.CODE]:      AgentRole.PLANNER,
   [WorkflowState.TEST]:      AgentRole.DEVELOPER,
 };
 
@@ -253,7 +258,7 @@ const ROLLBACK_BUS_SENDER = {
  */
 const ROLLBACK_TARGET = {
   [WorkflowState.ARCHITECT]: WorkflowState.ANALYSE,
-  [WorkflowState.CODE]:      WorkflowState.ARCHITECT,
+  [WorkflowState.CODE]:      WorkflowState.PLAN,
   [WorkflowState.TEST]:      WorkflowState.CODE,
 };
 
@@ -262,7 +267,7 @@ const ROLLBACK_TARGET = {
  */
 const ROLLBACK_CACHE_KEYS = {
   [WorkflowState.ARCHITECT]: ['Architecture', WorkflowState.ARCHITECT],
-  [WorkflowState.CODE]:      ['Architecture', 'Code', WorkflowState.ARCHITECT, WorkflowState.CODE],
+  [WorkflowState.CODE]:      ['Architecture', 'Plan', 'Code', WorkflowState.ARCHITECT, WorkflowState.PLAN, WorkflowState.CODE],
   [WorkflowState.TEST]:      ['Code', WorkflowState.CODE, 'TestReport'],
 };
 

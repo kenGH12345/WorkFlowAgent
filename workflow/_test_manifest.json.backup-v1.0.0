@@ -1,0 +1,25 @@
+{
+  "version": "1.0.0",
+  "projectId": "test-project-3",
+  "currentState": "ANALYSE",
+  "createdAt": "2026-03-20T05:46:51.854Z",
+  "updatedAt": "2026-03-20T05:46:51.855Z",
+  "history": [
+    {
+      "fromState": "INIT",
+      "toState": "ANALYSE",
+      "timestamp": "2026-03-20T05:46:51.855Z",
+      "artifactPath": null,
+      "note": "First transition"
+    }
+  ],
+  "artifacts": {
+    "requirementMd": null,
+    "architectureMd": null,
+    "codeDiff": null,
+    "executionPlanMd": null,
+    "testReportMd": null
+  },
+  "risks": [],
+  "meta": {}
+}

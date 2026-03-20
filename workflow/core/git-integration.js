@@ -571,7 +571,7 @@ class GitIntegration {
     if (body) {
       lines.push(body);
     } else {
-      // Auto-generate body from recent git log
+      // FIX(Defect #2): Auto-generate richer body from git log + diff statistics
       try {
         const log = this.getRecentLog({ limit: 10 });
         if (log.length > 0) {
@@ -580,7 +580,20 @@ class GitIntegration {
             lines.push(`- ${entry.subject || entry.message}`);
           }
         }
-      } catch (_) {}
+      } catch (err) { console.warn(`[GitIntegration] Failed to get git log for changelog: ${err.message}`); }
+
+      // Add diff statistics from git diff --stat
+      try {
+        const diffStatCmd = `git diff --stat ${baseBranch}...${head}`;
+        const diffStatOutput = execSync(diffStatCmd, {
+          cwd: this._repoPath,
+          encoding: 'utf-8',
+          timeout: 10000,
+        }).trim();
+        if (diffStatOutput) {
+          lines.push('', '## Diff Statistics', '', '```', diffStatOutput, '```');
+        }
+      } catch (_) { /* Non-fatal: diff stat not available */ }
     }
 
     lines.push('', '---');

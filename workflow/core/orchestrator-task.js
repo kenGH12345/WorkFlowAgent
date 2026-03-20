@@ -19,9 +19,20 @@
 const fs = require('fs');
 const path = require('path');
 const { PATHS, HOOK_EVENTS } = require('./constants');
-const { AgentRole } = require('./types');
+const { AgentRole, WorkflowState } = require('./types');
 const { ExperienceType, ExperienceCategory } = require('./experience-store');
 const { buildAgentPrompt } = require('./prompt-builder');
+// B-fix: import stage runners + context builders so task-based mode can reuse
+// the same ANALYSE/ARCHITECT stages and per-task context injection as sequential mode.
+const { _runAnalyst, _runArchitect } = require('./orchestrator-stages');
+const {
+  buildDeveloperContextBlock,
+  buildTesterContextBlock,
+  buildDeveloperUpstreamCtx,
+  buildTesterUpstreamCtx,
+} = require('./orchestrator-stage-helpers');
+const { CodeReviewAgent } = require('./code-review-agent');
+const { ArchitectureReviewAgent } = require('./architecture-review-agent');
 
 // ─── Module-level helpers ─────────────────────────────────────────────────────
 
@@ -29,7 +40,8 @@ const { buildAgentPrompt } = require('./prompt-builder');
  * D2 optimisation: maps AgentRole → WorkflowState for getRelevant() context selection.
  */
 function _roleToStageForTask(role) {
-const { WorkflowState } = require('./types');
+  // R1-3 audit: removed redundant require('./types') – WorkflowState is already
+  // imported at the top of orchestrator-task.js via the AgentRole/WorkflowState import.
   const map = {
     [AgentRole.ANALYST]:   WorkflowState.ANALYSE,
     [AgentRole.ARCHITECT]: WorkflowState.ARCHITECT,
@@ -61,6 +73,70 @@ module.exports = {
     // 1–3. Shared startup
     const resumeState = await this._initWorkflow();
     console.log(`[Orchestrator] Task-based mode resume state: ${resumeState} (reserved for future checkpoint-resume support).`);
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // B-fix: ANALYSE + ARCHITECT stages BEFORE parallel task execution.
+    //
+    // PROBLEM: The original runTaskBased() completely skipped requirement analysis
+    // and architecture design. Tasks were executed by _rawLlmCall with zero adapter
+    // context, zero context builder, zero self-correction, and zero document output.
+    // This produced dramatically lower quality than the sequential run() pipeline.
+    //
+    // FIX: Run the SAME _runAnalyst and _runArchitect functions used by sequential
+    // run(). This produces requirements.md + architecture.md with full adapter
+    // context (11 plugins), self-correction loops, quality gates, and rollback.
+    // Tasks then execute WITH these documents as upstream context.
+    // ════════════════════════════════════════════════════════════════════════════
+    console.log(`\n[Orchestrator] ════ Phase 1: Requirement Analysis & Architecture Design ════`);
+    console.log(`[Orchestrator] Running ANALYSE + ARCHITECT stages before task decomposition...\n`);
+
+    this.obs.stageStart('task-based:ANALYSE');
+    let analyseResult;
+    try {
+      analyseResult = await _runAnalyst.call(this, goal);
+      this.obs.stageEnd('task-based:ANALYSE', 'ok');
+      console.log(`[Orchestrator] ✅ ANALYSE stage complete → requirements.md produced.`);
+      // Stage Output Report: transparent artifact summary
+      try {
+        const { reportStageOutput } = require('./stage-output-reporter');
+        reportStageOutput('ANALYSE', PATHS.OUTPUT_DIR, { artifactPath: typeof analyseResult === 'string' ? analyseResult : undefined });
+      } catch (_) { /* non-fatal */ }
+    } catch (err) {
+      this.obs.stageEnd('task-based:ANALYSE', 'error');
+      this.obs.recordError('task-based:ANALYSE', err.message);
+      console.error(`[Orchestrator] ❌ ANALYSE stage failed: ${err.message}`);
+      throw err;
+    }
+
+    // Advance state machine: INIT → ANALYSE
+    if (analyseResult && !(analyseResult && analyseResult.__alreadyTransitioned)) {
+      await this.stateMachine.transition(analyseResult, 'Task-based: INIT → ANALYSE');
+    }
+
+    this.obs.stageStart('task-based:ARCHITECT');
+    let architectResult;
+    try {
+      architectResult = await _runArchitect.call(this);
+      this.obs.stageEnd('task-based:ARCHITECT', 'ok');
+      console.log(`[Orchestrator] ✅ ARCHITECT stage complete → architecture.md produced.`);
+      // Stage Output Report: transparent artifact summary
+      try {
+        const { reportStageOutput } = require('./stage-output-reporter');
+        reportStageOutput('ARCHITECT', PATHS.OUTPUT_DIR, { artifactPath: typeof architectResult === 'string' ? architectResult : undefined });
+      } catch (_) { /* non-fatal */ }
+    } catch (err) {
+      this.obs.stageEnd('task-based:ARCHITECT', 'error');
+      this.obs.recordError('task-based:ARCHITECT', err.message);
+      console.error(`[Orchestrator] ❌ ARCHITECT stage failed: ${err.message}`);
+      throw err;
+    }
+
+    // Advance state machine: ANALYSE → ARCHITECT
+    if (architectResult && !(architectResult && architectResult.__alreadyTransitioned)) {
+      await this.stateMachine.transition(architectResult, 'Task-based: ANALYSE → ARCHITECT');
+    }
+
+    console.log(`\n[Orchestrator] ════ Phase 2: Task-Based Parallel Execution ════\n`);
 
     // Register all tasks
     for (const def of taskDefs) {
@@ -231,6 +307,9 @@ module.exports = {
 
       await this.hooks.emit(HOOK_EVENTS.TASK_CLAIMED, { agentId, taskId: task.id });
 
+      // Set current agent ID for optimistic lock tracking in _applyFileReplacements
+      this._currentAgentId = agentId;
+
       try {
         let skillContent = '';
         if (task.skill) {
@@ -309,7 +388,18 @@ module.exports = {
   },
 
   /**
-   * Executes a single task using the appropriate agent.
+   * Executes a single task using the appropriate agent, context builder,
+   * and self-correction loop — matching sequential run() quality.
+   *
+   * B-fix: COMPLETELY REWRITTEN to address 8 critical deficiencies:
+   *   1. ✅ Uses context builders (adapter plugins, token budget, compression)
+   *   2. ✅ Uses agent.run() instead of _rawLlmCall (structured output, JSON instruction)
+   *   3. ✅ Full self-correction / review loops (CodeReviewAgent, ArchitectureReviewAgent)
+   *   4. ✅ Upstream context from ANALYSE + ARCHITECT documents
+   *   5. ✅ Adapter Telemetry and BlockCompressor integration
+   *   6. ✅ SmartContext filtering (skip irrelevant adapters)
+   *   7. ✅ Token Budget Guard with priority-based truncation
+   *   8. ✅ Writes output to proper artifact files (not just in-memory strings)
    *
    * @param {Task} task
    * @param {string} expContext
@@ -317,6 +407,7 @@ module.exports = {
    * @returns {object} result
    */
   async _executeTask(task, expContext, skillContent) {
+    // ── Role Inference ──────────────────────────────────────────────────────
     let role = AgentRole.DEVELOPER;
     if (task.agentRole && this.agents[task.agentRole]) {
       role = task.agentRole;
@@ -334,16 +425,17 @@ module.exports = {
       }
     }
 
+    // ── Prepare task-specific context ───────────────────────────────────────
     const agentsMdContent = this._agentsMdContent ?? '';
 
-    // Cross-stage context injection
+    // Cross-stage context injection (includes ANALYSE + ARCHITECT output summaries)
     let crossStageCtx = '';
     if (this.stageCtx) {
       const currentStage = _roleToStageForTask(role);
       const taskHints = `${task.title ?? ''} ${task.description ?? ''}`;
       crossStageCtx = currentStage
-        ? this.stageCtx.getRelevant(currentStage, { taskHints, maxChars: 1200 })
-        : this.stageCtx.getAll([], 1200);
+        ? this.stageCtx.getRelevant(currentStage, { taskHints, maxChars: 1500 })
+        : this.stageCtx.getAll([], 1500);
     }
 
     // CodeGraph: on-demand symbol lookup
@@ -351,16 +443,41 @@ module.exports = {
     if (role === AgentRole.DEVELOPER || role === AgentRole.ARCHITECT) {
       try {
         const taskHint = `${task.title ?? ''} ${task.description ?? ''}`;
+        // R1-1 audit: extended regex to capture both PascalCase and camelCase identifiers
+        // (previously only PascalCase was matched, missing most JS function names).
+        // Also filter common English words and prefer code-like identifiers.
+        const COMMON_WORDS = new Set([
+          'This', 'That', 'These', 'Those', 'With', 'From', 'Should', 'Would', 'Could',
+          'When', 'Where', 'What', 'Which', 'Each', 'Every', 'Some', 'None', 'Only',
+          'Before', 'After', 'Between', 'During', 'About', 'Below', 'Above', 'Under',
+          'Must', 'Also', 'Will', 'Shall', 'Note', 'Make', 'Uses', 'Used', 'Using',
+        ]);
         const identifiers = [...new Set(
-          (taskHint.match(/\b[A-Z][a-zA-Z0-9]{2,}\b/g) || [])
-            .filter(id => id.length >= 3 && id.length <= 40)
-            .slice(0, 15)
+          (taskHint.match(/\b[A-Za-z][a-zA-Z0-9_]{3,}\b/g) || [])
+            .filter(id => id.length >= 4 && id.length <= 40)
+            .filter(id => !COMMON_WORDS.has(id))
+            .filter(id => /[a-z][A-Z]|[A-Z][a-z]|_/.test(id))
+            .slice(0, 20)
         )];
         if (identifiers.length > 0) {
           const graphMd = this.codeGraph.querySymbolsAsMarkdown(identifiers);
           if (graphMd && !graphMd.includes('_Code graph not available') && !graphMd.includes('_No matching')) {
             codeGraphContext = graphMd;
             console.log(`[Orchestrator] 🗺️  Code graph: queried ${identifiers.length} symbol(s) for task "${task.id}"`);
+          } else {
+            // P1: Fallback to semantic search — if exact symbol lookup found nothing,
+            // use the full task hint as a natural-language search query to leverage
+            // the inverted token index + TF-IDF scoring.
+            const searchQuery = taskHint.slice(0, 120);
+            const searchResults = this.codeGraph.search(searchQuery, { limit: 5 });
+            if (searchResults.length > 0) {
+              const searchNames = searchResults.map(s => s.name);
+              const fallbackMd = this.codeGraph.querySymbolsAsMarkdown(searchNames);
+              if (fallbackMd && !fallbackMd.includes('_No matching')) {
+                codeGraphContext = fallbackMd;
+                console.log(`[Orchestrator] 🗺️  Code graph (semantic fallback): found ${searchResults.length} symbol(s) for task "${task.id}"`);
+              }
+            }
           }
         }
       } catch (err) {
@@ -374,68 +491,188 @@ module.exports = {
       ? `## Global Goal\nThis task is part of a larger objective: ${globalGoal.slice(0, 300)}${globalGoal.length > 300 ? '...' : ''}\nEnsure your output aligns with and contributes to this overall goal.`
       : '';
 
-    const dynamicInput = [
-      goalContext,
-      skillContent    ? `## Skill Context\n${skillContent}` : '',
-      expContext      ? `## Experience Context\n${expContext}` : '',
-      agentsMdContent ? `## Project Context (AGENTS.md)\n${agentsMdContent}` : '',
-      crossStageCtx   ? crossStageCtx : '',
-      codeGraphContext ? `## Code Graph Context\n${codeGraphContext}` : '',
-      `## Task\n**${task.title}**\n\n${task.description}`,
-    ].filter(Boolean).join('\n\n');
+    // Task-specific instruction block
+    const taskBlock = [
+      `## Task Assignment`,
+      `**Task ID**: ${task.id}`,
+      `**Title**: ${task.title}`,
+      `**Description**:`,
+      task.description,
+      task.deps && task.deps.length > 0 ? `**Dependencies**: ${task.deps.join(', ')}` : '',
+    ].filter(Boolean).join('\n');
 
-    let optimisedPrompt = dynamicInput;
-    try {
-      const result = buildAgentPrompt(role, dynamicInput);
-      optimisedPrompt = result.prompt;
-      console.log(`[Orchestrator] LLM call for ${role} (task: ${task.id}): ~${result.meta.estimatedTokens} tokens`);
-    } catch (err) {
-      console.warn(`[Orchestrator] buildAgentPrompt failed for role "${role}" (task: ${task.id}): ${err.message}. Using raw prompt.`);
-    }
-    const output = await this._rawLlmCall(optimisedPrompt);
+    // ══════════════════════════════════════════════════════════════════════════
+    // B-fix: CONTEXT BUILDER INTEGRATION
+    //
+    // Instead of manually splicing a flat prompt string, we now build labelled
+    // context blocks through the SAME context builder pipeline used by sequential
+    // run(). This provides:
+    //   - Full adapter plugin blocks (Security CVE, Package Registry, Code Quality, etc.)
+    //   - Token budget guard with priority-based truncation
+    //   - Block compression (Markdown → JSON shorthand)
+    //   - Adapter telemetry tracking (injection/truncation/drop/reference)
+    //   - SmartContext filtering (skip irrelevant adapters)
+    // ══════════════════════════════════════════════════════════════════════════
 
-    // Parallel mode quality gate: lightweight review for ARCHITECT/DEVELOPER
+    let output = '';
     let reviewRiskNotes = [];
-    if (role === AgentRole.ARCHITECT && output && output.length > 200) {
+    const uid = require('crypto').randomUUID().slice(0, 8);
+
+    if (role === AgentRole.DEVELOPER) {
+      // ── DEVELOPER task: use full developer context builder pipeline ──────
       try {
-const { ArchitectureReviewAgent } = require('./architecture-review-agent');
-        const uid = require('crypto').randomUUID();
-        const tmpPath = path.join(PATHS.OUTPUT_DIR, `arch-task-${uid}.tmp.md`);
-        fs.writeFileSync(tmpPath, output, 'utf-8');
-        const reviewer = new ArchitectureReviewAgent(this._rawLlmCall, { maxRounds: 1, verbose: false, outputDir: PATHS.OUTPUT_DIR });
-        const reviewResult = await reviewer.review(tmpPath, null);
-        reviewRiskNotes = reviewResult.riskNotes || [];
-        if (reviewRiskNotes.length > 0) {
-          console.warn(`[Orchestrator] ⚠️  Parallel arch review (task ${task.id}): ${reviewRiskNotes.length} issue(s) found.`);
-          for (const note of reviewRiskNotes) {
-            this.stateMachine.recordRisk(note.includes('(high)') ? 'high' : 'medium', `[ParallelArch:${task.id}] ${note}`, false);
-          }
-          this.stateMachine.flushRisks();
+        // Build upstream context (includes architecture.md, requirements.md, etc.)
+        const upstreamCtx = buildDeveloperUpstreamCtx(this);
+
+        // Build full developer context block with adapter plugins
+        const devCtxBlock = await buildDeveloperContextBlock(this, upstreamCtx);
+        // Inject task-specific context into the assembled prompt
+        const assembledCtx = devCtxBlock.assembled || devCtxBlock;
+        const taskSpecificInput = [
+          goalContext,
+          typeof assembledCtx === 'string' ? assembledCtx : '',
+          skillContent ? `## Skill Context\n${skillContent}` : '',
+          codeGraphContext ? `## Code Graph Context\n${codeGraphContext}` : '',
+          taskBlock,
+        ].filter(Boolean).join('\n\n');
+
+        // Write to temp file as agent input
+        const tmpInputPath = path.join(PATHS.OUTPUT_DIR, `task-${task.id}-${uid}-input.md`);
+        fs.writeFileSync(tmpInputPath, taskSpecificInput, 'utf-8');
+
+        // Use agent.run() — structured output with JSON instruction, proper parsing
+        const outputPath = await this.agents[AgentRole.DEVELOPER].run(tmpInputPath, null, devCtxBlock);
+        output = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf-8') : '';
+
+        // Adapter Telemetry: scan LLM output for block references
+        if (this._adapterTelemetry && output) {
+          this._adapterTelemetry.scanReferences(output, 'DEVELOPER');
         }
-        try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
-      } catch (err) {
-        console.warn(`[Orchestrator] Parallel arch review failed for task "${task.id}" (non-fatal): ${err.message}`);
+
+        // Self-correction: CodeReviewAgent review (same as sequential _runDeveloper)
+        if (output && output.length > 200) {
+          try {
+            const reviewer = new CodeReviewAgent(this._rawLlmCall, {
+              maxRounds: 1,
+              verbose: false,
+              outputDir: PATHS.OUTPUT_DIR,
+            });
+            const reviewResult = await reviewer.review(outputPath, null);
+            reviewRiskNotes = reviewResult.riskNotes || [];
+            if (reviewRiskNotes.length > 0) {
+              console.warn(`[Orchestrator] ⚠️  Code review (task ${task.id}): ${reviewRiskNotes.length} issue(s) found.`);
+              for (const note of reviewRiskNotes) {
+                this.stateMachine.recordRisk(note.includes('(high)') ? 'high' : 'medium', `[TaskCode:${task.id}] ${note}`, false);
+              }
+              this.stateMachine.flushRisks();
+            }
+          } catch (revErr) {
+            console.warn(`[Orchestrator] Code review for task "${task.id}" failed (non-fatal): ${revErr.message}`);
+          }
+        }
+
+        // Apply file replacements from the developer output
+        if (output) {
+          const applyResult = this._applyFileReplacements(output);
+          if (applyResult.applied > 0) {
+            console.log(`[Orchestrator] 🔧 Task ${task.id}: Applied ${applyResult.applied} replacement(s).`);
+          }
+        }
+
+        // Clean up temp input file
+        try { fs.unlinkSync(tmpInputPath); } catch { /* ignore */ }
+
+      } catch (ctxErr) {
+        console.warn(`[Orchestrator] Developer context builder failed for task "${task.id}" (non-fatal, falling back to buildAgentPrompt): ${ctxErr.message}`);
+        // Fallback: use buildAgentPrompt (still better than raw _rawLlmCall)
+        output = await this._executeTaskFallback(task, expContext, skillContent, role, goalContext, agentsMdContent, crossStageCtx, codeGraphContext, taskBlock);
       }
-    } else if (role === AgentRole.DEVELOPER && output && output.length > 200) {
+
+    } else if (role === AgentRole.TESTER) {
+      // ── TESTER task: use full tester context builder pipeline ────────────
       try {
-const { CodeReviewAgent } = require('./code-review-agent');
-        const uid = require('crypto').randomUUID();
-        const tmpPath = path.join(PATHS.OUTPUT_DIR, `code-task-${uid}.tmp.md`);
-        fs.writeFileSync(tmpPath, output, 'utf-8');
-        const reviewer = new CodeReviewAgent(this._rawLlmCall, { maxRounds: 1, verbose: false, outputDir: PATHS.OUTPUT_DIR });
-        const reviewResult = await reviewer.review(tmpPath, null);
-        reviewRiskNotes = reviewResult.riskNotes || [];
-        if (reviewRiskNotes.length > 0) {
-          console.warn(`[Orchestrator] ⚠️  Parallel code review (task ${task.id}): ${reviewRiskNotes.length} issue(s) found.`);
-          for (const note of reviewRiskNotes) {
-            this.stateMachine.recordRisk(note.includes('(high)') ? 'high' : 'medium', `[ParallelCode:${task.id}] ${note}`, false);
-          }
-          this.stateMachine.flushRisks();
+        const upstreamCtx = buildTesterUpstreamCtx(this);
+        const testCtxBlock = await buildTesterContextBlock(this, upstreamCtx, null /* no tcExecutionReport in task mode */);
+        const assembledCtx = testCtxBlock.assembled || testCtxBlock;
+        const taskSpecificInput = [
+          goalContext,
+          typeof assembledCtx === 'string' ? assembledCtx : '',
+          skillContent ? `## Skill Context\n${skillContent}` : '',
+          taskBlock,
+        ].filter(Boolean).join('\n\n');
+
+        const tmpInputPath = path.join(PATHS.OUTPUT_DIR, `task-${task.id}-${uid}-input.md`);
+        fs.writeFileSync(tmpInputPath, taskSpecificInput, 'utf-8');
+
+        const outputPath = await this.agents[AgentRole.TESTER].run(tmpInputPath, null, testCtxBlock);
+        output = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf-8') : '';
+
+        if (this._adapterTelemetry && output) {
+          this._adapterTelemetry.scanReferences(output, 'TESTER');
         }
-        try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
-      } catch (err) {
-        console.warn(`[Orchestrator] Parallel code review failed for task "${task.id}" (non-fatal): ${err.message}`);
+
+        try { fs.unlinkSync(tmpInputPath); } catch { /* ignore */ }
+      } catch (ctxErr) {
+        console.warn(`[Orchestrator] Tester context builder failed for task "${task.id}" (non-fatal, falling back): ${ctxErr.message}`);
+        output = await this._executeTaskFallback(task, expContext, skillContent, role, goalContext, agentsMdContent, crossStageCtx, codeGraphContext, taskBlock);
       }
+
+    } else if (role === AgentRole.ARCHITECT) {
+      // ── ARCHITECT task: use buildAgentPrompt + ArchitectureReviewAgent ───
+      // Note: The main architecture is already done in Phase 1. Task-level
+      // ARCHITECT roles handle sub-architecture decisions (schema design, etc.)
+      try {
+        const dynamicInput = [
+          goalContext,
+          skillContent    ? `## Skill Context\n${skillContent}` : '',
+          expContext      ? `## Experience Context\n${expContext}` : '',
+          agentsMdContent ? `## Project Context (AGENTS.md)\n${agentsMdContent}` : '',
+          crossStageCtx   ? crossStageCtx : '',
+          codeGraphContext ? `## Code Graph Context\n${codeGraphContext}` : '',
+          taskBlock,
+        ].filter(Boolean).join('\n\n');
+
+        const tmpInputPath = path.join(PATHS.OUTPUT_DIR, `task-${task.id}-${uid}-input.md`);
+        fs.writeFileSync(tmpInputPath, dynamicInput, 'utf-8');
+
+        const outputPath = await this.agents[AgentRole.ARCHITECT].run(tmpInputPath, null);
+        output = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf-8') : '';
+
+        if (this._adapterTelemetry && output) {
+          this._adapterTelemetry.scanReferences(output, 'ARCHITECT');
+        }
+
+        // Self-correction: ArchitectureReviewAgent
+        if (output && output.length > 200) {
+          try {
+            const reviewer = new ArchitectureReviewAgent(this._rawLlmCall, {
+              maxRounds: 1,
+              verbose: false,
+              outputDir: PATHS.OUTPUT_DIR,
+            });
+            const reviewResult = await reviewer.review(outputPath, null);
+            reviewRiskNotes = reviewResult.riskNotes || [];
+            if (reviewRiskNotes.length > 0) {
+              console.warn(`[Orchestrator] ⚠️  Arch review (task ${task.id}): ${reviewRiskNotes.length} issue(s) found.`);
+              for (const note of reviewRiskNotes) {
+                this.stateMachine.recordRisk(note.includes('(high)') ? 'high' : 'medium', `[TaskArch:${task.id}] ${note}`, false);
+              }
+              this.stateMachine.flushRisks();
+            }
+          } catch (revErr) {
+            console.warn(`[Orchestrator] Arch review for task "${task.id}" failed (non-fatal): ${revErr.message}`);
+          }
+        }
+
+        try { fs.unlinkSync(tmpInputPath); } catch { /* ignore */ }
+      } catch (ctxErr) {
+        console.warn(`[Orchestrator] Architect execution failed for task "${task.id}" (non-fatal, falling back): ${ctxErr.message}`);
+        output = await this._executeTaskFallback(task, expContext, skillContent, role, goalContext, agentsMdContent, crossStageCtx, codeGraphContext, taskBlock);
+      }
+
+    } else {
+      // ── ANALYST task (rare in task-based mode — main analysis done in Phase 1)
+      output = await this._executeTaskFallback(task, expContext, skillContent, role, goalContext, agentsMdContent, crossStageCtx, codeGraphContext, taskBlock);
     }
 
     const experience = {
@@ -448,7 +685,37 @@ const { CodeReviewAgent } = require('./code-review-agent');
       codeExample: null,
     };
 
-    return { summary: output, raw: output, experience };
+    return { summary: output, raw: output, experience, reviewRiskNotes };
+  },
+
+  /**
+   * Fallback task execution using buildAgentPrompt + _rawLlmCall.
+   * Used when context builder fails or for ANALYST role tasks.
+   * Still significantly better than the old bare _rawLlmCall approach
+   * because it uses buildAgentPrompt for structured output formatting.
+   *
+   * @private
+   */
+  async _executeTaskFallback(task, expContext, skillContent, role, goalContext, agentsMdContent, crossStageCtx, codeGraphContext, taskBlock) {
+    const dynamicInput = [
+      goalContext,
+      skillContent    ? `## Skill Context\n${skillContent}` : '',
+      expContext      ? `## Experience Context\n${expContext}` : '',
+      agentsMdContent ? `## Project Context (AGENTS.md)\n${agentsMdContent}` : '',
+      crossStageCtx   ? crossStageCtx : '',
+      codeGraphContext ? `## Code Graph Context\n${codeGraphContext}` : '',
+      taskBlock,
+    ].filter(Boolean).join('\n\n');
+
+    let optimisedPrompt = dynamicInput;
+    try {
+      const result = buildAgentPrompt(role, dynamicInput);
+      optimisedPrompt = result.prompt;
+      console.log(`[Orchestrator] LLM call for ${role} (task: ${task.id}): ~${result.meta.estimatedTokens} tokens`);
+    } catch (err) {
+      console.warn(`[Orchestrator] buildAgentPrompt failed for role "${role}" (task: ${task.id}): ${err.message}. Using raw prompt.`);
+    }
+    return this._rawLlmCall(optimisedPrompt);
   },
 
   /**
@@ -663,6 +930,62 @@ const { CodeReviewAgent } = require('./code-review-agent');
         if (t.title.length > avgLen * 3 && t.title.length > 40) {
           warnings.push(`Task "${t.id}" title is unusually long (${t.title.length} chars vs avg ${Math.round(avgLen)}). May need further decomposition.`);
         }
+      }
+    }
+
+    // Check 4: Parallelism Ratio – Anti-Serial-Collapse Guard
+    // Detects task graphs that appear parallel but actually form a long serial
+    // chain, causing concurrency workers to sit idle. Uses the DAG critical path
+    // (longest dependency chain) computed via topological-order DP.
+    if (sorted === taskDefs.length && taskDefs.length >= 3) {
+      // Compute longest path (critical path depth) via topological DP.
+      // Re-derive topological order from adjacency (already validated acyclic).
+      const inDeg2 = {};
+      for (const t of taskDefs) { inDeg2[t.id] = 0; }
+      for (const t of taskDefs) {
+        for (const dep of t.deps) {
+          if (idSet.has(dep)) inDeg2[t.id]++;
+        }
+      }
+      const topoQueue = Object.keys(inDeg2).filter(id => inDeg2[id] === 0);
+      const topoOrder = [];
+      while (topoQueue.length > 0) {
+        const node = topoQueue.shift();
+        topoOrder.push(node);
+        for (const next of (adjacency[node] || [])) {
+          inDeg2[next]--;
+          if (inDeg2[next] === 0) topoQueue.push(next);
+        }
+      }
+
+      // DP: longest path from any source to each node
+      const depth = {};
+      for (const id of topoOrder) { depth[id] = 1; } // each node has depth >= 1
+      for (const id of topoOrder) {
+        for (const next of (adjacency[id] || [])) {
+          if (depth[id] + 1 > depth[next]) {
+            depth[next] = depth[id] + 1;
+          }
+        }
+      }
+      const maxChainDepth = Math.max(...Object.values(depth));
+      const parallelismRatio = taskDefs.length / maxChainDepth;
+
+      if (parallelismRatio <= 1.0 && taskDefs.length >= 4) {
+        // Fully serial chain: every task depends on the previous one
+        issues.push(
+          `Serial collapse detected: all ${taskDefs.length} tasks form a single dependency chain ` +
+          `(max chain depth = ${maxChainDepth}, parallelism ratio = ${parallelismRatio.toFixed(2)}). ` +
+          `Parallel execution would degrade to sequential. Consider restructuring tasks ` +
+          `to allow independent work items, or fall back to sequential mode.`
+        );
+      } else if (parallelismRatio <= 1.2 && taskDefs.length >= 3) {
+        // Near-serial: very little actual parallelism available
+        warnings.push(
+          `Low parallelism ratio (${parallelismRatio.toFixed(2)}): ${taskDefs.length} tasks with ` +
+          `max chain depth ${maxChainDepth}. Most workers will be idle during execution. ` +
+          `Effective concurrency ≈ ${parallelismRatio.toFixed(1)}x.`
+        );
       }
     }
 

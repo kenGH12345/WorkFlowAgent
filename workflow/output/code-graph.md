@@ -1,124 +1,165 @@
-## Code Graph (517 symbols, 13292 call edges)
+## Code Graph (947 symbols, 31533 call edges)
 
-> Generated: 2026-03-15
-> Query: `/graph search <keyword>` | `/graph file <path>` | `/graph calls <symbol>`
+> Generated: 2026-03-17
+> Query: `/graph search <keyword>` | `/graph file <path>` | `/graph calls <symbol>` | `/graph hotspot [N]`
 
-### agents/analyst-agent.js
-- `class` **AnalystAgent** → 6 call(s) // - MUST focus solely on clarifying WHAT the user wants, not H
-- `method` **constructor**(llmCall, hookEmitter) → 5 call(s)
-- `method` **buildPrompt**(inputContent, expContext = null) → 5 call(s)
-- `method` **parseResponse**(llmResponse) → 5 call(s)
+### 🔥 Hotspot Analysis (Top referenced symbols)
 
-### agents/architect-agent.js
-- `class` **ArchitectAgent** → 6 call(s) // - MUST focus on system design: components, interfaces, data 
-- `method` **constructor**(llmCall, hookEmitter) → 5 call(s)
-- `method` **buildPrompt**(inputContent, expContext = null) → 5 call(s)
-- `method` **parseResponse**(llmResponse) → 5 call(s)
+> Categories: 🔧 Utility(74) | 🏗️ Foundation(124) | 🔀 Hub(52) | 🚪 Entry(98) | 🍃 Leaf(474) | 👻 Orphan(0)
 
-### agents/base-agent.js
-- `class` **BaseAgent** → 10 call(s)
-- `method` **run**(inputFilePath = null, rawInput = null, e) → 9 call(s)
-- `method` **buildPrompt**(inputContent, expContext = null) → 9 call(s)
-- `method` **parseResponse**(llmResponse) → 9 call(s)
-- `method` **assertAllowed**(action) → 9 call(s)
-- `method` **_readInput**(inputFilePath, rawInput) → 9 call(s)
-- `method` **_writeOutput**(content) → 9 call(s)
+- 🔧 **ExperienceStore** `[Utility]` ← 190 refs, → 24 calls | `workflow/core/experience-store.js`:26
+- 🔀 **search**(query, { kind = null, file = null, limit) `[Hub]` ← 138 refs, → 70 calls | `workflow/core/code-graph.js`:320
+- 🔧 **CodeReviewAgent** `[Utility]` ← 131 refs, → 39 calls | `workflow/core/code-review-agent.js`:375
+- 🔧 **SelfCorrectionEngine** `[Utility]` ← 115 refs, → 29 calls | `workflow/core/clarification-engine.js`:384
+- 🔀 **CodeGraph** `[Hub]` ← 112 refs, → 70 calls | `workflow/core/code-graph.js`:62
+- 🔀 **Orchestrator** `[Hub]` ← 111 refs, → 100 calls | `workflow/index.js`:72
+- 🔧 **getAll** `[Utility]` ← 109 refs, → 24 calls | `workflow/core/experience-store.js`:216
+- 🔧 **ArchitectureReviewAgent** `[Utility]` ← 99 refs, → 30 calls | `workflow/core/architecture-review-agent.js`:372
+- 🔧 **getStats** `[Utility]` ← 98 refs, → 24 calls | `workflow/core/complaint-wall.js`:227
+- 🔧 **missing**(reviewResults.filter(r ) `[Utility]` ← 97 refs, → 43 calls | `workflow/core/review-agent-base.js`:159
+- 🔧 **buildAgentPrompt**(role, dynamicInput, contextFiles = [], o) `[Utility]` ← 95 refs, → 35 calls | `workflow/core/prompt-builder.js`:518 // Builds a complete, optimised prompt for a specific
+- 🔧 **formatReport**(result) `[Utility]` ← 95 refs, → 30 calls | `workflow/core/architecture-review-agent.js`:452
+- 🔧 **translateMdFile**(mdPath, llmCall) `[Utility]` ← 93 refs, → 5 calls | `workflow/core/i18n-translator.js`:18 // - If llmCall is not provided, the translation is s
+- 🔀 **querySymbolsAsMarkdown**(symbolNames) `[Hub]` ← 89 refs, → 70 calls | `workflow/core/code-graph.js`:674
+- 🔧 **assert**(condition, msg) `[Utility]` ← 88 refs, → 8 calls | `workflow/tests/prompt-slot-manager.test.js`:14
 
-### agents/developer-agent.js
-- `class` **DeveloperAgent** → 6 call(s) // - MUST strictly follow the architecture document
-- `method` **constructor**(llmCall, hookEmitter) → 5 call(s)
-- `method` **buildPrompt**(inputContent, expContext = null) → 5 call(s)
-- `method` **parseResponse**(llmResponse) → 5 call(s)
+### ♻️ Recommended for Reuse
 
-### agents/tester-agent.js
-- `class` **TesterAgent** → 7 call(s)
-- `method` **constructor**(llmCall, hookEmitter) → 6 call(s)
-- `method` **buildPrompt**(inputContent, expContext = null) → 6 call(s)
-- `method` **parseResponse**(llmResponse) → 6 call(s)
-- `function` **missingSections**(requiredSections.filter(s ) → 6 call(s) // Validates that the report contains required sections.
+> **When writing new code, prefer reusing these widely-used symbols over creating new ones.**
 
-### commands/command-router.js
-- `function` **registerCommand**(name, description, handler) → 31 call(s) // Registers a command handler.
-- `function` **dispatch**(input, context = {}) → 31 call(s) // Parses and dispatches a slash command string.
-- `function` **loadGraph** → 31 call(s)
-- `function` **trendIcon**(t) → 31 call(s)
+- **ExperienceStore** (190 refs) in `workflow/core/experience-store.js`:26
+- **search** (138 refs) in `workflow/core/code-graph.js`:320
+- **CodeReviewAgent** (131 refs) in `workflow/core/code-review-agent.js`:375
+- **SelfCorrectionEngine** (115 refs) in `workflow/core/clarification-engine.js`:384
+- **CodeGraph** (112 refs) in `workflow/core/code-graph.js`:62
+- **Orchestrator** (111 refs) in `workflow/index.js`:72
+- **getAll** (109 refs) in `workflow/core/experience-store.js`:216
+- **ArchitectureReviewAgent** (99 refs) in `workflow/core/architecture-review-agent.js`:372
+- **getStats** (98 refs) in `workflow/core/complaint-wall.js`:227
+- **missing** (97 refs) in `workflow/core/review-agent-base.js`:159
 
-### core/architecture-review-agent.js
-- `function` **buildArchReviewPrompt**(checklist, archContent, requirementText ) → 30 call(s) // Uses evaluationGuide to give LLM precise instructions per it
-- `function` **buildArchFixPrompt**(originalContent, failures) → 30 call(s) // then merges them back. This avoids LLM output truncation on 
-- `function` **applyArchPatches**(originalContent, patchResponse) → 30 call(s) // Finds each "### PATCH: <heading>" block and replaces or appe
-- `function` **extractJsonArray**(response) → 30 call(s)
+### 📁 Symbol Index (by file)
+
+#### test-hotspot.js
+- `function` **main** → 7 call(s)
+
+#### workflow/agents/analyst-agent.js
+- `class` **AnalystAgent** → 14 call(s)
+- `method` **constructor**(llmCall, hookEmitter, opts = {}) → 13 call(s)
+- `method` **buildPrompt**(inputContent, expContext = null) → 13 call(s)
+- `method` **parseResponse**(llmResponse) → 13 call(s)
+- `function` **missingSections**(mandatorySections.filter(s ) → 13 call(s)
+
+#### workflow/agents/architect-agent.js
+- `class` **ArchitectAgent** → 14 call(s)
+- `method` **constructor**(llmCall, hookEmitter, opts = {}) → 13 call(s)
+- `method` **buildPrompt**(inputContent, expContext = null) → 13 call(s)
+- `method` **parseResponse**(llmResponse) → 13 call(s)
+- `function` **missingSections**(mandatorySections.filter(s ) → 13 call(s)
+
+#### workflow/agents/base-agent.js
+- `class` **BaseAgent** → 17 call(s)
+- `method` **run**(inputFilePath = null, rawInput = null, e) → 16 call(s)
+- `method` **buildPrompt**(inputContent, expContext = null) → 16 call(s)
+- `method` **parseResponse**(llmResponse) → 16 call(s)
+- `method` **assertAllowed**(action) → 16 call(s)
+- `method` **_readInput**(inputFilePath, rawInput) → 16 call(s)
+- `method` **_writeOutput**(content) → 16 call(s)
+
+#### workflow/agents/developer-agent.js
+- `class` **DeveloperAgent** → 14 call(s)
+- `method` **constructor**(llmCall, hookEmitter, opts = {}) → 13 call(s)
+- `method` **buildPrompt**(inputContent, expContext = null) → 13 call(s)
+- `method` **parseResponse**(llmResponse) → 13 call(s)
+- `function` **missingSections**(mandatorySections.filter(s ) → 13 call(s)
+
+#### workflow/agents/tester-agent.js
+- `class` **TesterAgent** → 21 call(s)
+- `method` **constructor**(llmCall, hookEmitter, opts = {}) → 20 call(s)
+- `method` **buildPrompt**(inputContent, expContext = null) → 20 call(s)
+- `method` **parseResponse**(llmResponse) → 20 call(s)
+- `function` **missingSections**(requiredSections.filter(s ) → 20 call(s)
+- `function` **missingMandatory**(mandatorySections.filter(s ) → 20 call(s)
+- `function` **coveredIds**(plannedIds.filter(id ) → 20 call(s)
+
+#### workflow/commands/command-router.js
+- `function` **registerCommand**(name, description, handler) → 56 call(s) // Registers a command handler.
+- `function` **dispatch**(input, context = {}) → 56 call(s) // Parses and dispatches a slash command string.
+- `function` **taskDefs**(rawTasks.map((raw, i) → 56 call(s)
+- `function` **taskSummary**(taskDefs.map((t, i) → 57 call(s)
+- `function` **sorted**(entries.sort((a, b) → 57 call(s)
+- `function` **loadGraph** → 56 call(s)
+- `function` **trendIcon**(t) → 56 call(s)
+
+#### workflow/core/agent-output-schema.js
+- `function` **extractJsonBlock**(content) → 13 call(s) // ## Full Markdown narrative follows...
+- `function` **validateJsonBlock**(jsonBlock, role) → 13 call(s) // Validates a parsed JSON block against the expected schema fo
+- `function` **buildJsonBlockInstruction**(role) → 13 call(s) // Injected into agent prompts to instruct the LLM to output st
+- `function` **extractKeyDecisions**(jsonBlock) → 13 call(s) // Falls back to empty array if the block is missing or malform
+- `function` **extractSummary**(jsonBlock, stageName) → 13 call(s) // Extracts a summary string from a structured JSON block.
+
+#### workflow/core/architecture-review-agent.js
+- `function` **buildArchReviewPrompt**(checklist, archContent, requirementText ) → 30 call(s)
+- `function` **buildAdversarialArchPrompt**(checklist, archContent, mainResults, req) → 30 call(s)
+- `function` **passedItems**(mainResults.filter(r ) → 30 call(s)
+- `function` **item**(checklist.find(c ) → 30 call(s)
+- `function` **buildArchFixPrompt**(originalContent, failures) → 30 call(s)
+- `function` **applyArchPatches**(originalContent, patchResponse) → 30 call(s)
 - `class` **ArchitectureReviewAgent** → 30 call(s)
-- `method` **review**(archPath, requirementPath = null) → 30 call(s)
-- `function` **failures**(reviewResults.filter(r ) → 30 call(s)
-- `function` **passes**(reviewResults.filter(r ) → 30 call(s)
-- `function` **nas**(reviewResults.filter(r ) → 30 call(s)
-- `function` **highFailures**(failures.filter(f ) → 30 call(s)
-- `function` **item**(this.checklist.find(c ) → 30 call(s)
-- `function` **finalFailures**(lastReviewResults.filter(r ) → 31 call(s)
-- `function` **finalMissing**(lastReviewResults.filter(r ) → 30 call(s)
-- `function` **riskNotes**(allFailed.map(f ) → 30 call(s)
-- `method` **_runReview**(archContent, requirementText) → 30 call(s)
-- `function` **resultMap**(new Map(parsed.map(r ) → 30 call(s)
+- `method` **constructor**(llmCall, options = {}) → 30 call(s)
+- `method` **_getReviewContent**(inputPath) → 30 call(s)
+- `method` **_buildReviewPrompt**(content, requirementText) → 30 call(s)
+- `method` **_buildAdversarialPrompt**(content, mainResults, requirementText) → 30 call(s)
+- `method` **_buildFixPrompt**(content, failures) → 30 call(s)
+- `method` **_applyFix**(currentContent, rawFixed, mode) → 30 call(s)
+- `method` **_writeBackArtifact**(inputPath, content) → 30 call(s)
+- `method` **_writeReport**(result) → 30 call(s)
+- `method` **_getInvestigationDomain** → 30 call(s)
+- `method` **_getLabelPrefix** → 30 call(s)
+- `method` **_getHeaderLine** → 30 call(s)
+- `method` **_getFailureDefault** → 30 call(s)
 - `method` **formatReport**(result) → 30 call(s)
-- `method` **_emptyResult**(skipReason) → 30 call(s)
-- `method` **_log**(msg) → 30 call(s)
 
-### core/ci-integration.js
-- `class` **CIIntegration** → 23 call(s)
-- `method` **_detectProvider** → 22 call(s)
-- `method` **_detectRepoSlug** → 22 call(s)
-- `method` **runLocalPipeline**({ skipLint = false, skipTest = false, sk) → 22 call(s)
-- `function` **allPassed**(steps.every(s ) → 23 call(s)
-- `method` **_runStep**(name, command) → 22 call(s)
-- `method` **_buildResult**(status, steps, startedAt, message = null) → 22 call(s)
-- `method` **pollGitHub**({ branch = null, workflowName = null, wa) → 22 call(s)
-- `function` **poll** → 22 call(s)
-- `method` **_mapGitHubStatus**(status, conclusion) → 22 call(s)
-- `method` **pollGitLab**({ branch = null, wait = false } = {}) → 22 call(s)
-- `method` **_mapGitLabStatus**(status) → 22 call(s)
-- `method` **_waitForCompletion**(pollFn) → 22 call(s)
-- `method` **_httpGet**(url, headers = {}) → 22 call(s)
-- `function` **req**(lib.request(options, (res) → 22 call(s)
-- `method` **_getCurrentBranch** → 22 call(s)
-- `method` **getSummary**(result) → 22 call(s)
+#### workflow/core/ci-integration.js
+- `class` **CIIntegration** → 31 call(s)
+- `method` **_detectProvider** → 30 call(s)
+- `method` **_detectRepoSlug** → 30 call(s)
+- `method` **runLocalPipeline**({ skipLint = false, skipTest = false, sk) → 30 call(s)
+- `function` **allPassed**(steps.every(s ) → 31 call(s)
+- `method` **_runSyntaxCheck** → 30 call(s)
+- `method` **_runStep**(name, command) → 30 call(s)
+- `method` **_buildResult**(status, steps, startedAt, message = null) → 30 call(s)
+- `method` **pollGitHub**({ branch = null, workflowName = null, wa) → 30 call(s)
+- `function` **poll** → 30 call(s)
+- `method` **_mapGitHubStatus**(status, conclusion) → 30 call(s)
+- `method` **pollGitLab**({ branch = null, wait = false } = {}) → 30 call(s)
+- `method` **_mapGitLabStatus**(status) → 30 call(s)
+- `method` **_waitForCompletion**(pollFn) → 30 call(s)
+- `method` **_httpGet**(url, headers = {}) → 30 call(s)
+- `function` **req**(lib.request(options, (res) → 30 call(s)
+- `method` **_getCurrentBranch** → 30 call(s)
+- `method` **getSummary**(result) → 30 call(s)
 
-### core/clarification-engine.js
-- `function` **detectSignals**(text) → 20 call(s) // Fast, no LLM needed. Used as fallback when semantic mode is 
-- `function` **buildSemanticDetectionPrompt**(text, stageLabel) → 20 call(s) // 3. Understands context: "default" in a config example ≠ unve
-- `function` **parseSemanticSignals**(response) → 20 call(s) // Falls back to empty array on parse error.
-- `function` **buildRefinementPrompt**(originalContent, signals, stageLabel) → 20 call(s) // Builds a refinement prompt that instructs the Agent to fix d
-- `class` **SelfCorrectionEngine** → 20 call(s)
-- `method` **constructor**(llmCall, { maxRounds = 3, verbose = true) → 20 call(s)
-- `method` **correct**(content, stageLabel = 'Review') → 20 call(s)
-- `function` **highSeverityRemaining**(remainingSignals.filter(s ) → 20 call(s)
-- `method` **_deepInvestigate**(content, highSignals, stageLabel) → 20 call(s)
-- `method` **_detectSignals**(text, stageLabel) → 20 call(s)
-- `method` **_log**(msg) → 20 call(s)
-- `class` **ClarificationEngine** → 20 call(s) // Kept so existing callers don't break during migration.
-- `method` **analyse**(proposalText, stageLabel = 'Review') → 20 call(s)
-- `function` **formatClarificationReport**(result) → 20 call(s) // Formats self-correction results as a Markdown block for inje
+#### workflow/core/clarification-engine.js
+- `function` **isMitigated**(mitigationPrefixes.some(p ) → 30 call(s)
+- `function` **detectSignals**(text) → 29 call(s) // Fast, no LLM needed. Used as fallback when semantic mode is 
+- `function` **buildSemanticDetectionPrompt**(text, stageLabel) → 29 call(s) // 3. Understands context: "default" in a config example ≠ unve
+- `function` **buildSemanticVerificationPrompt**(text, stageLabel) → 29 call(s) // or glossed over. This breaks the self-validation loop.
+- `function` **parseSemanticSignals**(response) → 29 call(s) // Falls back to empty array on parse error.
+- `function` **buildRefinementPrompt**(originalContent, signals, stageLabel) → 29 call(s) // Builds a refinement prompt that instructs the Agent to fix d
+- `class` **SelfCorrectionEngine** → 29 call(s)
+- `method` **constructor**(llmCall, { maxRounds = 3, verbose = true) → 29 call(s)
+- `method` **correct**(content, stageLabel = 'Review') → 29 call(s)
+- `function` **currentSignalKey**(signals.map(s ) → 30 call(s)
+- `function` **curTypes**(signals.map(s ) → 30 call(s)
+- `function` **highSeverityRemaining**(remainingSignals.filter(s ) → 29 call(s)
+- `method` **_deepInvestigate**(content, highSignals, stageLabel) → 29 call(s)
+- `method` **_detectSignals**(text, stageLabel, { verificationMode = f) → 29 call(s)
+- `method` **_log**(msg) → 29 call(s)
+- `class` **ClarificationEngine** → 29 call(s) // Kept so existing callers don't break during migration.
+- `method` **analyse**(proposalText, stageLabel = 'Review') → 29 call(s)
+- `function` **formatClarificationReport**(result) → 29 call(s) // Formats self-correction results as a Markdown block for inje
 
-### core/code-graph.js
-- `class` **CodeGraph** → 32 call(s)
-- `method` **build** → 31 call(s)
-- `method` **search**(query, { kind = null, file = null, limit) → 31 call(s)
-- `method` **getFileSymbols**(filePath) → 31 call(s)
-- `method` **getCallGraph**(symbolName) → 31 call(s)
-- `method` **toMarkdown**({ maxSymbols = 100 } = {}) → 31 call(s)
-- `method` **_extractSymbols**(content, relPath, ext) → 31 call(s)
-- `method` **_addSymbol**(kind, name, file, line, signature = '', ) → 31 call(s)
-- `method` **_extractJsSymbols**(lines, file) → 31 call(s)
-- `method` **_extractCsSymbols**(lines, file) → 31 call(s)
-- `method` **_extractLuaSymbols**(lines, file) → 31 call(s)
-- `method` **_extractGoSymbols**(lines, file) → 31 call(s)
-- `method` **_extractPySymbols**(lines, file) → 31 call(s)
-- `method` **_extractDartSymbols**(lines, file) → 31 call(s)
-- `method` **_extractJsDocSummary**(lines, fnLine) → 31 call(s)
-- `method` **_extractXmlDocSummary**(lines, fnLine) → 31 call(s)
-- `method` **_extractLuaCommentSummary**(lines, fnLine) → 31 call(s)
-- `method` **_extractGoDocSummary**(lines, fnLine) → 31 call(s)
-- `method` **_extractPyDocSummary**(lines, fnLine) → 31 call(s)
-- `method` **_extractImports**(content, relPath, ext) → 31 call(s)
-- `method` **_extractCallEdges**(content, relPath, ext) → 31 call(s)
-- `method` **_findByName**(name) → 31 call(s)
+#### workflow/core/code-review-agent.js
+- `function` **buildReviewPrompt**(checklist, codeDiff, requirementText = ') → 39 call(s)
+- `function` **buildFixPrompt**(originalDiff, failures) → 39 call(s)

@@ -28,7 +28,7 @@ function _findScreenFiles(root, exts, subdirs) {
         }
       }
       walk(dir);
-    } catch (_) {}
+    } catch (err) { console.warn(`[ProjectTemplate] Failed to scan directory ${dir}: ${err.message}`); }
   }
   return results.slice(0, 5);
 }
@@ -135,7 +135,7 @@ function _copyProjectTemplates(projectRoot, config) {
     stateManagement = typeof profile.stateManagement === 'function' ? profile.stateManagement(projectRoot) : profile.stateManagement;
   }
 
-  const directoryTree = _generateDirectoryTree(projectRoot, config.ignoreDirs);
+  const effectiveTree = _generateDirectoryTree(projectRoot, config.ignoreDirs);
 
   const maxLinesMap = {
     'flutter': '800', 'dart': '800',
@@ -162,7 +162,7 @@ function _copyProjectTemplates(projectRoot, config) {
       .replace(/\{NAMING_RULE\}/g, namingConvention)
       .replace(/\{STATE_MANAGEMENT_APPROACH\}/g, stateManagement)
       .replace(/\{STATE_MANAGEMENT_RULE\}/g, stateManagement)
-      .replace(/\{PASTE_YOUR_DIRECTORY_TREE_HERE\}/g, directoryTree)
+      .replace(/\{PASTE_YOUR_DIRECTORY_TREE_HERE\}/g, effectiveTree)
       .replace(/\{BRIEF_DESCRIPTION\}/g, `${techStack} project`)
       .replace(/\{FIRST_DECISION_TITLE\}/g, `Adopt ${techStack} as primary tech stack`)
       .replace(/\{WHY_THIS_DECISION_WAS_NEEDED\}/g, `Project was initialized with the /wf workflow. Tech stack auto-detected as ${techStack}.`)

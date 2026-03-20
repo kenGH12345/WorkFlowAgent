@@ -1,23 +1,36 @@
 {
-  "sessionId": "test-proj-1773571533096",
-  "projectId": "test-proj",
-  "startedAt": "2026-03-15T10:45:33.096Z",
-  "finishedAt": "2026-03-15T10:45:33.098Z",
+  "sessionId": "test-project-1773746103264",
+  "projectId": "test-project",
+  "startedAt": "2026-03-17T11:15:03.264Z",
+  "finishedAt": "2026-03-17T11:15:03.265Z",
   "totalDurationMs": 1,
   "stages": [
     {
-      "name": "INITANALYSE",
-      "start": 1773571533096,
-      "end": 1773571533096,
+      "name": "INIT-ANALYSE",
+      "start": 1773746103264,
+      "end": 1773746103264,
+      "status": "ok",
+      "durationMs": 0
+    },
+    {
+      "name": "ANALYSE-ARCHITECT",
+      "start": 1773746103264,
+      "end": 1773746103264,
       "status": "ok",
       "durationMs": 0
     }
   ],
   "llm": {
-    "totalCalls": 1,
-    "totalTokensEst": 1200,
+    "totalCalls": 2,
+    "totalTokensEst": 13000,
+    "totalTokensActual": null,
     "callsByRole": {
-      "analyst": 1
+      "analyst": 1,
+      "architect": 1
+    },
+    "tokensByRole": {
+      "analyst": 5000,
+      "architect": 8000
     }
   },
   "errors": {
@@ -25,25 +38,18 @@
     "details": []
   },
   "testResult": {
-    "passed": 5,
-    "failed": 0,
-    "skipped": 0,
-    "rounds": 1
+    "passed": 10,
+    "failed": 2,
+    "skipped": 1,
+    "rounds": 2
   },
-  "entropyResult": {
-    "violations": 2,
-    "filesScanned": 43,
-    "reportPath": "output/entropy-report.md"
-  },
-  "ciResult": {
-    "status": "success",
-    "provider": "local",
-    "steps": [],
-    "durationMs": 3000
-  },
+  "entropyResult": null,
+  "ciResult": null,
   "codeGraphResult": {
-    "symbolCount": 517,
-    "fileCount": 43,
-    "edgeCount": 13292
-  }
+    "symbolCount": 150,
+    "fileCount": 30,
+    "edgeCount": 200
+  },
+  "clarificationQuality": null,
+  "taskComplexity": null
 }
