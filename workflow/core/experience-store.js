@@ -20,6 +20,7 @@ const { ExperienceType, ExperienceCategory, UNIVERSAL_CATEGORIES } = require('./
 const { extractKeywords, ExperienceQueryMixin, STOPWORDS, SHORT_WORD_WHITELIST } = require('./experience-query');
 const { ExperienceEvolutionMixin } = require('./experience-evolution');
 const { ExperienceTransferMixin } = require('./experience-transfer');
+const { ExperienceDistillationMixin } = require('./experience-distillation');
 
 // ─── Experience Store ─────────────────────────────────────────────────────────
 
@@ -263,6 +264,12 @@ class ExperienceStore {
           console.log(`[ExperienceStore] Auto-purged ${purged} expired experience(s) on load. Remaining: ${this.experiences.length}`);
         }
 
+        // P2-C: Auto-distill similar experiences before capacity eviction.
+        // This preserves knowledge by merging instead of blindly evicting.
+        if (typeof this.autoDistill === 'function') {
+          this.autoDistill();
+        }
+
         // P2-1 fix: enforce capacity cap
         // P1-C: MAX_CAPACITY is now configurable via workflow.config.js → experienceStore.maxCapacity
         const MAX_CAPACITY = EXPERIENCE.MAX_CAPACITY;
@@ -312,6 +319,7 @@ class ExperienceStore {
 Object.assign(ExperienceStore.prototype, ExperienceQueryMixin);
 Object.assign(ExperienceStore.prototype, ExperienceEvolutionMixin);
 Object.assign(ExperienceStore.prototype, ExperienceTransferMixin);
+Object.assign(ExperienceStore.prototype, ExperienceDistillationMixin);
 
 // ─── Backward-Compatible Exports ────────────────────────────────────────────
 // All existing require('./experience-store') consumers continue to work unchanged.

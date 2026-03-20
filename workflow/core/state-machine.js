@@ -394,6 +394,127 @@ class StateMachine {
     return [...this._stateOrder];
   }
 
+  // ─── Conditional Transitions (P2-D) ────────────────────────────────────────
+
+  /**
+   * P2-D: Registers a conditional transition rule for a given state.
+   *
+   * Inspired by LangGraph's `add_conditional_edges()`, this makes branching
+   * logic visible at the state machine level instead of being scattered in
+   * stage-*.js files as ad-hoc if/else logic.
+   *
+   * When `transitionConditional()` is called from a state that has registered
+   * conditions, the condition function is evaluated and the state machine
+   * transitions to the corresponding target state.
+   *
+   * @param {string} fromState - The state where the condition is evaluated
+   * @param {object} rule
+   * @param {string}   rule.name       - Human-readable rule name for logging
+   * @param {Function} rule.condition   - (manifest, context) => string — returns a key from `targets`
+   * @param {Object<string, string>} rule.targets - Map of condition result → target state
+   *
+   * @example
+   *   stateMachine.addConditionalTransition('ARCHITECT', {
+   *     name: 'ArchReviewResult',
+   *     condition: (manifest, ctx) => ctx.archReviewPassed ? 'pass' : 'fail',
+   *     targets: { pass: 'PLAN', fail: 'ANALYSE' },
+   *   });
+   */
+  addConditionalTransition(fromState, rule) {
+    if (!this._stateOrder.includes(fromState)) {
+      throw new Error(`[StateMachine] addConditionalTransition: invalid fromState "${fromState}". Valid: ${this._stateOrder.join(', ')}`);
+    }
+    if (!rule || typeof rule.condition !== 'function' || !rule.targets) {
+      throw new Error(`[StateMachine] addConditionalTransition: rule must have { name, condition: fn, targets: {} }`);
+    }
+    // Validate all target states
+    for (const [key, target] of Object.entries(rule.targets)) {
+      if (!this._stateOrder.includes(target)) {
+        throw new Error(`[StateMachine] addConditionalTransition: target "${target}" for key "${key}" is not a valid state`);
+      }
+    }
+
+    if (!this._conditionalRules) this._conditionalRules = new Map();
+    if (!this._conditionalRules.has(fromState)) {
+      this._conditionalRules.set(fromState, []);
+    }
+    this._conditionalRules.get(fromState).push(rule);
+    console.log(`[StateMachine] 🔀 Registered conditional transition: ${fromState} → [${Object.entries(rule.targets).map(([k,v]) => `${k}:${v}`).join(', ')}] (rule: ${rule.name})`);
+  }
+
+  /**
+   * P2-D: Evaluates conditional rules for the current state and transitions
+   * to the determined target state.
+   *
+   * If no conditional rules are registered for the current state, falls back
+   * to the standard `transition()` (next sequential state).
+   *
+   * @param {object} context - Arbitrary context passed to the condition function
+   * @param {string|null} [artifactPath] - Artifact produced during current stage
+   * @param {string} [note] - Optional note
+   * @returns {string} The new current state
+   */
+  async transitionConditional(context = {}, artifactPath = null, note = '') {
+    const fromState = this.getState();
+    const rules = this._conditionalRules?.get(fromState);
+
+    if (!rules || rules.length === 0) {
+      // No conditional rules — use standard sequential transition
+      return this.transition(artifactPath, note);
+    }
+
+    // Evaluate rules in registration order; first match wins
+    for (const rule of rules) {
+      try {
+        const result = rule.condition(this.manifest, context);
+        if (result !== undefined && result !== null && rule.targets[result]) {
+          const targetState = rule.targets[result];
+          const isForward = this._stateOrder.indexOf(targetState) > this._stateOrder.indexOf(fromState);
+          const condNote = `[CONDITIONAL:${rule.name}=${result}] ${note}`.trim();
+
+          console.log(`[StateMachine] 🔀 Conditional transition: ${fromState} → ${targetState} (rule: ${rule.name}, result: ${result})`);
+
+          if (isForward && targetState === this.getNextState()) {
+            // Standard forward transition
+            return this.transition(artifactPath, condNote);
+          } else if (isForward) {
+            // Forward jump (skip stages)
+            return this.jumpTo(targetState, condNote);
+          } else {
+            // Backward = rollback direction
+            return this.jumpTo(targetState, condNote);
+          }
+        }
+      } catch (err) {
+        console.warn(`[StateMachine] ⚠️  Conditional rule "${rule.name}" threw: ${err.message}. Trying next rule.`);
+      }
+    }
+
+    // No rule matched — fall back to sequential transition
+    console.log(`[StateMachine] 🔀 No conditional rule matched for ${fromState}. Falling back to sequential transition.`);
+    return this.transition(artifactPath, note);
+  }
+
+  /**
+   * P2-D: Returns all registered conditional transition rules.
+   * Useful for visualization and debugging.
+   *
+   * @returns {Map<string, Array<{name: string, targets: Object}>>}
+   */
+  getConditionalRules() {
+    return this._conditionalRules || new Map();
+  }
+
+  /**
+   * P2-D: Checks if the current state has conditional rules registered.
+   *
+   * @returns {boolean}
+   */
+  hasConditionalTransition() {
+    const rules = this._conditionalRules?.get(this.getState());
+    return !!(rules && rules.length > 0);
+  }
+
   // ─── Artifact Helpers ─────────────────────────────────────────────────────────
 
   /** Returns the artifacts map from the current manifest */
