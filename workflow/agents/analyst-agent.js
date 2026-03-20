@@ -166,8 +166,40 @@ Produce a Markdown document with the following sections:
    - What assumptions were made and why
    - What risks or ambiguities remain unresolved
    - ⚠️ This section is REQUIRED. If you skip it, the workflow will flag a compliance error.
+8. **Functional Module Map** *(mandatory)* – A structured decomposition of the codebase into functional modules:
+   - Based on your codebase research, identify the distinct functional modules affected by this requirement.
+   - For each module, provide: a short ID (e.g. "mod-auth"), a descriptive name, a one-line description, file path boundaries (glob patterns), dependencies on other modules, complexity estimate (low/medium/high), and whether it is isolatable (can be designed/implemented independently).
+   - Also identify cross-cutting concerns that span multiple modules (e.g. logging, error-handling, config).
+   - This module map is used by downstream ARCHITECT stage to enable parallel architecture design.
+   - If the requirement is small and touches only 1 module, still produce the map with that single module.
+   - ⚠️ This section is REQUIRED. If you skip it, the workflow will flag a compliance error.
+   - Output format example:
+     \`\`\`
+     | Module ID | Name | Description | Boundaries | Dependencies | Complexity | Isolatable |
+     |-----------|------|-------------|------------|--------------|------------|------------|
+     | mod-auth  | Authentication | User login, registration, token management | src/auth/*, src/middleware/auth* | mod-db, mod-config | medium | yes |
+     \`\`\`
+     Cross-cutting concerns: logging, error-handling, configuration
 
 ${jsonInstruction}
+
+**IMPORTANT for JSON block**: The JSON metadata block MUST include a "moduleMap" field with this structure:
+\`\`\`
+"moduleMap": {
+  "modules": [
+    {
+      "id": "mod-xxx",
+      "name": "Module Name",
+      "description": "One-line description",
+      "boundaries": ["src/xxx/*", "src/yyy/*"],
+      "dependencies": ["mod-yyy"],
+      "complexity": "low|medium|high",
+      "isolatable": true|false
+    }
+  ],
+  "crossCuttingConcerns": ["logging", "error-handling"]
+}
+\`\`\`
 
 ## User Requirement
 ${inputContent}
@@ -220,14 +252,32 @@ Remember: NO technical details, NO code, NO architecture.
     }
 
     // ── Mandatory section compliance check ──────────────────────────────────
-    // Verify that the mandatory "Architecture Design" and "Execution Plan" sections
-    // are present in the output. These are required by the agent output specification.
-    const mandatorySections = ['Architecture Design', 'Execution Plan'];
+    // Verify that the mandatory "Architecture Design", "Execution Plan", and
+    // "Functional Module Map" sections are present in the output.
+    const mandatorySections = ['Architecture Design', 'Execution Plan', 'Functional Module Map'];
     const missingSections = mandatorySections.filter(s => !llmResponse.includes(s));
     if (missingSections.length > 0) {
       console.warn(`[AnalystAgent] ⚠️  COMPLIANCE: Missing mandatory section(s): ${missingSections.join(', ')}. The agent output specification requires these sections.`);
     } else {
-      console.log(`[AnalystAgent] ✅ Mandatory sections present: Architecture Design, Execution Plan.`);
+      console.log(`[AnalystAgent] ✅ Mandatory sections present: Architecture Design, Execution Plan, Functional Module Map.`);
+    }
+
+    // ── Module Map validation ──────────────────────────────────────────────
+    // Verify that the JSON block contains a valid moduleMap structure.
+    if (jsonBlock && jsonBlock.moduleMap) {
+      const mm = jsonBlock.moduleMap;
+      if (Array.isArray(mm.modules) && mm.modules.length > 0) {
+        const validModules = mm.modules.filter(m => m.id && m.name);
+        const isolatableCount = mm.modules.filter(m => m.isolatable).length;
+        console.log(`[AnalystAgent] 🗺️  Module Map: ${validModules.length} module(s), ${isolatableCount} isolatable, ${(mm.crossCuttingConcerns || []).length} cross-cutting concern(s).`);
+        if (validModules.length < mm.modules.length) {
+          console.warn(`[AnalystAgent] ⚠️  Module Map: ${mm.modules.length - validModules.length} module(s) missing required 'id' or 'name' field.`);
+        }
+      } else {
+        console.warn(`[AnalystAgent] ⚠️  Module Map: 'modules' array is empty or missing. Downstream ARCHITECT may not benefit from parallel design.`);
+      }
+    } else if (jsonBlock) {
+      console.warn(`[AnalystAgent] ⚠️  Module Map: No 'moduleMap' field found in JSON block. ARCHITECT stage will use single-pass design.`);
     }
 
     return llmResponse;

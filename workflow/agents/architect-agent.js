@@ -78,6 +78,15 @@ ${jsonInstruction}
 ## Requirement Document
 ${inputContent}
 ${expSection}
+## Module-Aware Architecture Design (IMPORTANT)
+If a **Functional Module Map** section is present in the upstream context above, you MUST:
+1. **Align your Component Breakdown** with the identified modules — each module should map to one or more components in your architecture.
+2. **Define explicit Interface Contracts** between modules where dependencies exist (function signatures, data structures, event protocols).
+3. **Respect module boundaries** — do not merge modules that were identified as isolatable unless you have a strong architectural reason (and document that reason).
+4. **Address cross-cutting concerns** at the architecture level (e.g. shared middleware, event bus, common utilities) — do not push them into individual module designs.
+5. **Mark modules by complexity** in your execution plan — high-complexity modules should be scheduled earlier (fail fast).
+6. If the Module Map contains only 1 module, this is a focused change — keep the architecture proportionally simple.
+
 ## Codebase Research Rules (CRITICAL)
 - If the requirement document references specific files (Anchor Files section), focus your research on those files and their direct dependencies ONLY.
 - **Search budget**: at most 8 file searches and 6 file reads total. Stop once you have enough context.

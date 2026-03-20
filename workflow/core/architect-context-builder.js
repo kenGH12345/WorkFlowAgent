@@ -47,7 +47,40 @@ function buildArchitectUpstreamCtx(orch, taskHints = '') {
   if (ctx) {
     console.log(`[Orchestrator] 🔗 Cross-stage context injected into ArchitectAgent (${ctx.length} chars, dynamic selection). Upstream: ${orch.stageCtx.getLogLine()}`);
   }
-  return ctx;
+
+  // ── P1-ModuleMap: Extract and format Functional Module Map ──────────────
+  // If ANALYSE stage produced a moduleMap, format it as a dedicated section
+  // so ArchitectAgent can use it for module-aware architecture design.
+  let moduleMapSection = '';
+  const analyseCtx = orch.stageCtx.get(WorkflowState.ANALYSE);
+  const moduleMap = analyseCtx?.meta?.moduleMap;
+  if (moduleMap && Array.isArray(moduleMap.modules) && moduleMap.modules.length > 0) {
+    const lines = [
+      `\n## 🗺️ Functional Module Map (from ANALYSE stage)`,
+      `> Use this map to structure your architecture around identified modules.`,
+      `> Each module represents a distinct functional domain. Design module interfaces explicitly.`,
+      `> Isolatable modules (isolatable=true) can potentially be designed in parallel.`,
+      ``,
+      `| Module ID | Name | Description | Boundaries | Dependencies | Complexity | Isolatable |`,
+      `|-----------|------|-------------|------------|--------------|------------|------------|`,
+    ];
+    for (const m of moduleMap.modules) {
+      const bounds = (m.boundaries || []).join(', ') || 'N/A';
+      const deps = (m.dependencies || []).join(', ') || 'none';
+      lines.push(`| ${m.id} | ${m.name} | ${m.description} | ${bounds} | ${deps} | ${m.complexity} | ${m.isolatable ? 'yes' : 'no'} |`);
+    }
+    if (moduleMap.crossCuttingConcerns && moduleMap.crossCuttingConcerns.length > 0) {
+      lines.push(``);
+      lines.push(`**Cross-cutting concerns:** ${moduleMap.crossCuttingConcerns.join(', ')}`);
+      lines.push(`> These concerns span multiple modules and should be addressed at the architecture level, not within individual modules.`);
+    }
+    lines.push(``);
+    lines.push(`**Architecture instruction:** Design your component breakdown to align with this module map. Each module should become a component (or component group) in your architecture. Define explicit interface contracts between modules, especially where dependencies exist.`);
+    moduleMapSection = lines.join('\n');
+    console.log(`[Orchestrator] 🗺️  Module Map injected into ArchitectAgent: ${moduleMap.modules.length} module(s), ${moduleMap.modules.filter(m => m.isolatable).length} isolatable.`);
+  }
+
+  return (ctx || '') + moduleMapSection;
 }
 
 // ─── Full context block assembly ─────────────────────────────────────────────

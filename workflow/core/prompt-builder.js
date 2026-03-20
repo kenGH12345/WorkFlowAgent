@@ -363,9 +363,17 @@ Negative Examples (what NOT to do):
 ❌ DO NOT skip the Socratic questioning step — always ask WHY before assuming you understand
 
 Complexity Assessment (evaluate before deep analysis):
-- Simple tasks (< 50 lines of change): streamline to minimal spec, skip chapters 5-8.
-- Medium tasks (50-500 lines): fill chapters 1-3, outline chapter 7.
-- Complex tasks (> 500 lines or multi-module): fill chapters 1-3 thoroughly, outline all remaining chapters.
+- Simple tasks (< 50 lines of change): streamline to minimal spec, skip chapters 5-8. Still produce Module Map (even if just 1 module).
+- Medium tasks (50-500 lines): fill chapters 1-3, outline chapter 7, produce Module Map with 1-3 modules.
+- Complex tasks (> 500 lines or multi-module): fill chapters 1-3 thoroughly, outline all remaining chapters, produce detailed Module Map with all affected modules.
+
+Module Map Construction (IMPORTANT – Section 8):
+- After completing your codebase research, identify the distinct functional modules affected by the requirement.
+- A "module" is a cohesive group of files/classes that serve a single business purpose (e.g. authentication, payment, UI rendering).
+- For each module, determine: file path boundaries, dependencies on other modules, complexity level, and whether it can be designed/implemented independently (isolatable).
+- Also identify cross-cutting concerns that span multiple modules (logging, error handling, config, etc.).
+- The Module Map is consumed by the downstream ARCHITECT stage to produce module-aligned architecture.
+- Even for simple 1-module changes, include the map — it helps ARCHITECT scope its design appropriately.
 
 Output Language (CRITICAL):
 - You MUST write the entire spec document in Chinese (简体中文).
@@ -385,7 +393,16 @@ Before writing any architecture, reason through:
 4. What existing modules/patterns in the codebase can I reuse?
 5. What are the top 3 technical risks, and how does my architecture mitigate them?
 6. How will the Planner (Kent Beck) decompose this into tasks? Is my module boundary clear enough?
+7. **Is there a Functional Module Map from ANALYSE?** If yes, use it as the starting point for your component breakdown. Each module in the map should correspond to one or more components. Define explicit interface contracts between modules.
 Only after this mental checklist should you begin writing the architecture.
+
+Module Map Awareness (IMPORTANT):
+- If the upstream context includes a Functional Module Map (Section 8 from ANALYSE), your architecture MUST align with it.
+- Each module in the map should become a distinct component (or component group) in your Component Breakdown.
+- For every dependency edge in the module map, define an explicit Interface Contract (function signatures, data structures, event protocols).
+- Cross-cutting concerns identified in the map should be addressed at the architecture level (shared middleware, event bus, common utilities).
+- Mark isolatable modules in your Execution Plan — these can be implemented in parallel.
+- If you disagree with the module map decomposition, document WHY in your Architecture Design section and propose an alternative.
 
 Downstream Awareness (IMPORTANT):
 - Your architecture.md is the PRIMARY input for the Planner (Kent Beck), who will decompose it into file/function-level implementation tasks.

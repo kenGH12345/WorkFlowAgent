@@ -31,13 +31,14 @@
  */
 const ANALYST_SCHEMA = {
   role: 'analyst',
-  version: '1.0',
+  version: '1.1',
   fields: {
     requirements:    { type: 'array',  description: 'Structured requirement items', required: true },
     risks:           { type: 'array',  description: 'Identified risk items',        required: false },
     clarifications:  { type: 'array',  description: 'Clarification Q&A pairs',      required: false },
     scope:           { type: 'string', description: 'Scope decision (minimal/full)', required: false },
     keyDecisions:    { type: 'array',  description: 'Top-level decisions made',      required: false },
+    moduleMap:       { type: 'object', description: 'Functional Module Map: { modules: [{ id, name, description, boundaries, dependencies, complexity, isolatable }], crossCuttingConcerns: [] }', required: false },
   },
 };
 
@@ -273,10 +274,13 @@ function extractSummary(jsonBlock, stageName) {
     if (parts.length > 0) return parts.join(' | ');
   }
 
-  // Analyst: synthesise from requirement count + scope
+  // Analyst: synthesise from requirement count + scope + moduleMap
   if (Array.isArray(jsonBlock.requirements)) {
     const scope = jsonBlock.scope ? ` (scope: ${jsonBlock.scope})` : '';
-    return `${jsonBlock.requirements.length} requirement(s) identified${scope}.`;
+    const modCount = jsonBlock.moduleMap && Array.isArray(jsonBlock.moduleMap.modules)
+      ? ` | ${jsonBlock.moduleMap.modules.length} functional module(s) identified`
+      : '';
+    return `${jsonBlock.requirements.length} requirement(s) identified${scope}${modCount}.`;
   }
 
   // Tester: synthesise from pass/fail counts

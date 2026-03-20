@@ -70,19 +70,23 @@ All inter-agent communication uses **file path references only** (never raw cont
 
 ---
 
-### Step 2 �?ANALYSE
+### Step 2 → ANALYSE
 **Actor**: AnalystAgent  
 **Input**: Raw user requirement string  
 **Action**:
 1. Call `AnalystAgent.run(null, rawRequirement)`
-2. Agent writes `output/requirement.md`
-3. Orchestrator calls `FileRefBus.publish('analyst', 'architect', requirementMdPath)`
-4. State machine transitions: `INIT �?ANALYSE`
-5. Record artifact path in manifest
+2. Agent writes `output/requirement.md` containing:
+   - Sections 1-7: Standard requirement analysis (Overview, User Stories, Acceptance Criteria, etc.)
+   - **Section 8: Functional Module Map** — a structured decomposition of the codebase into distinct functional modules. Each module has: id, name, description, file boundaries, dependencies, complexity, and isolatability. Also identifies cross-cutting concerns.
+   - **JSON metadata block**: includes a `moduleMap` field with structured module data for programmatic consumption by downstream stages.
+3. Orchestrator calls `storeAnalyseContext()` which extracts the `moduleMap` from the JSON block and stores it in `stageCtx.meta.moduleMap`
+4. `FileRefBus.publish('analyst', 'architect', requirementMdPath)`
+5. State machine transitions: `INIT → ANALYSE`
+6. Record artifact path in manifest
 
-**Output**: `output/requirement.md`  
+**Output**: `output/requirement.md` (with Functional Module Map)  
+**Downstream Impact**: The Module Map enables the ARCHITECT stage to produce module-aligned architecture with explicit inter-module interface contracts.  
 **Hook**: `HOOK_EVENTS.AFTER_STATE_TRANSITION`
-
 ---
 
 ### Step 3 �?ARCHITECT

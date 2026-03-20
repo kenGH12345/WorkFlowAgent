@@ -108,6 +108,31 @@ function _extractCorrectionHistory(rawHistory) {
 function storeAnalyseContext(orch, outputPath, clarResult) {
   if (!orch.stageCtx) throw new Error('[storeAnalyseContext] orch.stageCtx is null – StageContextStore was not initialised.');
   const ctx = StageContextStore.extractFromFile(outputPath, WorkflowState.ANALYSE);
+
+  // ── Extract Functional Module Map from JSON block ────────────────────────
+  // P1-ModuleMap: If the analyst output contains a structured moduleMap in
+  // the JSON block, extract it and store it in meta for downstream consumption.
+  // The ARCHITECT stage reads this to enable module-aware architecture design.
+  let moduleMap = null;
+  if (ctx.jsonBlock && ctx.jsonBlock.moduleMap) {
+    const mm = ctx.jsonBlock.moduleMap;
+    if (Array.isArray(mm.modules) && mm.modules.length > 0) {
+      moduleMap = {
+        modules: mm.modules.filter(m => m.id && m.name).map(m => ({
+          id:           m.id,
+          name:         m.name,
+          description:  m.description || '',
+          boundaries:   Array.isArray(m.boundaries) ? m.boundaries : [],
+          dependencies: Array.isArray(m.dependencies) ? m.dependencies : [],
+          complexity:   m.complexity || 'medium',
+          isolatable:   Boolean(m.isolatable),
+        })),
+        crossCuttingConcerns: Array.isArray(mm.crossCuttingConcerns) ? mm.crossCuttingConcerns : [],
+      };
+      console.log(`[Orchestrator] 🗺️  Module Map extracted: ${moduleMap.modules.length} module(s), ${moduleMap.crossCuttingConcerns.length} cross-cutting concern(s).`);
+    }
+  }
+
   orch.stageCtx.set(WorkflowState.ANALYSE, {
     summary:      ctx.summary,
     keyDecisions: ctx.keyDecisions,
@@ -117,9 +142,11 @@ function storeAnalyseContext(orch, outputPath, clarResult) {
       clarificationRounds: clarResult.rounds ?? 0,
       signalCount:         clarResult.allSignals?.length ?? 0,
       skipped:             clarResult.skipped ?? false,
+      moduleMap,
     },
   });
-  console.log(`[Orchestrator] 🔗 ANALYSE context stored: ${ctx.keyDecisions.length} key decision(s).`);
+  const mmMsg = moduleMap ? `, ${moduleMap.modules.length} module(s) mapped` : '';
+  console.log(`[Orchestrator] 🔗 ANALYSE context stored: ${ctx.keyDecisions.length} key decision(s)${mmMsg}.`);
   return ctx;
 }
 

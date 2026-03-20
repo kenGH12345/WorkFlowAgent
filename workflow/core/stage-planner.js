@@ -34,7 +34,7 @@ const {
 function buildPlannerUpstreamCtx(orch) {
   const parts = [];
 
-  // Inject ANALYSE stage context
+    // Inject ANALYSE stage context
   if (orch.stageCtx) {
     const analyseCtx = orch.stageCtx.get(WorkflowState.ANALYSE);
     if (analyseCtx) {
@@ -45,6 +45,20 @@ function buildPlannerUpstreamCtx(orch) {
       }
       if (analyseCtx.risks && analyseCtx.risks.length > 0) {
         parts.push(`Risks:\n${analyseCtx.risks.slice(0, 5).map(r => `- ${r}`).join('\n')}`);
+      }
+
+      // P1-ModuleMap: Inject Module Map for task decomposition alignment
+      const moduleMap = analyseCtx.meta?.moduleMap;
+      if (moduleMap && Array.isArray(moduleMap.modules) && moduleMap.modules.length > 0) {
+        parts.push(`\n**Functional Module Map** (${moduleMap.modules.length} module(s)):`);
+        for (const m of moduleMap.modules) {
+          const deps = (m.dependencies || []).join(', ') || 'none';
+          parts.push(`- **${m.id}** (${m.name}): ${m.description} [complexity: ${m.complexity}, isolatable: ${m.isolatable ? 'yes' : 'no'}, deps: ${deps}]`);
+        }
+        if (moduleMap.crossCuttingConcerns && moduleMap.crossCuttingConcerns.length > 0) {
+          parts.push(`- Cross-cutting concerns: ${moduleMap.crossCuttingConcerns.join(', ')}`);
+        }
+        parts.push(`> **Planning hint:** Align task grouping with module boundaries. Isolatable modules can be planned as parallel work streams.`);
       }
     }
 
