@@ -239,6 +239,28 @@ module.exports = {
       }
     }
 
+    // ── Step 10: P2-1 EventJournal — Append-only event sourcing log ──────────
+    // Creates an EventJournal and attaches it to HookSystem as a universal
+    // subscriber. Every emitted event is captured in a JSONL file for:
+    //   - Structured observability (query events by type/stage/time)
+    //   - Future replay support (deterministic session reconstruction)
+    //   - Debugging (full audit trail of all LLM calls, transitions, errors)
+    // Reference: Restate deterministic journal + OpenHands EventStream.
+    if (!this._initCompleted.has('eventJournal')) {
+      try {
+        const { EventJournal } = require('./event-journal');
+        this.eventJournal = new EventJournal({
+          outputDir: this._outputDir || PATHS.OUTPUT_DIR,
+          sessionId: `${this.projectId || 'session'}-${Date.now()}`,
+          enabled: true,
+        });
+        this.eventJournal.attachToHookSystem(this.hooks);
+        this._initCompleted.add('eventJournal');
+      } catch (err) {
+        console.warn(`[Orchestrator] ⚠️  [P2-1] Step 10 (EventJournal) failed (non-fatal): ${err.message}`);
+      }
+    }
+
     return resumeState;
   },
 
@@ -790,6 +812,19 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
         }
       } catch (pubErr) {
         console.warn(`[Orchestrator] ⚠️  ExperienceRouter publish failed (non-fatal): ${pubErr.message}`);
+      }
+    }
+
+    // ── P2-1: EventJournal — flush and close ────────────────────────────────
+    // Must run before Logger flush: EventJournal captures the close event and
+    // writes its summary before the Logger captures the final log line.
+    if (this.eventJournal) {
+      try {
+        await this.eventJournal.close();
+        const stats = this.eventJournal.getStats();
+        console.log(`[Orchestrator] 📖 EventJournal: ${stats.totalEvents} events captured in ${path.basename(this.eventJournal.journalPath)}`);
+      } catch (ejErr) {
+        console.warn(`[Orchestrator] ⚠️  EventJournal close failed (non-fatal): ${ejErr.message}`);
       }
     }
 
