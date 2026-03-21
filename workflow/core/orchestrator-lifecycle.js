@@ -563,6 +563,24 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
       console.warn(`[Orchestrator] ⚠️  Prompt trace flush failed (non-fatal): ${ptErr.message}`);
     }
 
+    // ── Direction 1+2: RunGuard summary — cost analysis & execution guard report ──
+    // Prints a structured summary of LLM call counts, token usage, cost, and
+    // any tier downgrades that occurred during execution.
+    if (this.runGuard) {
+      try {
+        const guardSummary = this.runGuard.formatSummary();
+        if (guardSummary) {
+          console.log(guardSummary);
+        }
+        // Record RunGuard metrics into Observability for cross-session analysis
+        if (this.obs.recordRunGuardSummary) {
+          this.obs.recordRunGuardSummary(this.runGuard.getSummary());
+        }
+      } catch (rgErr) {
+        console.warn(`[Orchestrator] ⚠️  RunGuard summary failed (non-fatal): ${rgErr.message}`);
+      }
+    }
+
     // ── Skill Lifecycle: sync usage stats to SkillEvolutionEngine registry ──
     // Transfers per-session skill injection/effectiveness data from Observability
     // to the persistent SkillEvolutionEngine registry, enabling cross-session
@@ -1001,6 +1019,28 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
     if (this.logger) {
       this.logger.info('Stage', `Stage started: ${stageLabel}`, { fromState, toState });
     }
+
+    // ── Direction 1+2: RunGuard pre-stage check ─────────────────────────────
+    // Checks global execution limits (LLM calls, tokens, duration, budget).
+    // If budget pressure is detected, automatically downgrades LlmRouter tier.
+    // If hard limits are exceeded, throws RunGuardAbortError.
+    if (this.runGuard) {
+      try {
+        const guardResult = this.runGuard.beforeStage(fromState, { llmRouter: this.llmRouter });
+        if (guardResult.warnings.length > 0 && this.logger) {
+          this.logger.warn('RunGuard', `Pre-stage warnings for ${fromState}`, { warnings: guardResult.warnings, tierMode: guardResult.tierMode });
+        }
+      } catch (guardErr) {
+        if (guardErr.code === 'RUN_GUARD_ABORT') {
+          console.error(`[Orchestrator] 🛑 RunGuard aborted workflow before stage ${fromState}: ${guardErr.message}`);
+          this.obs.stageEnd(stageLabel, 'aborted');
+          throw guardErr;
+        }
+        // Non-RunGuard errors: log and continue (guard must not block execution)
+        console.warn(`[Orchestrator] ⚠️  RunGuard.beforeStage failed (non-fatal): ${guardErr.message}`);
+      }
+    }
+
     let stageStatus = 'ok';
     let lastErr = null;
 

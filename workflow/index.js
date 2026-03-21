@@ -70,6 +70,8 @@ const { StageRunner, StageRegistry } = require('./core/stage-runner');
 const { AnalystStage, ArchitectStage, PlannerStage, DeveloperStage, TesterStage } = require('./core/stages');
 // P3 optimisation: multi-model routing support
 const { LlmRouter } = require('./core/llm-router');
+// Direction 1+2: Cost-aware gateway + Global run guard
+const { RunGuard } = require('./core/run-guard');
 // P1-2: Agent Negotiation Protocol (inter-agent concern resolution)
 const { NegotiationEngine } = require('./core/negotiation-engine');
 // P1-4: Structured Logger (JSON Lines logging)
@@ -555,6 +557,23 @@ class Orchestrator {
     this.services.registerValue('rawLlmCall', this._rawLlmCall);
     this.services.registerValue('adaptiveStrategy', this._adaptiveStrategy);
     this.services.registerValue('llmRouter', this.llmRouter);
+
+    // ── Direction 1+2: RunGuard (cost-aware gateway + global execution ceiling) ──
+    // Layered defence: soft limit (downgrade model tier) + hard limit (abort execution).
+    // Reads budget from adaptiveStrategy.budgetUsd or defaults to $5.
+    const runGuardOpts = {
+      maxTotalLlmCalls:   (this._adaptiveStrategy && this._adaptiveStrategy.maxTotalLlmCalls) || 50,
+      maxTotalTokens:     (this._adaptiveStrategy && this._adaptiveStrategy.maxTotalTokens) || 800_000,
+      maxTotalDurationMs: (this._adaptiveStrategy && this._adaptiveStrategy.maxTotalDurationMs) || 30 * 60 * 1000,
+      budgetUsd:          (this._config && this._config.llmCostRouter && this._config.llmCostRouter.budgetUsd) || 5.0,
+      enabled:            !(this._config && this._config.runGuard && this._config.runGuard.enabled === false),
+    };
+    if (this._config && this._config.runGuard) {
+      Object.assign(runGuardOpts, this._config.runGuard);
+    }
+    this.runGuard = new RunGuard(runGuardOpts);
+    this.services.registerValue('runGuard', this.runGuard);
+
     console.log(`[Orchestrator] 🏗️  ServiceContainer initialised with ${this.services.getRegisteredNames().length} service(s).`);
 
     // ── P0/P1-b: StageRegistry (stage registration) ─────────────────────────

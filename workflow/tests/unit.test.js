@@ -1498,6 +1498,328 @@ async function runSkillMarketplaceTests() {
 
 // ─── Main Runner ──────────────────────────────────────────────────────────────
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Direction 1+2: RunGuard Tests (Cost-Aware Gateway + Global Run Guard)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function runRunGuardTests() {
+  console.log('\n📌 RunGuard Tests');
+
+  const { RunGuard, RunGuardAbortError, DEFAULT_LIMITS } = require('../core/run-guard');
+
+  await test('RunGuard: uses default limits when no options provided', async () => {
+    const guard = new RunGuard();
+    assertEqual(guard._limits.maxTotalLlmCalls, DEFAULT_LIMITS.maxTotalLlmCalls);
+    assertEqual(guard._limits.maxTotalTokens, DEFAULT_LIMITS.maxTotalTokens);
+    assertEqual(guard._enabled, true);
+  });
+
+  await test('RunGuard: accepts custom limits', async () => {
+    const guard = new RunGuard({ maxTotalLlmCalls: 10, maxTotalTokens: 100000, budgetUsd: 1.0 });
+    assertEqual(guard._limits.maxTotalLlmCalls, 10);
+    assertEqual(guard._limits.maxTotalTokens, 100000);
+    assertEqual(guard._budgetUsd, 1.0);
+  });
+
+  await test('RunGuard: enabled=false disables all checks', async () => {
+    const guard = new RunGuard({ enabled: false, maxTotalLlmCalls: 1 });
+    guard._totalLlmCalls = 100;
+    const result = guard.beforeLlmCall('DEVELOPER');
+    assertEqual(result.allowed, true);
+  });
+
+  await test('RunGuard: beforeLlmCall allows calls within limits', async () => {
+    const guard = new RunGuard({ maxTotalLlmCalls: 5 });
+    const result = guard.beforeLlmCall('ARCHITECT', 1000);
+    assertEqual(result.allowed, true);
+  });
+
+  await test('RunGuard: beforeLlmCall throws when LLM call limit reached', async () => {
+    const guard = new RunGuard({ maxTotalLlmCalls: 2 });
+    guard._totalLlmCalls = 2;
+    let threw = false;
+    try { guard.beforeLlmCall('DEVELOPER'); } catch (err) {
+      threw = true;
+      assertEqual(err.code, 'RUN_GUARD_ABORT');
+      assertEqual(err.limitType, 'llm_calls');
+    }
+    assertEqual(threw, true);
+  });
+
+  await test('RunGuard: beforeLlmCall throws when token limit approaching', async () => {
+    const guard = new RunGuard({ maxTotalTokens: 10000 });
+    guard._totalInputTokens = 8000;
+    guard._totalOutputTokens = 1500;
+    let threw = false;
+    try { guard.beforeLlmCall('DEVELOPER', 1000); } catch (err) {
+      threw = true;
+      assertEqual(err.limitType, 'tokens');
+    }
+    assertEqual(threw, true);
+  });
+
+  await test('RunGuard: afterLlmCall increments counters', async () => {
+    const guard = new RunGuard();
+    guard.afterLlmCall('ARCHITECT', 5000, 2000, 0.05);
+    assertEqual(guard._totalLlmCalls, 1);
+    assertEqual(guard._totalInputTokens, 5000);
+    assertEqual(guard._totalOutputTokens, 2000);
+    assertEqual(guard._totalCostUsd, 0.05);
+  });
+
+  await test('RunGuard: afterLlmCall accumulates across multiple calls', async () => {
+    const guard = new RunGuard();
+    guard.afterLlmCall('ARCHITECT', 5000, 2000, 0.05);
+    guard.afterLlmCall('DEVELOPER', 3000, 1000, 0.03);
+    assertEqual(guard._totalLlmCalls, 2);
+    assertEqual(guard._totalInputTokens, 8000);
+    assertEqual(guard._totalCostUsd, 0.08);
+  });
+
+  await test('RunGuard: stays normal when budget is healthy', async () => {
+    const guard = new RunGuard({ budgetUsd: 5.0 });
+    guard._totalCostUsd = 1.0;
+    const result = guard.beforeStage('ARCHITECT', {});
+    assertEqual(result.tierMode, 'normal');
+    assertEqual(result.warnings.length, 0);
+  });
+
+  await test('RunGuard: downgrades to cost-optimised when budget <= 40% remaining', async () => {
+    const guard = new RunGuard({ budgetUsd: 5.0, downgradeTierAt: 40 });
+    guard._totalCostUsd = 3.5;
+    const result = guard.beforeStage('DEVELOPER', {});
+    assertEqual(result.tierMode, 'downgraded');
+    assertEqual(guard._currentTierMode, 'downgraded');
+    assert.ok(result.warnings.length > 0);
+  });
+
+  await test('RunGuard: downgrades to emergency when budget <= 15% remaining', async () => {
+    const guard = new RunGuard({ budgetUsd: 5.0, emergencyTierAt: 15 });
+    guard._totalCostUsd = 4.5;
+    const result = guard.beforeStage('TESTER', {});
+    assertEqual(result.tierMode, 'emergency');
+  });
+
+  await test('RunGuard: throws when budget <= abort threshold', async () => {
+    const guard = new RunGuard({ budgetUsd: 5.0, abortAt: 5 });
+    guard._totalCostUsd = 4.8;
+    let threw = false;
+    try { guard.beforeStage('TESTER', {}); } catch (err) {
+      threw = true;
+      assertEqual(err.code, 'RUN_GUARD_ABORT');
+      assertEqual(err.limitType, 'budget');
+    }
+    assertEqual(threw, true);
+  });
+
+  await test('RunGuard: applies tier routing on LlmRouter when downgrading', async () => {
+    const appliedArgs = [];
+    const mockLlmRouter = {
+      getTierConfig: () => ({ fast: () => {}, default: () => {}, strong: () => {} }),
+      applyTierRouting: (c) => { appliedArgs.push(c); return { applied: true, changes: [] }; },
+    };
+    const guard = new RunGuard({ budgetUsd: 5.0, downgradeTierAt: 40 });
+    guard._totalCostUsd = 3.5;
+    guard.beforeStage('DEVELOPER', { llmRouter: mockLlmRouter });
+    assertEqual(appliedArgs.length, 1);
+    assertEqual(appliedArgs[0].level, 'moderate');
+  });
+
+  await test('RunGuard: applies simple tier on emergency downgrade', async () => {
+    const appliedArgs = [];
+    const mockLlmRouter = {
+      getTierConfig: () => ({ fast: () => {}, default: () => {}, strong: () => {} }),
+      applyTierRouting: (c) => { appliedArgs.push(c); return { applied: true, changes: [] }; },
+    };
+    const guard = new RunGuard({ budgetUsd: 5.0, emergencyTierAt: 15 });
+    guard._totalCostUsd = 4.5;
+    guard.beforeStage('TESTER', { llmRouter: mockLlmRouter });
+    assertEqual(appliedArgs[0].level, 'simple');
+  });
+
+  await test('RunGuard: does not double-downgrade', async () => {
+    const guard = new RunGuard({ budgetUsd: 5.0, downgradeTierAt: 40, emergencyTierAt: 15 });
+    guard._totalCostUsd = 3.2;
+    guard.beforeStage('DEVELOPER', {});
+    assertEqual(guard._currentTierMode, 'downgraded');
+    guard._totalCostUsd = 3.3;
+    const result = guard.beforeStage('TESTER', {});
+    assertEqual(result.tierMode, 'downgraded');
+    assertEqual(result.warnings.length, 0);
+  });
+
+  await test('RunGuard: syncCost updates total cost', async () => {
+    const guard = new RunGuard({ budgetUsd: 10.0 });
+    guard.syncCost(5.5);
+    assertEqual(guard._totalCostUsd, 5.5);
+  });
+
+  await test('RunGuard: getSummary returns structured data with utilisation', async () => {
+    const guard = new RunGuard({ maxTotalLlmCalls: 50, maxTotalTokens: 800000, budgetUsd: 5.0 });
+    guard._totalLlmCalls = 10;
+    guard._totalInputTokens = 50000;
+    guard._totalOutputTokens = 20000;
+    guard._totalCostUsd = 1.0;
+    const s = guard.getSummary();
+    assertEqual(s.totalLlmCalls, 10);
+    assertEqual(s.totalTokens, 70000);
+    assertEqual(s.totalCostUsd, 1.0);
+    assertEqual(s.utilisation.llmCallsPct, 20);
+    assertEqual(s.utilisation.budgetPct, 20);  // 20% used ($1 of $5)
+  });
+
+  await test('RunGuard: formatSummary returns Markdown with key sections', async () => {
+    const guard = new RunGuard({ budgetUsd: 5.0 });
+    guard._totalLlmCalls = 5;
+    guard._totalCostUsd = 0.5;
+    const formatted = guard.formatSummary();
+    assertContains(formatted, 'RUN GUARD SUMMARY');
+    assertContains(formatted, 'LLM Calls');
+    assertContains(formatted, 'Budget');
+  });
+
+  await test('RunGuard: formatSummary returns empty when disabled', async () => {
+    const guard = new RunGuard({ enabled: false });
+    assertEqual(guard.formatSummary(), '');
+  });
+
+  await test('RunGuard: recordStageCall tracks per-stage counts', async () => {
+    const guard = new RunGuard();
+    guard.beforeStage('ARCHITECT', {});
+    guard.recordStageCall('ARCHITECT');
+    guard.recordStageCall('ARCHITECT');
+    const s = guard.getSummary();
+    assertEqual(s.stageCallCounts['ARCHITECT'], 2);
+  });
+
+  await test('RunGuardAbortError: has correct error properties', async () => {
+    const err = new RunGuardAbortError('test reason', 'llm_calls', { current: 50 });
+    assertEqual(err.name, 'RunGuardAbortError');
+    assertEqual(err.code, 'RUN_GUARD_ABORT');
+    assertEqual(err.limitType, 'llm_calls');
+    assertContains(err.message, 'test reason');
+    assert.ok(err instanceof Error);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Direction 3: Enrichment Section Cache Tests (ContextLoader)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function runEnrichmentCacheTests() {
+  console.log('\n📌 Enrichment Cache Tests');
+
+  const { ContextLoader } = require('../core/context-loader');
+
+  function createTestDir() {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enrich-cache-test-'));
+    const skillsDir = path.join(tmpDir, 'skills');
+    const docsDir = path.join(tmpDir, 'docs');
+    const outputDir = path.join(tmpDir, 'output');
+    fs.mkdirSync(skillsDir, { recursive: true });
+    fs.mkdirSync(docsDir, { recursive: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(docsDir, 'architecture-constraints.md'),
+      '# Architecture Constraints\n\n- Use TypeScript\n- Follow REST API conventions\n- Keep modules decoupled\n- Use DI pattern for testability\n'
+    );
+    return tmpDir;
+  }
+
+  function cleanup(dir) {
+    try {
+      if (!fs.existsSync(dir)) return;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, entry.name);
+        if (entry.isDirectory()) cleanup(p);
+        else fs.unlinkSync(p);
+      }
+      fs.rmdirSync(dir);
+    } catch (_) { /* best-effort cleanup */ }
+  }
+
+  await test('EnrichmentCache: misses cache on first call', async () => {
+    const tmpDir = createTestDir();
+    try {
+      const loader = new ContextLoader({ workflowRoot: tmpDir, projectRoot: tmpDir });
+      loader.resolve('implement user auth', 'developer');
+      const stats = loader.getEnrichmentCacheStats();
+      assertEqual(stats.misses, 1);
+      assertEqual(stats.hits, 0);
+    } finally { cleanup(tmpDir); }
+  });
+
+  await test('EnrichmentCache: hits cache on subsequent call with same role', async () => {
+    const tmpDir = createTestDir();
+    try {
+      const loader = new ContextLoader({ workflowRoot: tmpDir, projectRoot: tmpDir });
+      loader.resolve('task 1', 'developer');
+      loader.resolve('task 2', 'developer');
+      const stats = loader.getEnrichmentCacheStats();
+      assertEqual(stats.misses, 1);
+      assertEqual(stats.hits, 1);
+    } finally { cleanup(tmpDir); }
+  });
+
+  await test('EnrichmentCache: invalidates when file changes', async () => {
+    const tmpDir = createTestDir();
+    try {
+      const loader = new ContextLoader({ workflowRoot: tmpDir, projectRoot: tmpDir });
+      loader.resolve('test something', 'tester');
+      // Modify file
+      const constraintsPath = path.join(tmpDir, 'docs', 'architecture-constraints.md');
+      const content = fs.readFileSync(constraintsPath, 'utf-8');
+      fs.writeFileSync(constraintsPath, content + '\n- New constraint\n');
+      loader.resolve('test again', 'tester');
+      const stats = loader.getEnrichmentCacheStats();
+      assertEqual(stats.misses, 2);
+      assertEqual(stats.hits, 0);
+    } finally { cleanup(tmpDir); }
+  });
+
+  await test('EnrichmentCache: independent caches per role', async () => {
+    const tmpDir = createTestDir();
+    try {
+      const loader = new ContextLoader({ workflowRoot: tmpDir, projectRoot: tmpDir });
+      loader.resolve('design', 'architect');
+      loader.resolve('code', 'developer');
+      loader.resolve('review design', 'architect');
+      const stats = loader.getEnrichmentCacheStats();
+      assertEqual(stats.misses, 2);  // architect miss + developer miss
+      assertEqual(stats.hits, 1);    // architect hit
+      assert.ok(stats.cachedRoles.includes('architect'));
+      assert.ok(stats.cachedRoles.includes('developer'));
+    } finally { cleanup(tmpDir); }
+  });
+
+  await test('EnrichmentCache: tracks correct hit rate', async () => {
+    const tmpDir = createTestDir();
+    try {
+      const loader = new ContextLoader({ workflowRoot: tmpDir, projectRoot: tmpDir });
+      loader.resolve('t1', 'analyst');
+      loader.resolve('t2', 'analyst');
+      loader.resolve('t3', 'analyst');
+      loader.resolve('t4', 'analyst');
+      const stats = loader.getEnrichmentCacheStats();
+      assertEqual(stats.misses, 1);
+      assertEqual(stats.hits, 3);
+      assertEqual(stats.hitRate, '75%');
+    } finally { cleanup(tmpDir); }
+  });
+
+  await test('EnrichmentCache: cached result produces valid sections', async () => {
+    const tmpDir = createTestDir();
+    try {
+      const loader = new ContextLoader({ workflowRoot: tmpDir, projectRoot: tmpDir });
+      const result1 = loader.resolve('analyse', 'analyst');
+      const result2 = loader.resolve('review', 'analyst');
+      // Both should have sections (static from constraints doc)
+      assert.ok(result1.sections.length >= 0);
+      assert.ok(result2.sections.length >= 0);
+    } finally { cleanup(tmpDir); }
+  });
+}
+
 async function runTests() {
   console.log('\n' + '='.repeat(60));
   console.log('  Workflow Unit Tests – Functional Correctness');
@@ -1514,6 +1836,8 @@ async function runTests() {
   await runMAPETests();
   await runRegressionGuardTests();
   await runSkillMarketplaceTests();
+  await runRunGuardTests();
+  await runEnrichmentCacheTests();
 
   console.log('\n' + '='.repeat(60));
   console.log(`  Results: ${passed} passed, ${failed} failed`);

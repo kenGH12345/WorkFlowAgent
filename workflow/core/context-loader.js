@@ -151,6 +151,20 @@ class ContextLoader {
     // The cache is per-instance; when a new ContextLoader is created, it starts fresh.
     /** @type {Map<string, { content: string, mtime: number }>} */
     this._fileCache = new Map();
+
+    // ── Direction 3: Enrichment Section Cache ─────────────────────────────────
+    // Caches the processed sections (Markdown output) for role-mandatory docs,
+    // global skills, project skills, and always-load skills. These sections
+    // don't depend on taskText — only on file content (mtime) and role.
+    // Key: `${role}:${filePath}`, Value: { sections, sources, tokens, mtime }
+    // This avoids redundant file processing, ADR extraction, code-graph
+    // truncation, and token estimation across multiple buildAgentPrompt() calls.
+    /** @type {Map<string, { sections: string[], sources: string[], tokens: number, mtimes: Map<string,number> }>} */
+    this._enrichmentCache = new Map();
+    /** @type {number} Cache hit counter for observability */
+    this._enrichmentCacheHits = 0;
+    /** @type {number} Cache miss counter for observability */
+    this._enrichmentCacheMisses = 0;
   }
 
   /**
@@ -194,6 +208,18 @@ class ContextLoader {
     const sections = [];
     const sources  = [];
     let   budget   = MAX_INJECT_TOKENS;
+
+    // ── Direction 3: Try enrichment cache for static layers (1-4) ──────────
+    // Layers 1-4 (role-mandatory docs, global/project/always-load skills) don't
+    // depend on taskText. Cache their processed sections keyed by role + file mtimes.
+    // Only Layer 5 (task-matched skills) and ADR digest vary with taskText.
+    const staticCacheResult = this._resolveStaticLayersCached(role, taskText);
+    if (staticCacheResult) {
+      sections.push(...staticCacheResult.sections);
+      sources.push(...staticCacheResult.sources);
+      budget -= staticCacheResult.tokens;
+    } else {
+    // Cache miss — compute static layers the normal way
 
     // 1. Role-mandatory docs (always injected first, highest priority)
     const mandatoryDocs = ROLE_MANDATORY_DOCS[role] || [];
@@ -310,6 +336,11 @@ class ContextLoader {
       }
     }
 
+    // Direction 3: Store computed static layers in cache for next call
+    this._storeStaticLayersCache(role, sections, sources, MAX_INJECT_TOKENS - budget);
+
+    } // end of cache-miss block
+
     // 5. Level 3 – Task skills (keyword-matched from task text)
     const matchedSkills = this._matchSkills(taskText, role);
     for (const skillName of matchedSkills) {
@@ -329,6 +360,107 @@ class ContextLoader {
     }
 
     return { sections, tokenCount, sources };
+  }
+
+  // ─── Direction 3: Enrichment Section Cache ─────────────────────────────
+
+  /**
+   * Attempts to resolve static layers (1-4) from the enrichment cache.
+   * Returns cached result if all source files have unchanged mtimes.
+   *
+   * @param {string} role
+   * @param {string} taskText - Only needed for ADR digest (which is NOT cached)
+   * @returns {{ sections: string[], sources: string[], tokens: number }|null}
+   * @private
+   */
+  _resolveStaticLayersCached(role, taskText) {
+    const cacheKey = `static:${role}`;
+    const cached = this._enrichmentCache.get(cacheKey);
+    if (!cached) {
+      this._enrichmentCacheMisses++;
+      return null;
+    }
+
+    // Validate: check if any source file has changed since cache was built
+    for (const [filePath, cachedMtime] of cached.mtimes) {
+      try {
+        if (!fs.existsSync(filePath)) {
+          this._enrichmentCacheMisses++;
+          return null; // file deleted — invalidate
+        }
+        const currentMtime = fs.statSync(filePath).mtimeMs;
+        if (currentMtime !== cachedMtime) {
+          this._enrichmentCacheMisses++;
+          return null; // file modified — invalidate
+        }
+      } catch {
+        this._enrichmentCacheMisses++;
+        return null;
+      }
+    }
+
+    // Cache hit! Reset the per-resolve dedup tracker from cached sources
+    this._loadedSkillsInResolve = new Set();
+    for (const src of cached.sources) {
+      const name = src.replace(/\.md.*$/, '').replace(/\s*\(.*\)$/, '');
+      if (name && !name.includes('/') && !name.includes('\\')) {
+        this._loadedSkillsInResolve.add(name);
+      }
+    }
+
+    this._enrichmentCacheHits++;
+    if (this._enrichmentCacheHits % 5 === 0) {
+      console.log(
+        `[ContextLoader] ⚡ Enrichment cache: ${this._enrichmentCacheHits} hits / ` +
+        `${this._enrichmentCacheMisses} misses (saving ~${cached.tokens * this._enrichmentCacheHits} token estimations)`
+      );
+    }
+
+    return {
+      sections: [...cached.sections],
+      sources: [...cached.sources],
+      tokens: cached.tokens,
+    };
+  }
+
+  /**
+   * Stores the computed static layer results in the enrichment cache.
+   *
+   * @param {string}   role
+   * @param {string[]} sections
+   * @param {string[]} sources
+   * @param {number}   tokens
+   * @private
+   */
+  _storeStaticLayersCache(role, sections, sources, tokens) {
+    const cacheKey = `static:${role}`;
+
+    // Collect mtimes for all source files in the file cache
+    const mtimes = new Map();
+    for (const [filePath, entry] of this._fileCache) {
+      mtimes.set(filePath, entry.mtime);
+    }
+
+    this._enrichmentCache.set(cacheKey, {
+      sections: [...sections],
+      sources: [...sources],
+      tokens,
+      mtimes,
+    });
+  }
+
+  /**
+   * Returns enrichment cache statistics for observability.
+   * @returns {{ hits: number, misses: number, hitRate: string, cachedRoles: string[] }}
+   */
+  getEnrichmentCacheStats() {
+    const total = this._enrichmentCacheHits + this._enrichmentCacheMisses;
+    return {
+      hits: this._enrichmentCacheHits,
+      misses: this._enrichmentCacheMisses,
+      hitRate: total > 0 ? `${(this._enrichmentCacheHits / total * 100).toFixed(0)}%` : 'n/a',
+      cachedRoles: [...this._enrichmentCache.keys()].map(k => k.replace('static:', '')),
+    };
   }
 
   // ─── Skill Matching ───────────────────────────────────────────────────────
