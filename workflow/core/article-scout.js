@@ -170,6 +170,9 @@ class ArticleScout {
     const report = this._generateReport(allEvaluations, startTime, injectedCount);
     this._writeReport(report, allEvaluations);
 
+    // Update lastArticleScoutAt timestamp
+    this._updateTimestamp();
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     const highValue = allEvaluations.filter(e => e.compositeScore >= minScore).length;
     console.log(`[ArticleScout] ✅ Scout complete in ${elapsed}s: ${allEvaluations.length} article(s) evaluated, ${highValue} high-value, ${injectedCount} entries injected.`);
@@ -352,6 +355,16 @@ class ArticleScout {
     }
   }
 
+  // ─── Private: Timestamp Management ──────────────────────────────────────
+
+  _updateTimestamp() {
+    try {
+      if (this._orch && this._orch._manifest && this._orch._manifest.meta) {
+        this._orch._manifest.meta.lastArticleScoutAt = new Date().toISOString();
+      }
+    } catch (_) { /* non-fatal */ }
+  }
+
   _log(msg) {
     if (this._verbose) {
       console.log(`[ArticleScout] ${msg}`);
@@ -361,4 +374,27 @@ class ArticleScout {
   }
 }
 
-module.exports = { ArticleScout, DEFAULT_SCOUT_TOPICS, SCORE_WEIGHTS, MIN_COMPOSITE_SCORE };
+// ─── Static Helper: Staleness Check ─────────────────────────────────────────
+
+/**
+ * Checks if ArticleScout scan is stale (>14 days since last scan).
+ * Used by Orchestrator._finalizeWorkflow() to trigger reminder.
+ *
+ * @param {object} manifestMeta - The manifest.meta object
+ * @returns {{ isStale: boolean, daysSince: number, lastScan: string|null }}
+ */
+function isArticleScoutStale(manifestMeta) {
+  const STALE_DAYS = 14;
+  const lastScan = manifestMeta && manifestMeta.lastArticleScoutAt;
+  const daysSince = lastScan
+    ? (Date.now() - new Date(lastScan).getTime()) / (24 * 60 * 60 * 1000)
+    : Infinity;
+
+  return {
+    isStale: daysSince > STALE_DAYS,
+    daysSince: Math.round(daysSince),
+    lastScan: lastScan || null,
+  };
+}
+
+module.exports = { ArticleScout, DEFAULT_SCOUT_TOPICS, SCORE_WEIGHTS, MIN_COMPOSITE_SCORE, isArticleScoutStale };

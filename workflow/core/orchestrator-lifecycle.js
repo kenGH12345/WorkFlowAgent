@@ -229,6 +229,20 @@ module.exports = {
       }
     }
 
+    // ── Step 6b: P1 fix – Set ExperienceStore reference in PromptBuilder for synonym expansion ──
+    if (!this._initCompleted.has('experienceStoreRef')) {
+      try {
+        if (this.experienceStore) {
+          const { setExperienceStore } = require('./prompt-builder');
+          setExperienceStore(this.experienceStore);
+          console.log(`[Orchestrator] 🔗 ExperienceStore linked to PromptBuilder (synonym expansion enabled).`);
+        }
+        this._initCompleted.add('experienceStoreRef');
+      } catch (err) {
+        console.warn(`[Orchestrator] ⚠️  [P1-4] Step 6b (ExperienceStore Ref) failed (non-fatal): ${err.message}`);
+      }
+    }
+
     // ── Steps 7-9: Island modules (Logger, Negotiation, ExperienceRouter) ──
     if (!this._initCompleted.has('islandModules')) {
       try {
@@ -360,6 +374,11 @@ module.exports = {
    * @param {object} [extra] - Additional fields merged into the WORKFLOW_COMPLETE payload
    */
   async _finalizeWorkflow(mode, extra = {}) {
+    // ── Smart Trigger: determine which evolution modules should run ───────────
+    // Avoids unnecessary token consumption by only running modules when conditions
+    // indicate they will produce meaningful results.
+    const shouldEvolve = this._shouldTriggerEvolution();
+
     // Flush all in-memory risk entries to the manifest checkpoint
     if (this.stateMachine.flushRisks) {
       this.stateMachine.flushRisks();
@@ -440,7 +459,8 @@ module.exports = {
     // Inspired by AEF's self-refinement skill: analyse the workflow run for
     // error patterns and generate refinement suggestions.
     // Two channels: automatic (low-severity, auto-evolve) and prudent (high-severity, suggest only).
-    if (this.complaintWall && this.skillEvolution && this.experienceStore) {
+    // Smart Trigger: only run if there are open complaints or negative experiences.
+    if (this.complaintWall && this.skillEvolution && this.experienceStore && shouldEvolve.aefRefinement) {
       try {
         const openComplaints = this.complaintWall.getOpenComplaints();
         const negativeExps = this.experienceStore.getAll ? this.experienceStore.getAll().filter(e => e.type === 'negative') : [];
@@ -493,6 +513,8 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
       } catch (srErr) {
         console.warn(`[Orchestrator] ⚠️  AEF Self-Refinement analysis failed (non-fatal): ${srErr.message}`);
       }
+    } else if (this.complaintWall && !shouldEvolve.aefRefinement) {
+      console.log(`[Orchestrator] ⏭️  AEF Self-Refinement skipped (no open complaints or negative experiences)`);
     }
 
     // ── Prompt A/B: snapshot variant stats into Observability before flush ──
@@ -523,7 +545,8 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
     // This is the integration point where SelfReflectionEngine hooks into the
     // workflow lifecycle. It runs AFTER all stages complete but BEFORE the
     // Observability flush, so gating results are captured in the session report.
-    if (this._selfReflection) {
+    // Smart Trigger: only run if there are errors or the workflow took long.
+    if (this._selfReflection && shouldEvolve.selfReflection) {
       try {
         // Step 1: Flush current metrics snapshot for validation
         const preFlushMetrics = this.obs.getMetricsSnapshot ? this.obs.getMetricsSnapshot() : null;
@@ -549,6 +572,9 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
       } catch (srErr) {
         console.warn(`[Orchestrator] ⚠️  Self-Reflection integration failed (non-fatal): ${srErr.message}`);
       }
+    } else if (this._selfReflection && !shouldEvolve.selfReflection) {
+      // Log skip reason for observability
+      console.log(`[Orchestrator] ⏭️  Self-Reflection skipped (no errors, short session)`);
     }
 
     // ── P0 Prompt Tracing: flush prompt trace digests to prompt-traces.jsonl ──
@@ -689,7 +715,8 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
     // After metrics are flushed, re-derive the adaptive strategy from updated
     // history and auto-apply any config parameter changes to workflow.config.js.
     // This closes the loop: run workflow → collect metrics → adjust config → next run.
-    if (this.autoDeployer) {
+    // Smart Trigger: only run if strategy source is not 'defaults' (i.e., we have history).
+    if (this.autoDeployer && shouldEvolve.autoDeploy) {
       try {
         const Observability = require('./observability');
         const cfgAutoFix = (this._config && this._config.autoFixLoop) || {};
@@ -709,6 +736,8 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
       } catch (adErr) {
         console.warn(`[Orchestrator] ⚠️  Auto-Deploy (YELLOW) failed (non-fatal): ${adErr.message}`);
       }
+    } else if (this.autoDeployer && !shouldEvolve.autoDeploy) {
+      console.log(`[Orchestrator] ⏭️  Auto-Deploy YELLOW skipped (no strategy history)`);
     }
 
     // Print Observability dashboard (session metrics summary)
@@ -724,6 +753,18 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
       console.log(`[Orchestrator] 📊 HTML session report: ${reportPath}`);
     } catch (htmlErr) {
       console.warn(`[Orchestrator] ⚠️  HTML report generation failed (non-fatal): ${htmlErr.message}`);
+    }
+
+    // P3 fix: Generate cross-session trends report (long-term evolution tracking)
+    try {
+      const ObsStrategy = require('./observability-strategy');
+      const history = ObsStrategy.loadHistory(PATHS.OUTPUT_DIR);
+      const trendsPath = ObsStrategy.generateTrendsReport(history, PATHS.OUTPUT_DIR);
+      if (trendsPath) {
+        console.log(`[Orchestrator] 📈 Cross-session trends report: ${trendsPath}`);
+      }
+    } catch (trendsErr) {
+      console.warn(`[Orchestrator] ⚠️  Trends report generation failed (non-fatal): ${trendsErr.message}`);
     }
 
     // ── P3 Cross-Stage Risk Correlation Analysis ─────────────────────────────
@@ -893,6 +934,141 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
     // ── Git PR workflow ──────────────────────────────────────────────────────
     if (this._gitOptions.enabled && !this.dryRun) {
       await this._runGitPRWorkflow(mode, extra);
+    }
+
+    // ── P0 MAPE Engine: Self-Adaptive Closed-Loop ───────────────────────────
+    // Runs the MAPE cycle (Monitor-Analyze-Plan-Execute) to detect anomalies,
+    // identify root causes, and automatically apply fixes. This closes the
+    // self-adaptive loop: run workflow → detect issues → auto-fix → next run.
+    // Reference: ADR-35 MAPE Engine for Self-Adaptive Workflow Optimization.
+    // Smart Trigger: only run if there are anomaly signals or metrics history.
+    if (shouldEvolve.mape) {
+      try {
+        const { MAPEEngine } = require('./mape-engine');
+        const mape = new MAPEEngine({ orchestrator: this, verbose: this._verbose });
+
+        // Run MAPE cycle in dry-run mode first to see what actions would be taken
+        const mapeReport = await mape.runCycle({ dryRun: false, maxActions: 5 });
+
+        if (mapeReport.phases.monitor.signalCount > 0) {
+          console.log(`[Orchestrator] 🔄 MAPE Engine: ${mapeReport.phases.monitor.signalCount} signal(s) detected`);
+          console.log(`[Orchestrator]    → ${mapeReport.phases.analyze.rootCauses} root cause(s), ${mapeReport.phases.analyze.correlations} correlation(s)`);
+          console.log(`[Orchestrator]    → ${mapeReport.phases.execute.executed} action(s) executed, ${mapeReport.phases.execute.skipped} skipped`);
+        }
+
+        // Record MAPE results in observability for cross-session tracking
+        if (this.obs && typeof this.obs.recordCustomMetric === 'function') {
+          this.obs.recordCustomMetric('mape_cycle', {
+            signalCount: mapeReport.phases.monitor.signalCount,
+            rootCauses: mapeReport.phases.analyze.rootCauses,
+            correlations: mapeReport.phases.analyze.correlations,
+            executed: mapeReport.phases.execute.executed,
+            elapsed: mapeReport.elapsed,
+          });
+        }
+      } catch (mapeErr) {
+        console.warn(`[Orchestrator] ⚠️  MAPE Engine cycle failed (non-fatal): ${mapeErr.message}`);
+      }
+    } else {
+      console.log(`[Orchestrator] ⏭️  MAPE Engine skipped (no anomaly signals or insufficient history)`);
+    }
+
+    // ── Sleeptime Maintenance Pipeline ───────────────────────────────────────
+    // Unified orchestration of distill/purge/retire/audit. Replaces scattered
+    // calls with a single pipeline. Runs after Git PR so maintenance doesn't
+    // block the primary deliverable.
+    // Smart Trigger: only run if there are enough experiences or skills to maintain.
+    if (shouldEvolve.sleeptime) {
+      try {
+        const { sleeptime } = require('./sleeptime');
+        const sleeptimeResult = sleeptime({
+          experienceStore: this.experienceStore,
+          skillEvolution: this.skillEvolution,
+          selfReflection: this._selfReflection,
+          verbose: true,
+        });
+        // Record sleeptime results in observability for cross-session tracking
+        if (this.obs && typeof this.obs.recordCustomMetric === 'function') {
+          this.obs.recordCustomMetric('sleeptime', {
+            totalDurationMs: sleeptimeResult.totalDurationMs,
+            stages: sleeptimeResult.stages.map(s => ({ name: s.name, status: s.status })),
+          });
+        }
+      } catch (stErr) {
+        console.warn(`[Orchestrator] ⚠️  Sleeptime pipeline failed (non-fatal): ${stErr.message}`);
+      }
+    } else {
+      console.log(`[Orchestrator] ⏭️  Sleeptime skipped (low experience/skill count)`);
+    }
+
+    // ── Recall Memory: record task history for cross-session continuity ──────
+    try {
+      const { TaskHistory } = require('./task-history');
+      const taskHistory = new TaskHistory();
+      const metrics = this.obs.getMetricsSnapshot ? this.obs.getMetricsSnapshot() : {};
+      const allTasks = this.taskManager ? this.taskManager.getAllTasks() : [];
+      const doneTasks = allTasks.filter(t => t.status === 'done');
+      const failedTasks = allTasks.filter(t => t.status === 'failed' || t.status === 'exhausted');
+      const outcome = failedTasks.length === 0 ? 'success'
+                    : doneTasks.length > 0 ? 'partial'
+                    : 'failed';
+      taskHistory.record({
+        mode,
+        goal: extra.goal || this._currentRequirement || '',
+        projectId: this.projectId,
+        taskCount: allTasks.length,
+        taskTitles: doneTasks.map(t => t.title || '').slice(0, 10),
+        outcome,
+        metrics: {
+          durationMs: metrics.totalDurationMs || (Date.now() - (this.obs._startedAt || Date.now())),
+          errorCount: (metrics.errors && metrics.errors.count) || 0,
+          expRecorded: this.experienceStore ? this.experienceStore.getStats().total : 0,
+        },
+      });
+      console.log(`[Orchestrator] 📖 Task history recorded for recall memory (${taskHistory.getStats().totalEntries} total entries).`);
+
+      // Trigger incremental arch-knowledge-cache rebuild after task-history update
+      try {
+        const { rebuildCache } = require('./arch-knowledge-cache');
+        rebuildCache(this.projectRoot, { projectProfile: this._config && this._config.projectProfile });
+      } catch (cacheErr) {
+        console.warn(`[Orchestrator] ⚠️  Arch knowledge cache rebuild failed (non-fatal): ${cacheErr.message}`);
+      }
+    } catch (thErr) {
+      console.warn(`[Orchestrator] ⚠️  Task history recording failed (non-fatal): ${thErr.message}`);
+    }
+
+    // ── ADR-38: TechRadar Staleness Check ─────────────────────────────────────
+    // Remind user to run /techradar if >7 days since last tech scan.
+    // This follows the same pattern as Stale Skill Auto-Refresh (ADR-32 P4).
+    // Condition-triggered: zero daemon, zero background processes.
+    try {
+      const { isTechRadarStale } = require('./techradar');
+      const staleness = isTechRadarStale(this._manifest && this._manifest.meta);
+
+      if (staleness.isStale) {
+        const daysText = staleness.daysSince === Infinity ? 'never' : `${staleness.daysSince} days`;
+        console.log(`[Orchestrator] 🔔 TechRadar: ${daysText} since last tech scan.`);
+        console.log(`[Orchestrator]    Run /techradar to discover new techniques and evaluate upgrades.`);
+      }
+    } catch (trErr) {
+      // Non-fatal: TechRadar module may not be available
+    }
+
+    // ── ADR-32 P3: ArticleScout Staleness Check ───────────────────────────────
+    // Remind user to run /article-scout if >14 days since last article discovery.
+    // Complements TechRadar: TechRadar focuses on tech upgrades, ArticleScout on knowledge articles.
+    try {
+      const { isArticleScoutStale } = require('./article-scout');
+      const staleness = isArticleScoutStale(this._manifest && this._manifest.meta);
+
+      if (staleness.isStale) {
+        const daysText = staleness.daysSince === Infinity ? 'never' : `${staleness.daysSince} days`;
+        console.log(`[Orchestrator] 🔔 ArticleScout: ${daysText} since last article discovery.`);
+        console.log(`[Orchestrator]    Run /article-scout to discover high-value AI/Agent articles.`);
+      }
+    } catch (asErr) {
+      // Non-fatal: ArticleScout module may not be available
     }
   },
 
@@ -1311,13 +1487,22 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
         // LSP Enhancement: if an LSP adapter is connected, use it to replace
         // regex-based symbols with compiler-accurate data AND enhance call edges
         // for hotspot symbols via findReferences (Hybrid Strategy).
+        // IDE-First: When running inside an IDE, LSP adapter is not connected
+        // (skipped for IDE-native LSP). CodeGraph remains regex-based but the
+        // AI Agent can use IDE tools (view_code_item, codebase_search) for
+        // compiler-accurate data on-demand.
         let lspEnhanced = false;
         try {
           if (this.services && this.services.has('mcpRegistry')) {
             const registry = this.services.resolve('mcpRegistry');
             let lspAdapter;
             try { lspAdapter = registry.get('lsp'); } catch (_) { /* no LSP adapter */ }
-            if (lspAdapter && lspAdapter.isConnected) {
+            if (lspAdapter && lspAdapter._skippedForIDE) {
+              // IDE-First mode: LSP adapter was registered but skipped because
+              // IDE already provides LSP. CodeGraph uses regex-based indexing,
+              // which is still functional. Agent uses IDE tools for precision.
+              console.log(`[Orchestrator] 🏠 LSP enhancement skipped – IDE provides native LSP capabilities.`);
+            } else if (lspAdapter && lspAdapter.isConnected) {
               // P1: Inject LSP adapter into CodeGraph for query-time on-demand enrichment
               this.codeGraph.setLSPAdapter(lspAdapter);
 
@@ -1356,6 +1541,75 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
         console.warn(`[Orchestrator] Code graph update failed (non-fatal): ${err.message}`);
       }
     });
+  },
+
+  /**
+   * Smart Trigger: determines which evolution modules should run based on current state.
+   *
+   * This is the core of the "conditional trigger" optimization. Instead of running all
+   * evolution modules on every workflow completion, we check if there's meaningful work
+   * to do. This avoids unnecessary token consumption and improves performance.
+   *
+   * Trigger conditions:
+   *   - selfReflection: errorRate > 0 OR durationMs > 60s OR has quality gate history
+   *   - aefRefinement: has open complaints OR has negative experiences
+   *   - autoDeploy: has metrics history (source !== 'defaults')
+   *   - mape: has anomaly signals OR has metrics history (>= 3 sessions)
+   *   - sleeptime: experienceCount > 20 OR skillCount > 10
+   *
+   * @returns {{ selfReflection: boolean, aefRefinement: boolean, autoDeploy: boolean, mape: boolean, sleeptime: boolean }}
+   */
+  _shouldTriggerEvolution() {
+    const metrics = this.obs?.getMetricsSnapshot?.() || {};
+    const expStats = this.experienceStore?.getStats?.() || {};
+    const skillCount = this.skillEvolution?.registry?.size || 0;
+    const openComplaints = this.complaintWall?.getOpenComplaints?.() || [];
+    const negativeExps = this.experienceStore?.getAll?.()?.filter(e => e.type === 'negative') || [];
+
+    // Check metrics history for MAPE and Auto-Deploy
+    let hasMetricsHistory = false;
+    let historyLength = 0;
+    try {
+      const ObsStrategy = require('./observability-strategy');
+      const history = ObsStrategy.loadHistory(this._outputDir || PATHS.OUTPUT_DIR);
+      historyLength = history.length;
+      hasMetricsHistory = historyLength >= 3;
+    } catch (_) { /* non-fatal */ }
+
+    // Check for anomaly signals (quick scan without full MAPE cycle)
+    let hasAnomalySignals = false;
+    try {
+      const errorCount = (metrics.errors?.count || 0);
+      const tokenTrend = metrics.tokenTrend || 0;
+      const durationTrend = metrics.durationTrend || 0;
+      hasAnomalySignals = errorCount > 0 || tokenTrend > 0.1 || durationTrend > 0.2;
+    } catch (_) { /* non-fatal */ }
+
+    // Determine triggers
+    const selfReflection = (metrics.errors?.count || 0) > 0 ||
+                           (metrics.totalDurationMs || 0) > 60000 ||
+                           hasMetricsHistory;
+
+    const aefRefinement = openComplaints.length > 0 || negativeExps.length > 0;
+
+    const autoDeploy = hasMetricsHistory;
+
+    const mape = hasAnomalySignals || hasMetricsHistory;
+
+    const sleeptime = (expStats.total || 0) > 20 || skillCount > 10;
+
+    // Log trigger decisions in verbose mode
+    if (this._verbose) {
+      console.log(`[Orchestrator] 🎯 Smart Trigger: selfReflection=${selfReflection}, aefRefinement=${aefRefinement}, autoDeploy=${autoDeploy}, mape=${mape}, sleeptime=${sleeptime}`);
+    }
+
+    return {
+      selfReflection,
+      aefRefinement,
+      autoDeploy,
+      mape,
+      sleeptime,
+    };
   },
 };
 

@@ -1577,6 +1577,218 @@ Implemented all four P3 items in a single batch:
 - `commands/command-router.js` — Step 2+3 parallelized + incremental mode
 - `docs/decision-log.md` — ADR-36
 
+---
+
+## ADR-37: IDE-First Architecture — IDE Capabilities Preferred, Self-Built as Fallback
+
+**Status**: Accepted
+
+**Context**:
+WorkFlowAgent runs inside IDEs (Cursor, VS Code + Copilot, Claude Code, Windsurf) as an AI Agent
+driven by AGENTS.md. These IDEs already provide powerful built-in capabilities:
+- `codebase_search`: Semantic/vector code search (OpenAI embeddings, Turbopuffer)
+- `grep_search`: ripgrep-powered exact text search
+- `view_code_item`: Compiler-accurate symbol navigation
+- Built-in LSP: gotoDefinition, findReferences, hover, documentSymbols
+
+Meanwhile, WorkFlowAgent has self-built modules that overlap significantly:
+- `CodeGraph.search()`: TF-IDF keyword search (inferior to IDE's semantic search)
+- `CodeGraph.querySymbol()`: Regex-based symbol lookup (inferior to compiler-accurate LSP)
+- `LSPAdapter`: Self-spawns a second language server (redundant when IDE already has one)
+
+This created three layers of redundancy, wasting resources and risking conflicts.
+
+**Decision**:
+Adopt an **IDE-First, Self-Built Fallback** architecture:
+
+1. **`ide-detection.js`** (new): Detects IDE environment via env vars (VSCODE_PID, CURSOR_SESSION, etc.)
+   and exposes capability flags (codebaseSearch, grepSearch, builtinLSP, etc.)
+
+2. **LSPAdapter** (modified): When `shouldSkipLSPAdapter()` returns true, `connect()` sets
+   `_skippedForIDE = true` and returns immediately without spawning a language server process.
+
+3. **PromptBuilder** (modified): Injects a structured "IDE Tool Guidance" section into Agent prompts
+   when IDE is detected. This guidance instructs AI Agents to prefer IDE-native tools for search,
+   symbol navigation, and file reading, while using self-built context (CodeGraph hotspots, Skill
+   matching, Project profiling) for capabilities the IDE doesn't provide.
+
+4. **Orchestrator** (modified): Registers `ideDetection` in service container; skips LSP code graph
+   enhancement when LSP adapter was skipped for IDE.
+
+**Key principle**: IDE tools are always the first choice for capabilities they provide (search,
+symbols, LSP). Self-built modules are retained as fallback for non-IDE environments AND for
+unique capabilities that no IDE offers (hotspot analysis, skill matching, experience routing,
+project profiling, ADR digest).
+
+### Consequences
+
+**Positive:**
+- Eliminates redundant language server spawn inside IDE (saves memory + avoids conflicts)
+- Agent gets compiler-accurate search results via IDE tools instead of regex approximations
+- No self-built vector/embedding search needed — IDE already has it
+- All changes are backward-compatible: non-IDE environments still get full self-built capabilities
+- Zero new dependencies; detection uses only `process.env` inspection
+
+**Negative:**
+- Detection relies on environment variable heuristics (may need updates for new IDEs)
+- Agent prompt slightly longer when IDE guidance is injected (~1.7KB)
+- Self-built CodeGraph search is still built on every run (could be lazily skipped in future)
+
+### IDE Capability Mapping
+
+| Need | IDE Tool (preferred) | Self-Built (fallback) |
+|------|---------------------|----------------------|
+| Semantic search | `codebase_search` | CodeGraph.search() TF-IDF |
+| Exact text search | `grep_search` (ripgrep) | CodeGraph.search() substring |
+| Symbol lookup | `view_code_item` | CodeGraph.querySymbol() regex |
+| Go to definition | IDE built-in LSP | LSPAdapter (spawn) |
+| Find references | IDE built-in LSP | LSPAdapter (spawn) |
+| Type inference / hover | IDE built-in LSP (hover) | LSPAdapter.getHover() |
+| Hotspot analysis | ❌ (no equivalent) | CodeGraph (unique value) |
+| Skill matching | ❌ (no equivalent) | ContextLoader (unique value) |
+| Project profiling | ❌ (no equivalent) | ProjectProfiler (unique value) |
+| Experience routing | ❌ (no equivalent) | ExperienceRouter (unique value) |
+
+### Files Changed
+
+- `core/ide-detection.js` — New: IDE environment detection + capability mapping + prompt guidance generator
+- `hooks/adapters/lsp-adapter.js` — Modified: skip spawn when IDE provides LSP
+- `core/prompt-builder.js` — Modified: inject IDE Tool Guidance into Agent prompts
+- `core/orchestrator-mcp.js` — Modified: IDE detection init + logging
+- `core/orchestrator-lifecycle.js` — Modified: skip LSP enhancement when adapter skipped for IDE
+- `docs/decision-log.md` — ADR-37
+
+---
+
+## ADR-20260321-41: Long Task Protocol & Progress Beacon (Anti-Amnesia)
+
+**Status**: Accepted
+
+**Context**:
+When processing complex multi-step tasks (e.g. "analyse and optimise 10 modules"), LLM agents
+suffer from "deep-dive amnesia" — after spending significant context on the details of early
+steps, the agent loses awareness of the global task list and forgets later steps.
+
+This affects both automated workflows (runTaskBased) and interactive dialogue mode (/wf commands).
+Users also lack a clear way to see overall progress across all tasks/steps.
+
+**Root Causes**:
+1. LLM attention decays for earlier context as conversation grows
+2. No external task tracking in interactive dialogue mode
+3. No per-task progress injection in automated workflow mode
+4. No standardised user-visible progress display protocol
+
+**Decision**:
+
+### 1. Progress Beacon (Automated Workflow)
+Inject a compact progress snapshot (~100-200 tokens) into every task's Agent context in
+`orchestrator-task.js:_executeTask()`. The beacon shows ✅ done, 🔄 current, ⬜ remaining
+tasks with a reminder of how many tasks are left.
+
+Implementation: `_buildProgressBeacon(currentTaskId)` in orchestrator-task.js.
+
+### 2. Long Task Protocol (Interactive Dialogue)
+Added to `agent-collaboration.md`: when handling multi-step requests in interactive mode,
+agents MUST display a numbered progress checklist, update it after each step, and carry
+forward key decisions that affect later steps.
+
+### 3. User-Visible Progress Display Protocol
+Standardised how users see progress:
+- Phase markers (🔍 ✅ ⚠️) during execution
+- Progress dashboard (📍 N/M completed + checklist) for multi-step tasks
+- Error/block visibility (❌ FAILED, ⚠️ BLOCKED with action needed)
+- Final completion summary (🎉 All N/N done)
+
+### 4. Scratchpad File (Optional Enhancement)
+For 5+ step tasks, agents may create `output/scratchpad.md` as external working memory
+to persist task state across context boundaries.
+
+**Consequences**:
+- Agents always know "where am I" even deep into a complex task
+- Users can clearly monitor progress at all times
+- Token cost is negligible (~200 tokens per task for the beacon)
+- Interactive dialogue mode now has structured progress tracking
+- Key decisions are explicitly carried forward between steps
+
+### Files Changed
+
+- `core/orchestrator-task.js` — New: `_buildProgressBeacon()`, Progress Beacon injection in `_executeTask()`
+- `docs/agent-collaboration.md` — New: Long Task Protocol + User-Visible Progress Display Protocol
+- `AGENTS.md` — Updated: Critical Rules #8 + Progress Beacon section
+- `docs/decision-log.md` — ADR-41
+
+---
+
+## ADR-42: ArticleScout Staleness Check — Condition-Triggered Article Discovery
+
+**Status**: Accepted
+**Date**: 2026-03-24
+
+### Context
+
+ADR-38 (TechRadar) established the pattern of condition-triggered staleness checks for web-based learning modules. ArticleScout (ADR-32 P3) is another module that discovers knowledge from the web, but it currently only supports manual `/article-scout` command execution.
+
+This creates a gap in the self-evolution closed loop:
+- TechRadar: ✅ Auto-reminds after 7 days
+- ArticleScout: ❌ No staleness check, relies on manual execution only
+- SkillRefresh: ✅ Auto-triggers after 90 days
+
+### Decision
+
+Add staleness check to ArticleScout following the same pattern as TechRadar:
+
+1. **Staleness threshold**: 14 days (vs TechRadar's 7 days)
+   - Rationale: Article discovery is less time-sensitive than tech upgrades
+   - Articles have longer shelf-life than rapidly evolving tech techniques
+
+2. **Trigger location**: `_finalizeWorkflow()` in orchestrator-lifecycle.js
+   - Same location as TechRadar check
+   - Zero daemon, zero background processes
+   - User-controlled: reminds but doesn't auto-execute
+
+3. **Timestamp tracking**: `manifest.meta.lastArticleScoutAt`
+   - Updated after each successful ArticleScout run
+   - Persisted in workflow manifest
+
+4. **Reminder format**:
+   ```
+   [Orchestrator] 🔔 ArticleScout: N days since last article discovery.
+   [Orchestrator]    Run /article-scout to discover high-value AI/Agent articles.
+   ```
+
+### Self-Evolution Closed Loop (Updated)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  WorkFlowAgent Self-Evolution - Web Learning Modules            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  TechRadar (7 days)     → Tech upgrade evaluation               │
+│  ArticleScout (14 days) → Article knowledge discovery  ← NEW    │
+│  SkillRefresh (90 days) → Skill content refresh                 │
+│                                                                 │
+│  All condition-triggered, zero daemon, user-controlled          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Consequences
+
+**Positive:**
+- Completes the web-based learning staleness check pattern
+- ArticleScout now has same UX as TechRadar (reminder, not auto-execute)
+- Zero additional runtime overhead
+- Consistent with ADR-37 IDE-First principle (user controls execution)
+
+**Negative:**
+- None identified
+
+### Files Changed
+
+- `core/article-scout.js` — New: `isArticleScoutStale()`, `_updateTimestamp()`
+- `core/orchestrator-lifecycle.js` — New: ArticleScout staleness check in `_finalizeWorkflow()`
+- `docs/decision-log.md` — ADR-42
+
 
 
 
