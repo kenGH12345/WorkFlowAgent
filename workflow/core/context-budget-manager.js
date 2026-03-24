@@ -15,9 +15,11 @@
 
 const {
   STAGE_TOKEN_BUDGET_CHARS,
+  STAGE_TOKEN_BUDGET_TOKENS,
   BLOCK_PRIORITY,
   _applyTokenBudget,
   ToolResultFilter,
+  getBudgetSummary,
 } = require('./token-budget');
 
 const {
@@ -49,8 +51,10 @@ const {
 module.exports = {
   // Token budget
   STAGE_TOKEN_BUDGET_CHARS,
+  STAGE_TOKEN_BUDGET_TOKENS,
   BLOCK_PRIORITY,
   _applyTokenBudget,
+  getBudgetSummary,
   // P1: Tool Result Filter (Programmatic Tool Calling)
   ToolResultFilter,
   // Web search

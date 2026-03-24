@@ -44,6 +44,10 @@ class StateMachine {
     // calls from corrupting the manifest. In a single Node.js process, async
     // operations can interleave if two callers await transition() simultaneously.
     this._transitionLock = null;
+    // P0-1 fix: FIFO wait queue replaces the old busy-wait polling loop.
+    // Each waiter pushes { caller, resolve } and is unblocked in order
+    // when _releaseTransitionLock() shifts the next entry.
+    this._lockWaitQueue = [];
   }
 
   // ─── Initialisation  }
@@ -126,43 +130,56 @@ class StateMachine {
   async transition(artifactPath = null, note = '') {
     await this._acquireTransitionLock('transition');
     try {
-      const fromState = this.getState();
-      const toState = this.getNextState();
-
-      if (!toState) {
-        throw new Error(`[StateMachine] Cannot transition: already in terminal state "${fromState}"`);
-      }
-
-      // Emit before-transition hook
-      await this.hookEmitter(HOOK_EVENTS.BEFORE_STATE_TRANSITION, { fromState, toState, artifactPath });
-
-      // Update manifest
-      const entry = createHistoryEntry(fromState, toState, artifactPath, note);
-      this.manifest.history.push(entry);
-      this.manifest.currentState = toState;
-      this.manifest.updatedAt = new Date().toISOString();
-
-      // Record artifact path
-      if (artifactPath) {
-        this._recordArtifact(toState, artifactPath);
-      }
-
-      this._writeManifest();
-
-      console.log(`[StateMachine] Transition: ${fromState} → ${toState}${artifactPath ? ` (artifact: ${artifactPath})` : ''}`);
-
-      // Emit after-transition hook
-      await this.hookEmitter(HOOK_EVENTS.AFTER_STATE_TRANSITION, { fromState, toState, artifactPath, manifest: this.manifest });
-
-      // Emit completion hook
-      if (toState === WorkflowState.FINISHED) {
-        await this.hookEmitter(HOOK_EVENTS.WORKFLOW_COMPLETE, { manifest: this.manifest });
-      }
-
-      return toState;
+      return await this._transitionInner(artifactPath, note);
     } finally {
       this._releaseTransitionLock();
     }
+  }
+
+  /**
+   * P1-1 fix: Lock-free inner implementation of transition().
+   * Called by transition() (which holds the lock) and by transitionConditional()
+   * (which also holds the lock). This avoids deadlocking on the non-reentrant mutex.
+   *
+   * @param {string|null} artifactPath
+   * @param {string} note
+   * @returns {Promise<string>} The new current state
+   */
+  async _transitionInner(artifactPath = null, note = '') {
+    const fromState = this.getState();
+    const toState = this.getNextState();
+
+    if (!toState) {
+      throw new Error(`[StateMachine] Cannot transition: already in terminal state "${fromState}"`);
+    }
+
+    // Emit before-transition hook
+    await this.hookEmitter(HOOK_EVENTS.BEFORE_STATE_TRANSITION, { fromState, toState, artifactPath });
+
+    // Update manifest
+    const entry = createHistoryEntry(fromState, toState, artifactPath, note);
+    this.manifest.history.push(entry);
+    this.manifest.currentState = toState;
+    this.manifest.updatedAt = new Date().toISOString();
+
+    // Record artifact path
+    if (artifactPath) {
+      this._recordArtifact(toState, artifactPath);
+    }
+
+    this._writeManifest();
+
+    console.log(`[StateMachine] Transition: ${fromState} → ${toState}${artifactPath ? ` (artifact: ${artifactPath})` : ''}`);
+
+    // Emit after-transition hook
+    await this.hookEmitter(HOOK_EVENTS.AFTER_STATE_TRANSITION, { fromState, toState, artifactPath, manifest: this.manifest });
+
+    // Emit completion hook
+    if (toState === WorkflowState.FINISHED) {
+      await this.hookEmitter(HOOK_EVENTS.WORKFLOW_COMPLETE, { manifest: this.manifest });
+    }
+
+    return toState;
   }
 
   /**
@@ -216,34 +233,47 @@ class StateMachine {
   async jumpTo(targetState, reason = '') {
     await this._acquireTransitionLock('jumpTo');
     try {
-      if (!this._stateOrder.includes(targetState)) {
-        throw new Error(`[StateMachine] Invalid target state: "${targetState}". Valid states: ${this._stateOrder.join(', ')}`);
-      }
-
-      const fromState = this.getState();
-      if (fromState === targetState) {
-        console.warn(`[StateMachine] jumpTo: already in state "${targetState}". No-op.`);
-        return targetState;
-      }
-
-      const direction = this._stateOrder.indexOf(targetState) < this._stateOrder.indexOf(fromState) ? '⏪' : '⏩';
-      console.warn(`[StateMachine] ${direction} Jump: ${fromState} → ${targetState}${reason ? ` (reason: ${reason})` : ''}`);
-
-      await this.hookEmitter(HOOK_EVENTS.BEFORE_STATE_TRANSITION, { fromState, toState: targetState, jump: true, reason });
-
-      const entry = createHistoryEntry(fromState, targetState, null, `[JUMP] ${reason}`);
-      this.manifest.history.push(entry);
-      this.manifest.currentState = targetState;
-      this.manifest.updatedAt = new Date().toISOString();
-
-      this._writeManifest();
-
-      await this.hookEmitter(HOOK_EVENTS.AFTER_STATE_TRANSITION, { fromState, toState: targetState, jump: true, manifest: this.manifest });
-
-      return targetState;
+      return await this._jumpToInner(targetState, reason);
     } finally {
       this._releaseTransitionLock();
     }
+  }
+
+  /**
+   * P1-1 fix: Lock-free inner implementation of jumpTo().
+   * Called by jumpTo() (which holds the lock) and by transitionConditional()
+   * (which also holds the lock). This avoids deadlocking on the non-reentrant mutex.
+   *
+   * @param {string} targetState
+   * @param {string} reason
+   * @returns {Promise<string>} The new current state
+   */
+  async _jumpToInner(targetState, reason = '') {
+    if (!this._stateOrder.includes(targetState)) {
+      throw new Error(`[StateMachine] Invalid target state: "${targetState}". Valid states: ${this._stateOrder.join(', ')}`);
+    }
+
+    const fromState = this.getState();
+    if (fromState === targetState) {
+      console.warn(`[StateMachine] jumpTo: already in state "${targetState}". No-op.`);
+      return targetState;
+    }
+
+    const direction = this._stateOrder.indexOf(targetState) < this._stateOrder.indexOf(fromState) ? '⏪' : '⏩';
+    console.warn(`[StateMachine] ${direction} Jump: ${fromState} → ${targetState}${reason ? ` (reason: ${reason})` : ''}`);
+
+    await this.hookEmitter(HOOK_EVENTS.BEFORE_STATE_TRANSITION, { fromState, toState: targetState, jump: true, reason });
+
+    const entry = createHistoryEntry(fromState, targetState, null, `[JUMP] ${reason}`);
+    this.manifest.history.push(entry);
+    this.manifest.currentState = targetState;
+    this.manifest.updatedAt = new Date().toISOString();
+
+    this._writeManifest();
+
+    await this.hookEmitter(HOOK_EVENTS.AFTER_STATE_TRANSITION, { fromState, toState: targetState, jump: true, manifest: this.manifest });
+
+    return targetState;
   }
 
   // ─── Parallel Sub-task Execution ─────────────────────────────────────────────
@@ -454,45 +484,54 @@ class StateMachine {
    * @param {string} [note] - Optional note
    * @returns {string} The new current state
    */
+  /**
+   * P1-1 fix: transitionConditional now acquires the transition lock BEFORE
+   * evaluating conditions, preventing two concurrent callers from both reading
+   * the same fromState and triggering duplicate transitions.
+   *
+   * The lock is acquired once at the top and released in `finally`. Internal
+   * transition/jump operations use _transitionInner/_jumpToInner (lock-free)
+   * to avoid deadlocking on the non-reentrant mutex.
+   */
   async transitionConditional(context = {}, artifactPath = null, note = '') {
-    const fromState = this.getState();
-    const rules = this._conditionalRules?.get(fromState);
+    await this._acquireTransitionLock('transitionConditional');
+    try {
+      const fromState = this.getState();
+      const rules = this._conditionalRules?.get(fromState);
 
-    if (!rules || rules.length === 0) {
-      // No conditional rules — use standard sequential transition
-      return this.transition(artifactPath, note);
-    }
-
-    // Evaluate rules in registration order; first match wins
-    for (const rule of rules) {
-      try {
-        const result = rule.condition(this.manifest, context);
-        if (result !== undefined && result !== null && rule.targets[result]) {
-          const targetState = rule.targets[result];
-          const isForward = this._stateOrder.indexOf(targetState) > this._stateOrder.indexOf(fromState);
-          const condNote = `[CONDITIONAL:${rule.name}=${result}] ${note}`.trim();
-
-          console.log(`[StateMachine] 🔀 Conditional transition: ${fromState} → ${targetState} (rule: ${rule.name}, result: ${result})`);
-
-          if (isForward && targetState === this.getNextState()) {
-            // Standard forward transition
-            return this.transition(artifactPath, condNote);
-          } else if (isForward) {
-            // Forward jump (skip stages)
-            return this.jumpTo(targetState, condNote);
-          } else {
-            // Backward = rollback direction
-            return this.jumpTo(targetState, condNote);
-          }
-        }
-      } catch (err) {
-        console.warn(`[StateMachine] ⚠️  Conditional rule "${rule.name}" threw: ${err.message}. Trying next rule.`);
+      if (!rules || rules.length === 0) {
+        // No conditional rules — use standard sequential transition (lock-free inner)
+        return this._transitionInner(artifactPath, note);
       }
-    }
 
-    // No rule matched — fall back to sequential transition
-    console.log(`[StateMachine] 🔀 No conditional rule matched for ${fromState}. Falling back to sequential transition.`);
-    return this.transition(artifactPath, note);
+      // Evaluate rules in registration order; first match wins
+      for (const rule of rules) {
+        try {
+          const result = rule.condition(this.manifest, context);
+          if (result !== undefined && result !== null && rule.targets[result]) {
+            const targetState = rule.targets[result];
+            const isForward = this._stateOrder.indexOf(targetState) > this._stateOrder.indexOf(fromState);
+            const condNote = `[CONDITIONAL:${rule.name}=${result}] ${note}`.trim();
+
+            console.log(`[StateMachine] 🔀 Conditional transition: ${fromState} → ${targetState} (rule: ${rule.name}, result: ${result})`);
+
+            if (isForward && targetState === this.getNextState()) {
+              return this._transitionInner(artifactPath, condNote);
+            } else {
+              return this._jumpToInner(targetState, condNote);
+            }
+          }
+        } catch (err) {
+          console.warn(`[StateMachine] ⚠️  Conditional rule "${rule.name}" threw: ${err.message}. Trying next rule.`);
+        }
+      }
+
+      // No rule matched — fall back to sequential transition
+      console.log(`[StateMachine] 🔀 No conditional rule matched for ${fromState}. Falling back to sequential transition.`);
+      return this._transitionInner(artifactPath, note);
+    } finally {
+      this._releaseTransitionLock();
+    }
   }
 
   /**
@@ -529,28 +568,50 @@ class StateMachine {
    * for it to complete before proceeding. This prevents interleaved async
    * operations from corrupting the manifest state.
    *
+   * P0-1 fix: Replaced busy-wait setTimeout(5ms) polling with a FIFO queue.
+   * Old implementation had three problems:
+   *   1. Non-atomic check-then-set: two callers could both pass the while-check
+   *      and both set themselves as lock holder → concurrent manifest corruption.
+   *   2. CPU-burning 5ms polling loop wasting cycles.
+   *   3. No FIFO fairness guarantee.
+   *
+   * New implementation: if the lock is held, the caller's resolve callback is
+   * enqueued. _releaseTransitionLock() dequeues the next waiter atomically
+   * (synchronous shift + set), ensuring exactly one caller proceeds at a time.
+   *
    * @param {string} caller - Name of the calling method (for diagnostics)
    */
   async _acquireTransitionLock(caller) {
-    while (this._transitionLock) {
-      console.warn(`[StateMachine] ⏳ ${caller}() waiting for in-flight ${this._transitionLock} to complete...`);
-      // Wait for the current lock holder to finish
-      await new Promise(resolve => {
-        const check = () => {
-          if (!this._transitionLock) { resolve(); }
-          else { setTimeout(check, 5); }
-        };
-        setTimeout(check, 5);
-      });
+    if (!this._transitionLock) {
+      // Lock is free — acquire immediately (synchronous, no race window)
+      this._transitionLock = caller;
+      return;
     }
-    this._transitionLock = caller;
+    // Lock is held — enqueue and wait
+    console.warn(`[StateMachine] ⏳ ${caller}() waiting for in-flight ${this._transitionLock} to complete...`);
+    await new Promise(resolve => {
+      this._lockWaitQueue.push({ caller, resolve });
+    });
+    // When we reach here, _releaseTransitionLock() has already set
+    // this._transitionLock = caller for us.
   }
 
   /**
    * Releases the transition lock.
+   *
+   * P0-1 fix: If waiters are queued, atomically hands the lock to the next
+   * waiter (FIFO order) and resolves its promise. This is a synchronous
+   * operation — no race window between release and next acquire.
    */
   _releaseTransitionLock() {
-    this._transitionLock = null;
+    if (this._lockWaitQueue.length > 0) {
+      // Hand lock directly to the next waiter (atomic: shift + set + resolve)
+      const next = this._lockWaitQueue.shift();
+      this._transitionLock = next.caller;
+      next.resolve();
+    } else {
+      this._transitionLock = null;
+    }
   }
 
   // ─── Private Helpers ──────────────────────────────────────────────────────────

@@ -43,6 +43,34 @@ Every session MUST begin in this order:
 
 ---
 
+## IDE Tool Usage Protocol (ADR-37)
+
+> **Foundational principle**: IDE capabilities first, self-built as fallback.
+
+When running inside an IDE (auto-detected by `core/ide-detection.js`), agents receive an
+**IDE Tool Guidance** block in their prompt. Follow these rules:
+
+### Search Strategy
+- **Semantic search** → Use `codebase_search` (IDE's vector/semantic search)
+- **Exact text search** → Use `grep_search` (IDE's ripgrep engine)
+- **Symbol lookup** → Use `view_code_item` (compiler-accurate via IDE LSP)
+- **File reading** → Use `read_file` (real-time file content from IDE)
+
+### When to Use Self-Built Context
+Self-built context is **always injected** into your prompt for capabilities the IDE cannot provide:
+- Hotspot analysis (CodeGraph) — which symbols change most frequently
+- Module summary (CodeGraph) — high-level codebase overview
+- Skill knowledge (ContextLoader) — domain-specific best practices
+- Experience records (ExperienceStore) — lessons learned from past tasks
+- Architecture decisions (ADR digest) — why things are the way they are
+
+### Rule for Developers Adding New Modules
+Before building any new code intelligence feature, **check the IDE Tool Guidance table** in
+`AGENTS.md`. If the IDE already provides the capability, add it to the guidance table
+as "preferred" and mark your implementation as "fallback".
+
+---
+
 ## `/wf init` Command Protocol
 
 When the user sends `/wf init` (with or without `--path <dir>`), you **MUST** execute the
@@ -132,6 +160,137 @@ During work, output brief phase markers:
 - `📝 Writing...`
 - `✅ Phase N done: <summary>`
 - `⚠️ Issue found: <description>`
+
+---
+
+## Long Task Protocol (ADR-41)
+
+> When handling multi-step tasks (e.g. "analyse 10 modules and optimise each"),
+> agents MUST follow this protocol to prevent "deep-dive amnesia" — the phenomenon
+> where an agent forgets the global task list after diving into implementation details.
+
+### Rules
+
+1. **Before starting**: Create a structured task list and display it to the user.
+   Format: numbered checklist with clear scope for each item.
+
+2. **Progress Beacon (auto-injected)**: In automated workflow mode (`runTaskBased()`),
+   the orchestrator automatically injects a `📍 Progress Beacon` block into every
+   task's context. This block shows which tasks are done, which is current, and
+   which remain. Agents do NOT need to manage this manually in workflow mode.
+
+3. **Interactive mode progress tracking**: When working in `/wf` interactive dialogue
+   mode (not automated workflow), agents MUST:
+   - At the **start** of a multi-step request: output a numbered task list
+   - After **each step completes**: output an updated progress summary
+   - At the **end**: output a final completion summary with all items checked
+
+4. **Scratchpad file (optional)**: For tasks with 5+ steps, agents SHOULD create
+   `output/scratchpad.md` as an external working memory file. Update it after each
+   step. Re-read it if context feels lost.
+
+5. **Never skip the remaining list**: When completing one sub-task, always explicitly
+   acknowledge how many tasks remain and what they are.
+
+### Interactive Mode Progress Format
+
+Agents MUST use this format for user-visible progress:
+
+```
+📍 Progress: 3/10 completed
+
+✅ 1. User auth module — Done (extracted 3 helper functions)
+✅ 2. Database schema — Done (normalised 2 tables)
+✅ 3. API endpoints — Done (split into 4 route files)
+🔄 4. Frontend routing — In Progress
+⬜ 5. Payment integration
+⬜ 6. Notification service
+⬜ 7. Admin dashboard
+⬜ 8. Search engine
+⬜ 9. Analytics module
+⬜ 10. Deployment config
+```
+
+### Key Decisions Carry-Forward
+
+When a decision made in step N affects step M (M > N), agents MUST note it in the
+progress output:
+
+```
+📌 Key Decisions (carry forward):
+- Decision: Use Express Router groups (not Koa) — affects steps 4, 5, 7
+- Risk: Steps 5 and 6 share dependency on event-bus.js — must coordinate
+```
+
+---
+
+## User-Visible Progress Display Protocol
+
+> Users must always be able to clearly see the current status of all tasks/steps.
+> This is a UX contract, not just an internal mechanism.
+
+### Rule 1: Phase Markers (Always Required)
+
+Every workflow execution MUST output brief phase markers as work progresses:
+- `🔍 Analyzing...` — starting analysis
+- `📝 Writing...` — generating artifacts
+- `✅ Phase N done: <summary>` — phase complete
+- `⚠️ Issue found: <description>` — problem detected
+
+### Rule 2: Multi-Step Progress Dashboard
+
+For any request involving 3+ sub-tasks, agents MUST display a progress dashboard:
+
+**On first response:**
+```
+📋 Task Plan (10 items identified):
+⬜ 1. <task description>
+⬜ 2. <task description>
+...
+⬜ 10. <task description>
+```
+
+**After each sub-task:**
+```
+📍 Progress: N/Total completed
+✅ 1. <done task> — <brief result>
+🔄 K. <current task> — In Progress
+⬜ M. <pending task>
+```
+
+**On completion:**
+```
+🎉 All 10/10 tasks completed!
+✅ 1. <task> — <result>
+✅ 2. <task> — <result>
+...
+✅ 10. <task> — <result>
+
+📌 Summary: <overall result summary>
+```
+
+### Rule 3: Automated Workflow Progress
+
+When running `orchestrator.run()` or `runTaskBased()`, the system automatically:
+1. Logs phase transitions to console (`[Orchestrator] ✅ Phase X done`)
+2. Injects Progress Beacon into each Agent's context
+3. Generates final summary with task completion stats
+
+Users can monitor progress through:
+- **Console output**: real-time phase markers and task completion logs
+- **`output/feature-list.json`**: persistent feature acceptance tracking
+- **Task Manager summary**: `taskManager.getSummary()` shows byStatus counts
+
+### Rule 4: Error/Block Visibility
+
+When a task fails or is blocked, agents MUST immediately surface this to the user:
+```
+❌ Task 5 (Payment integration) FAILED: Stripe API key not configured
+⚠️ Task 6 (Notification) BLOCKED: depends on Task 5
+
+📍 Progress: 4/10 completed, 1 failed, 1 blocked, 4 remaining
+   Action needed: please provide Stripe API key to continue
+```
 
 ---
 

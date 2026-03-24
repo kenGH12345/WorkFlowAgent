@@ -39,6 +39,14 @@ function _getRunDeveloper() {
   return _runDeveloper;
 }
 
+/**
+ * Runs the TEST stage: test generation, execution, auto-fix loop, and quality gate.
+ *
+ * P1-2 fix: @this annotation for IDE IntelliSense and safe refactoring.
+ *
+ * @this {import('./orchestrator').Orchestrator}
+ * @returns {Promise<string|null>} Path to the test report, or null on failure
+ */
 async function _runTester() {
   const MAX_TEST_ITERATIONS = 2;
   let testIteration = 0;
@@ -63,7 +71,21 @@ async function _runTester() {
   return null;
 }
 
+/**
+ * Single iteration of the TEST stage. Separated from _runTester for retry logic.
+ *
+ * @this {import('./orchestrator').Orchestrator}
+ * @param {number} testIteration
+ * @param {number} maxIterations
+ * @param {Array} fixConversationHistory
+ */
 async function _runTesterOnce(testIteration, maxIterations, fixConversationHistory) {
+  // P1-4 fix: Declare corrResult at function scope so storeTestContext() at the
+  // bottom always sees the actual correction result. Previously corrResult was
+  // declared as `const` inside the `if (testContent)` else-branch, making it
+  // block-scoped — storeTestContext() always received null via the ?? fallback.
+  let corrResult = null;
+
   console.log(`\n[Orchestrator] Stage: TEST (TesterAgent)${testIteration > 1 ? ` [iteration ${testIteration}/${maxIterations}]` : ''}`);
   const inputPath = this.bus.consume(AgentRole.TESTER);
 
@@ -130,9 +152,12 @@ async function _runTesterOnce(testIteration, maxIterations, fixConversationHisto
     console.log(`[Orchestrator] ⏭️  Test case execution skipped (no cases generated).`);
   }
 
-  const testExpContextWithComplaints = await buildTesterContextBlock(this, upstreamCtxForTest, tcExecutionReport);
-  this.obs.recordExpUsage({ injected: (testExpContextWithComplaints._injectedExpIds || []).length });
-  const outputPath = await this.agents[AgentRole.TESTER].run(inputPath, null, testExpContextWithComplaints);
+  // A-3 fix: buildTesterContextBlock now returns { content, injectedExpIds } struct
+  const testContextResult = await buildTesterContextBlock(this, upstreamCtxForTest, tcExecutionReport);
+  const testExpContext = testContextResult.content;
+  const testInjectedExpIds = testContextResult.injectedExpIds || [];
+  this.obs.recordExpUsage({ injected: testInjectedExpIds.length });
+  const outputPath = await this.agents[AgentRole.TESTER].run(inputPath, null, testExpContext);
 
   // ── Adapter Telemetry ─────────────────────────────────────────────────────
   if (this._adapterTelemetry && outputPath && fs.existsSync(outputPath)) {
@@ -156,7 +181,7 @@ async function _runTesterOnce(testIteration, maxIterations, fixConversationHisto
         investigationTools: this._buildInvestigationTools('TestReport'),
       }
     );
-    const corrResult = await corrector.correct(testContent, 'Test Report');
+    corrResult = await corrector.correct(testContent, 'Test Report');
 
     if (corrResult.rounds > 0) {
       const tmpPath = outputPath + '.tmp';
@@ -290,7 +315,7 @@ async function _runTesterOnce(testIteration, maxIterations, fixConversationHisto
     console.log(`[Orchestrator] ℹ️  No testCommand configured – skipping real test execution.`);
     console.log(`[Orchestrator] 💡 Set testCommand in workflow.config.js to enable automated verification.`);
   } else {
-    await _runRealTestLoop.call(this, { testCommand, autoFixEnabled, maxFixRounds, failOnUnfixed, testReportPath: outputPath, lintCommand: this._config?.lintCommand || null, fixConversationHistory, injectedExpIds: testExpContextWithComplaints._injectedExpIds || [] });
+    await _runRealTestLoop.call(this, { testCommand, autoFixEnabled, maxFixRounds, failOnUnfixed, testReportPath: outputPath, lintCommand: this._config?.lintCommand || null, fixConversationHistory, injectedExpIds: testInjectedExpIds });
   }
 
   // ── CIIntegration ────────────────────────────────────────────────────────
@@ -361,6 +386,12 @@ async function _runTesterOnce(testIteration, maxIterations, fixConversationHisto
   return { __done: true, outputPath };
 }
 
+/**
+ * Real test execution loop with auto-fix capability.
+ *
+ * @this {import('./orchestrator').Orchestrator}
+ * @param {object} opts - Loop configuration
+ */
 async function _runRealTestLoop({ testCommand, autoFixEnabled, maxFixRounds, failOnUnfixed, testReportPath, lintCommand = null, fixConversationHistory = null, injectedExpIds = [] }) {
   const fixHistory = fixConversationHistory || [];
   const runner = new TestRunner({

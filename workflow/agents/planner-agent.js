@@ -25,7 +25,7 @@
 
 const { BaseAgent } = require('./base-agent');
 const { AgentRole } = require('../core/types');
-const { buildJsonBlockInstruction } = require('../core/agent-output-schema');
+const { buildJsonBlockInstruction, extractJsonBlock, validateJsonBlock } = require('../core/agent-output-schema');
 
 class PlannerAgent extends BaseAgent {
   constructor(llmCall, hookEmitter, opts = {}) {
@@ -128,7 +128,7 @@ Format:
 ${jsonInstruction}
 
 ## Upstream Module Map Context
-${this._formatModuleMapForPlanner(expContext)}
+${this._formatModuleMapForPlanner(expContext, inputContent)}
 
 ## Architecture Document
 ${inputContent}
@@ -145,16 +145,19 @@ Remember: NO code, NO pseudocode – planning and task decomposition ONLY.
   }
 
   /**
-   * Extracts and formats the Module Map from experience context for the planner.
-   * The moduleMap is embedded in the experience context block by buildPlannerUpstreamCtx().
+   * Extracts and formats the Module Map for the planner.
+   * P1-6 fix: now also checks inputContent (architecture.md) which may contain
+   * the Module Map from the upstream analyst, not just expContext.
    *
    * @param {string|null} expContext - Experience context that may contain module map
+   * @param {string|null} inputContent - Architecture document that may contain module map
    * @returns {string} Formatted module map section or empty guidance
    */
-  _formatModuleMapForPlanner(expContext) {
-    // The module map is already formatted in the upstream context by buildPlannerUpstreamCtx()
-    // Check if it's present
-    if (expContext && typeof expContext === 'string' && expContext.includes('Functional Module Map')) {
+  _formatModuleMapForPlanner(expContext, inputContent = null) {
+    // Check both expContext and inputContent for the module map
+    const hasModuleMap = (str) => str && typeof str === 'string' && str.includes('Functional Module Map');
+    
+    if (hasModuleMap(expContext) || hasModuleMap(inputContent)) {
       return `The Functional Module Map is available in the upstream context below. You MUST use it to:
 1. Group tasks by module in Section 7 (Module-Task Grouping table)
 2. Include a "moduleGrouping" field in the JSON metadata block with this structure:
@@ -178,8 +181,7 @@ Remember: NO code, NO pseudocode – planning and task decomposition ONLY.
    * @returns {string}
    */
   parseResponse(llmResponse) {
-    // Validate JSON block presence
-    const { extractJsonBlock, validateJsonBlock } = require('../core/agent-output-schema');
+    // Validate JSON block presence (imports hoisted to file top – P1-1 fix)
     const jsonBlock = extractJsonBlock(llmResponse);
     if (!jsonBlock) {
       console.warn(`[PlannerAgent] ⚠️  No structured JSON block found in output. Downstream agents will use regex-based extraction (degraded mode).`);
@@ -192,13 +194,18 @@ Remember: NO code, NO pseudocode – planning and task decomposition ONLY.
       }
     }
 
-    // Mandatory section compliance check
-    const mandatorySections = ['Plan Overview', 'Implementation Phases', 'Task Breakdown', 'Dependency Graph'];
-    const missingSections = mandatorySections.filter(s => !llmResponse.includes(s));
+    // Mandatory section compliance check (P1-4: bilingual support)
+    const mandatorySections = [
+      { en: 'Plan Overview', zh: '计划概览' },
+      { en: 'Implementation Phases', zh: '实施阶段' },
+      { en: 'Task Breakdown', zh: '任务分解' },
+      { en: 'Dependency Graph', zh: '依赖图' },
+    ];
+    const missingSections = mandatorySections.filter(s => !llmResponse.includes(s.en) && !llmResponse.includes(s.zh));
     if (missingSections.length > 0) {
-      console.warn(`[PlannerAgent] ⚠️  COMPLIANCE: Missing mandatory section(s): ${missingSections.join(', ')}. The agent output specification requires these sections.`);
+      console.warn(`[PlannerAgent] ⚠️  COMPLIANCE: Missing mandatory section(s): ${missingSections.map(s => s.en).join(', ')}. The agent output specification requires these sections.`);
     } else {
-      console.log(`[PlannerAgent] ✅ Mandatory sections present: ${mandatorySections.join(', ')}.`);
+      console.log(`[PlannerAgent] ✅ Mandatory sections present: ${mandatorySections.map(s => s.en).join(', ')}.`);
     }
 
     // Check for acceptance criteria presence

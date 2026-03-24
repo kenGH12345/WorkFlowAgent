@@ -529,39 +529,44 @@ function _collectDirNames(root, maxDepth = 4) {
 
 function _detectCommunicationPatterns(root, deps) {
   const patterns = [];
+  const seen = new Set(); // P1-5 fix: dedup communication pattern detections
+
+  function addPattern(name) {
+    if (!seen.has(name)) { seen.add(name); patterns.push(name); }
+  }
 
   // Dependency Injection
   if (deps['@nestjs/core'] || deps['inversify'] || deps['tsyringe'] || deps['awilix']) {
-    patterns.push('Dependency Injection');
+    addPattern('Dependency Injection');
   }
   if (_csprojContains(root, 'Microsoft.Extensions.DependencyInjection')) {
-    patterns.push('Dependency Injection (.NET)');
+    addPattern('Dependency Injection (.NET)');
   }
   if (_pomContains(root, 'spring-context') || _pomContains(root, 'spring-boot')) {
-    patterns.push('Dependency Injection (Spring)');
+    addPattern('Dependency Injection (Spring)');
   }
 
   // Event-driven
   if (deps['eventemitter3'] || deps['eventemitter2'] || deps['mitt'] || deps['rxjs']) {
-    patterns.push('Event-driven');
+    addPattern('Event-driven');
   }
   if (deps['bull'] || deps['bullmq'] || deps['amqplib'] || deps['kafkajs']) {
-    patterns.push('Message Queue');
+    addPattern('Message Queue');
   }
 
   // WebSocket
   if (deps['socket.io'] || deps['ws'] || deps['@nestjs/websockets']) {
-    patterns.push('WebSocket');
+    addPattern('WebSocket');
   }
 
   // gRPC
   if (deps['@grpc/grpc-js'] || deps['grpc'] || _goModContains(root, 'google.golang.org/grpc')) {
-    patterns.push('gRPC');
+    addPattern('gRPC');
   }
 
   // GraphQL
   if (deps['graphql'] || deps['apollo-server'] || deps['@apollo/server'] || deps['type-graphql']) {
-    patterns.push('GraphQL');
+    addPattern('GraphQL');
   }
 
   // REST (inferred from having a web framework)
@@ -572,7 +577,7 @@ function _detectCommunicationPatterns(root, deps) {
       _goModContains(root, 'github.com/gin-gonic/gin') ||
       _goModContains(root, 'github.com/labstack/echo') ||
       _goModContains(root, 'github.com/gofiber/fiber')) {
-    patterns.push('REST API');
+    addPattern('REST API');
   }
 
   return patterns;
@@ -770,11 +775,21 @@ class ProjectProfiler {
   /**
    * @param {string} projectRoot - Absolute path to the project root
    * @param {object} [options]
-   * @param {string[]} [options.ignoreDirs] - Additional dirs to ignore during scanning
+   * @param {string[]}  [options.ignoreDirs]         - Additional dirs to ignore during scanning
+   * @param {object[]}  [options.customFrameworkRules]  - P2-3: User-defined framework detection rules
+   *   Each: { name: string, category: string, lang: string, detect: (root, deps) => boolean }
+   * @param {object[]}  [options.customDataLayerRules]  - P2-3: User-defined ORM/data layer rules
+   * @param {object[]}  [options.customTestRules]       - P2-3: User-defined test framework rules
    */
   constructor(projectRoot, options = {}) {
     this.projectRoot = projectRoot;
     this.ignoreDirs = options.ignoreDirs || [];
+
+    // P2-3: Merge user-defined detection rules with built-in rules.
+    // User rules are prepended so they take priority over built-in rules.
+    this._frameworkRules  = [...(options.customFrameworkRules || []),  ...FRAMEWORK_RULES];
+    this._dataLayerRules  = [...(options.customDataLayerRules || []),  ...DATA_LAYER_RULES];
+    this._testRules       = [...(options.customTestRules || []),       ...TEST_FRAMEWORK_RULES];
   }
 
   /**
@@ -793,10 +808,17 @@ class ProjectProfiler {
 
     // ── 1. Framework Detection ────────────────────────────────────────────
     const frameworks = [];
-    for (const rule of FRAMEWORK_RULES) {
+    const frameworkNamesSeen = new Set(); // P1-5 fix: dedup by name
+    for (const rule of this._frameworkRules) {
       try {
         if (rule.detect(root, deps)) {
-          frameworks.push({ name: rule.name, category: rule.category, lang: rule.lang });
+          // P1-6 fix: skip duplicate framework names (e.g. 'Spring Boot' and
+          // 'Spring Boot (Kotlin)' both matching). First match wins within
+          // same-name rules. Cross-category duplicates are also eliminated.
+          if (!frameworkNamesSeen.has(rule.name)) {
+            frameworkNamesSeen.add(rule.name);
+            frameworks.push({ name: rule.name, category: rule.category, lang: rule.lang });
+          }
         }
       } catch { /* ignore detection errors */ }
     }
@@ -808,10 +830,14 @@ class ProjectProfiler {
 
     // ── 3. Data Layer Detection ───────────────────────────────────────────
     const dataLayer = { orm: [], databases: [] };
-    for (const rule of DATA_LAYER_RULES) {
+    const ormNamesSeen = new Set(); // P1-5 fix: dedup ORM detections
+    for (const rule of this._dataLayerRules) {
       try {
         if (rule.detect(root, deps)) {
-          dataLayer.orm.push(rule.name);
+          if (!ormNamesSeen.has(rule.name)) {
+            ormNamesSeen.add(rule.name);
+            dataLayer.orm.push(rule.name);
+          }
         }
       } catch { /* ignore */ }
     }
@@ -824,10 +850,14 @@ class ProjectProfiler {
 
     // ── 5. Test Strategy ──────────────────────────────────────────────────
     const testing = { frameworks: [] };
-    for (const rule of TEST_FRAMEWORK_RULES) {
+    const testNamesSeen = new Set(); // P1-5 fix: dedup test framework detections
+    for (const rule of this._testRules) {
       try {
         if (rule.detect(root, deps)) {
-          testing.frameworks.push(rule.name);
+          if (!testNamesSeen.has(rule.name)) {
+            testNamesSeen.add(rule.name);
+            testing.frameworks.push(rule.name);
+          }
         }
       } catch { /* ignore */ }
     }
@@ -860,6 +890,85 @@ class ProjectProfiler {
     };
 
     console.log(`[ProjectProfiler] ✅ Analysis complete.`);
+    return profile;
+  }
+
+  /**
+   * P2-1: Enhance an existing profile with CodeGraph statistical evidence.
+   *
+   * This is the "graph → profiler" fusion direction. When code-graph stats
+   * are available, they provide compiler-grade evidence that can:
+   *   1. Boost architecture confidence (symbol kinds confirm layer inference)
+   *   2. Refine framework detection (symbol name patterns match frameworks)
+   *   3. Add language distribution data (actual symbol counts per extension)
+   *   4. Identify top coupling modules (highest import fan-in)
+   *
+   * Called optionally after analyze() when a CodeGraph instance is available.
+   *
+   * @param {object} profile - Profile from analyze()
+   * @param {object} codeGraphStats - Stats from CodeGraph.getCodeGraphStats()
+   * @returns {object} Enhanced profile (same object, mutated)
+   */
+  enhanceWithCodeGraphStats(profile, codeGraphStats) {
+    if (!codeGraphStats || !profile) return profile;
+
+    console.log(`[ProjectProfiler] 🔗 P2-1 Fusion: enhancing with ${codeGraphStats.symbolCount} symbols from code graph`);
+
+    // 1. Inject code graph summary
+    profile.codeGraphSummary = {
+      symbolCount:   codeGraphStats.symbolCount,
+      fileCount:     codeGraphStats.fileCount,
+      edgeCount:     codeGraphStats.edgeCount,
+      avgImportsPerFile: codeGraphStats.avgImportsPerFile,
+      languageDistribution: codeGraphStats.languageDistribution,
+      kindBreakdown: codeGraphStats.kindBreakdown,
+    };
+
+    // 2. Boost architecture confidence with symbol-based evidence
+    if (profile.architecture && codeGraphStats.kindBreakdown) {
+      const kb = codeGraphStats.kindBreakdown;
+      const classCount    = kb['class'] || 0;
+      const interfaceCount = kb['interface'] || 0;
+      const functionCount = kb['function'] || 0;
+
+      // High class-to-function ratio suggests OOP/layered architecture
+      if (classCount > functionCount * 0.3 && classCount > 10) {
+        profile.architecture.confidence = Math.min(1, (profile.architecture.confidence || 0) + 0.15);
+        profile.architecture._evidenceBoost = 'class-heavy codebase confirms layered/OOP pattern';
+      }
+
+      // Interfaces suggest dependency-inverted architecture
+      if (interfaceCount > 5) {
+        profile.architecture._evidenceBoost =
+          (profile.architecture._evidenceBoost ? profile.architecture._evidenceBoost + '; ' : '')
+          + `${interfaceCount} interfaces suggest DI/clean architecture`;
+        profile.architecture.confidence = Math.min(1, (profile.architecture.confidence || 0) + 0.1);
+      }
+    }
+
+    // 3. Cross-validate framework detection with symbol name patterns
+    if (codeGraphStats.frameworkIndicators && codeGraphStats.frameworkIndicators.length > 0) {
+      const existingNames = new Set((profile.frameworks || []).map(f => f.name.toLowerCase()));
+      for (const indicator of codeGraphStats.frameworkIndicators) {
+        if (!existingNames.has(indicator.framework.toLowerCase())) {
+          profile.frameworks = profile.frameworks || [];
+          profile.frameworks.push({
+            name: indicator.framework,
+            category: 'detected-by-symbols',
+            lang: 'unknown',
+            _symbolMatches: indicator.matchCount,
+            _confidence: 'low (symbol-name heuristic only)',
+          });
+        }
+      }
+    }
+
+    // 4. Add top coupling modules
+    if (codeGraphStats.topModules && codeGraphStats.topModules.length > 0) {
+      profile.couplingHotspots = codeGraphStats.topModules;
+    }
+
+    console.log(`[ProjectProfiler] 🔗 Fusion complete: architecture confidence=${(profile.architecture?.confidence || 0).toFixed(2)}`);
     return profile;
   }
 
@@ -1112,6 +1221,104 @@ class ProjectProfiler {
       lines.push(``);
     }
 
+    // ── P1 Fallback: When all detection rules fall through ──────────────────
+    // For tool-type / zero-dependency projects where no frameworks, ORM, DB,
+    // infra, or architecture patterns are detected, generate a baseline profile
+    // from directory structure + file statistics so the profile is never empty.
+    const hasAnyContent =
+      profile.frameworks.length > 0 ||
+      (profile.architecture && profile.architecture.pattern) ||
+      profile.dataLayer.orm.length > 0 ||
+      profile.dataLayer.databases.length > 0 ||
+      profile.communication.length > 0 ||
+      profile.testing.frameworks.length > 0 ||
+      profile.apis.length > 0 ||
+      Object.keys(profile.infrastructure).length > 0 ||
+      (profile.monorepo && profile.monorepo.isMonorepo) ||
+      profile.entryPoints.length > 0;
+
+    if (!hasAnyContent) {
+      lines.push(`## Baseline Profile (auto-inferred)`);
+      lines.push(``);
+      lines.push(`> No known frameworks, ORM, or infrastructure detected.`);
+      lines.push(`> This baseline is generated from directory structure analysis.`);
+      lines.push(``);
+
+      // Directory structure summary (top-level dirs)
+      try {
+        const entries = fs.readdirSync(this.projectRoot, { withFileTypes: true });
+        const topDirs = entries
+          .filter(e => e.isDirectory() && !IGNORE_DIRS.has(e.name) && !e.name.startsWith('.'))
+          .map(e => e.name);
+        if (topDirs.length > 0) {
+          lines.push(`### Directory Structure`);
+          lines.push(``);
+          for (const d of topDirs) {
+            // Count files in each top-level dir
+            let fileCount = 0;
+            try {
+              const sub = fs.readdirSync(path.join(this.projectRoot, d), { withFileTypes: true });
+              fileCount = sub.filter(e => e.isFile()).length;
+            } catch { /* ignore */ }
+            const desc = this._inferDirPurpose(d);
+            lines.push(`- \`${d}/\` — ${desc}${fileCount > 0 ? ` (${fileCount} files)` : ''}`);
+          }
+          lines.push(``);
+        }
+      } catch { /* ignore */ }
+
+      // Language distribution from file extensions
+      try {
+        const extCounts = {};
+        const walkForExts = (dir, depth) => {
+          if (depth > 3) return;
+          let entries;
+          try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+          for (const e of entries) {
+            if (e.isDirectory()) {
+              if (!IGNORE_DIRS.has(e.name) && !e.name.startsWith('.')) {
+                walkForExts(path.join(dir, e.name), depth + 1);
+              }
+            } else {
+              const ext = path.extname(e.name).toLowerCase();
+              if (ext && ['.js','.ts','.py','.go','.java','.cs','.lua','.dart','.rb','.rs','.kt','.php','.swift','.cpp','.c','.scala','.ex'].includes(ext)) {
+                extCounts[ext] = (extCounts[ext] || 0) + 1;
+              }
+            }
+          }
+        };
+        walkForExts(this.projectRoot, 0);
+        const sorted = Object.entries(extCounts).sort((a, b) => b[1] - a[1]);
+        if (sorted.length > 0) {
+          lines.push(`### Language Distribution`);
+          lines.push(``);
+          for (const [ext, count] of sorted.slice(0, 6)) {
+            lines.push(`- \`${ext}\`: ${count} files`);
+          }
+          lines.push(``);
+        }
+      } catch { /* ignore */ }
+
+      // Core module description (infer from dir names)
+      lines.push(`### Core Modules (inferred)`);
+      lines.push(``);
+      try {
+        const dirNames = _collectDirNames(this.projectRoot, 2);
+        const coreIndicators = ['core', 'src', 'lib', 'pkg', 'internal', 'app', 'main', 'engine'];
+        const foundCore = coreIndicators.filter(d => dirNames.has(d));
+        if (foundCore.length > 0) {
+          for (const d of foundCore) {
+            lines.push(`- \`${d}/\` — ${this._inferDirPurpose(d)}`);
+          }
+        } else {
+          lines.push(`- No standard module directories detected. Project may use flat structure.`);
+        }
+      } catch {
+        lines.push(`- Unable to infer module structure.`);
+      }
+      lines.push(``);
+    }
+
     // ── LSP-Enhanced Sections ──────────────────────────────────────────────
 
     if (profile.lspEnhanced) {
@@ -1287,8 +1494,59 @@ function renderCompactProfileSummary(profile) {
   return lines.join('\n');
 }
 
+// ─── Helper: Infer directory purpose from name ─────────────────────────────
+
+/**
+ * Added to ProjectProfiler prototype to infer human-readable purpose of a directory
+ * from its name. Used by P1 fallback baseline profile.
+ */
+ProjectProfiler.prototype._inferDirPurpose = function _inferDirPurpose(dirName) {
+  const purposes = {
+    src: 'Source code',
+    lib: 'Library / shared utilities',
+    core: 'Core business logic',
+    app: 'Application entry / main module',
+    pkg: 'Package modules',
+    internal: 'Internal / private modules',
+    cmd: 'CLI entry points',
+    api: 'API layer',
+    config: 'Configuration files',
+    configs: 'Configuration files',
+    tests: 'Test suites',
+    test: 'Test suites',
+    spec: 'Test specifications',
+    docs: 'Documentation',
+    scripts: 'Build / utility scripts',
+    tools: 'Tooling / dev tools',
+    utils: 'Utility functions',
+    helpers: 'Helper functions',
+    hooks: 'Hooks / plugins / adapters',
+    adapters: 'External integrations / adapters',
+    middleware: 'Middleware layer',
+    services: 'Service layer',
+    models: 'Data models',
+    views: 'View layer / templates',
+    components: 'UI components',
+    pages: 'Page components / routes',
+    assets: 'Static assets',
+    public: 'Public / static files',
+    output: 'Generated output / artifacts',
+    workflow: 'Workflow engine / pipeline',
+    agents: 'Agent definitions',
+    commands: 'Command handlers',
+    skills: 'Skill knowledge base',
+    stages: 'Pipeline stage implementations',
+  };
+  return purposes[dirName.toLowerCase()] || 'Project module';
+};
+
 module.exports = {
   ProjectProfiler,
   renderCompactProfileSummary,
   IGNORE_DIRS,
+  // P2-3: Export built-in rule arrays for advanced users who want to extend them
+  FRAMEWORK_RULES,
+  DATA_LAYER_RULES,
+  TEST_FRAMEWORK_RULES,
+  ARCHITECTURE_PATTERNS,
 };

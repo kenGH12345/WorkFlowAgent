@@ -172,5 +172,29 @@
     "lastEvolvedAt": null,
     "filePath": "C:\\workspace\\WorkFlowAgent\\workflow\\skills\\flutter-dev.md",
     "createdAt": "2026-03-15T09:28:03.998Z"
+  },
+  {
+    "name": "python-dev",
+    "description": "Python development best practices (OpenCV, EasyOCR, automation)",
+    "domains": [
+      "python",
+      "automation",
+      "computer-vision"
+    ],
+    "type": "domain-skill",
+    "loadLevel": "task",
+    "dependencies": [],
+    "maxTokens": 800,
+    "triggers": {},
+    "version": "1.0.0",
+    "evolutionCount": 0,
+    "lastEvolvedAt": null,
+    "usageCount": 0,
+    "effectiveCount": 0,
+    "lastUsedAt": null,
+    "lastEffectiveAt": null,
+    "retiredAt": null,
+    "filePath": "C:\\workspace\\WorkFlowAgent\\workflow\\skills\\python-dev.md",
+    "createdAt": "2026-03-22T00:43:05.384Z"
   }
 ]

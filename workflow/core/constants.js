@@ -50,6 +50,8 @@ const PATHS = {
   SYNONYM_TABLE_JSON: path.join(WORKFLOW_ROOT, 'output', 'synonym-table.json'),
   /** Prompt A/B variant registry (auto-managed by PromptSlotManager) */
   PROMPT_VARIANTS_JSON: path.join(WORKFLOW_ROOT, 'output', 'prompt-variants.json'),
+  /** Cross-session task history (Recall Memory) */
+  TASK_HISTORY_JSON: path.join(WORKFLOW_ROOT, 'output', 'task-history.json'),
 };
 
 // ─── Output Artifact File Names ────────────────────────────────────────────────

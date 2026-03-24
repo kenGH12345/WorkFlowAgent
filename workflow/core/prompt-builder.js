@@ -13,11 +13,13 @@
 'use strict';
 
 const fs = require('fs');
-const { LLM } = require('../core/constants');
+const nodePath = require('path');
+const { LLM, PATHS, WORKFLOW_ROOT } = require('../core/constants');
 const { getConfig } = require('../core/config-loader');
 const { estimateTokens } = require('../tools/thin-tools');
 const { ContextLoader } = require('./context-loader');
 const { PromptSlotManager } = require('./prompt-slot-manager');
+const { generateIDEToolGuidance } = require('./ide-detection');
 
 // ─── KV Cache Friendly Prompt Structure ──────────────────────────────────────
 
@@ -58,7 +60,7 @@ function buildFullContextPrompt(basePrompt, contextFilePaths = [], options = {})
 
   // 1. Global context (AGENTS.md) – always first for KV cache efficiency
   if (includeAgentsMd) {
-    const agentsMdPath = require('../core/constants').PATHS.AGENTS_MD;
+    const agentsMdPath = PATHS.AGENTS_MD;
     if (fs.existsSync(agentsMdPath)) {
       const agentsMd = fs.readFileSync(agentsMdPath, 'utf-8');
       sections.push(`## Global Project Context (AGENTS.md)\n\n${agentsMd}`);
@@ -69,7 +71,7 @@ function buildFullContextPrompt(basePrompt, contextFilePaths = [], options = {})
   for (const filePath of contextFilePaths) {
     if (fs.existsSync(filePath)) {
       const content = fs.readFileSync(filePath, 'utf-8');
-      const fileName = require('path').basename(filePath);
+      const fileName = nodePath.basename(filePath);
       sections.push(`## Context: ${fileName}\n\n${content}`);
     } else {
       console.warn(`[PromptBuilder] Context file not found, skipping: "${filePath}"`);
@@ -172,6 +174,24 @@ let _selfReflectionEngine = null;
 let _skillEvolutionEngine = null;
 
 /**
+ * Module-level ExperienceStore reference.
+ * When set, buildAgentPrompt() uses the synonym table to expand queries
+ * for better skill matching and context retrieval.
+ *
+ * @type {ExperienceStore|null}
+ */
+let _experienceStore = null;
+
+/**
+ * Module-level Orchestrator reference (ADR-45).
+ * When set, ContextLoader can trigger lazy skill enrichment when it detects
+ * placeholder skills during loading.
+ *
+ * @type {object|null}
+ */
+let _orchestrator = null;
+
+/**
  * Sets the module-level SelfReflectionEngine reference.
  * Called by Orchestrator during initialisation.
  *
@@ -190,6 +210,28 @@ function setSelfReflectionEngine(engine) {
  */
 function setSkillEvolutionEngine(engine) {
   _skillEvolutionEngine = engine;
+}
+
+/**
+ * Sets the module-level ExperienceStore reference.
+ * Called by Orchestrator during initialisation.
+ * Used to access the synonym table for query expansion.
+ *
+ * @param {ExperienceStore} store
+ */
+function setExperienceStore(store) {
+  _experienceStore = store;
+}
+
+/**
+ * Sets the module-level Orchestrator reference (ADR-45).
+ * Called by Orchestrator during initialisation.
+ * Used by ContextLoader for lazy skill enrichment.
+ *
+ * @param {object} orch
+ */
+function setOrchestrator(orch) {
+  _orchestrator = orch;
 }
 
 /**
@@ -291,6 +333,10 @@ function _getOrCreateLoader(options) {
     // P0: update codeGraph reference on cache hit (instance may change between calls)
     if (options.codeGraph) {
       _cachedLoader._codeGraph = options.codeGraph;
+    }
+    // ADR-45: update orchestrator reference on cache hit (for lazy enrichment)
+    if (options.orchestrator) {
+      _cachedLoader._orchestrator = options.orchestrator;
     }
     return _cachedLoader;
   }
@@ -786,10 +832,58 @@ function buildSessionStartChecklist(options = {}) {
  * @returns {{ prompt: string, meta: PromptMeta }}
  */
 function buildAgentPrompt(role, dynamicInput, contextFiles = [], options = {}) {
-  // ── Prompt Slot A/B resolution ───────────────────────────────────────────
-  // If PromptSlotManager is initialised and has a variant for this role,
-  // use the resolved variant instead of the hardcoded AGENT_FIXED_PREFIXES.
-  // This is the core integration point for Prefix-Level A/B testing.
+  // P1-6 fix: refactored from 200-line monolith into a coordinator that
+  // delegates to focused helper functions, each handling one phase.
+
+  // Phase 1: Resolve fixed prefix (A/B testing)
+  const { fixedPrefix, _resolvedVariantId, _isExploration } = _resolveFixedPrefix(role);
+
+  // Phase 2: Collect explicit context file sections
+  const autoContextFiles = _prepareContextFiles(role, contextFiles, options);
+
+  // Phase 3: Load skills + ADR digest via ContextLoader
+  const { autoSections, injectedSkillNames } = _loadAutoInjectedSections(role, dynamicInput, options);
+
+  // Phase 4: Read context files from disk
+  const contextSections = _readContextFileSections(autoContextFiles);
+
+  // Phase 5: Inject runtime environment info + self-reflection + IDE tool guidance
+  _injectRuntimeInfo(autoSections);
+  _injectIDEToolGuidance(autoSections);
+  _injectSelfReflection(autoSections, options);
+
+  // Phase 6: Assemble and apply degradation
+  let dynamicSuffix = [...autoSections, ...contextSections, `### Input\n${dynamicInput}`].join('\n\n');
+  let result = buildKVCacheFriendlyPrompt(fixedPrefix, dynamicSuffix);
+
+  const noiseAnalysis = analysePromptNoise(result.prompt);
+  if (noiseAnalysis.isHighRisk && (autoSections.length > 0 || contextSections.length > 0)) {
+    result = _applyContextDegradation(fixedPrefix, dynamicInput, autoSections, contextSections);
+    result.meta.contextDegraded = true;
+  }
+
+  // Phase 7: Attach metadata
+  result.meta.noiseAnalysis = result.meta.contextDegraded
+    ? analysePromptNoise(result.prompt)
+    : noiseAnalysis;
+  result.meta.agentRole = role;
+  if (injectedSkillNames && injectedSkillNames.length > 0) {
+    result.meta.injectedSkillNames = injectedSkillNames;
+  }
+  if (_resolvedVariantId) {
+    result.meta.promptVariantId = _resolvedVariantId;
+    result.meta.promptVariantExploration = _isExploration;
+  }
+
+  return result;
+}
+
+// ─── buildAgentPrompt helper functions (P1-6 SRP extraction) ────────────────
+
+/**
+ * Phase 1: Resolve the fixed prefix, supporting A/B testing via PromptSlotManager.
+ */
+function _resolveFixedPrefix(role) {
   let fixedPrefix = AGENT_FIXED_PREFIXES[role];
   let _resolvedVariantId = null;
   let _isExploration = false;
@@ -811,68 +905,122 @@ function buildAgentPrompt(role, dynamicInput, contextFiles = [], options = {}) {
     throw new Error(`[PromptBuilder] Unknown agent role: "${role}". Valid roles: ${validRoles}`);
   }
 
-  // For coding-agent: auto-inject feature-list.json if available.
-  // Resolution order:
-  //  1. Caller explicitly passes the path in contextFiles – use as-is.
-  //  2. options.projectRoot is provided – look in <projectRoot>/output/feature-list.json.
-  //  3. Fallback to PATHS.OUTPUT_DIR (workflow's own output dir) for backward-compat.
+  return { fixedPrefix, _resolvedVariantId, _isExploration };
+}
+
+/**
+ * Phase 2: Prepare the list of context files, auto-injecting feature-list.json
+ * for coding-agent if available.
+ */
+function _prepareContextFiles(role, contextFiles, options) {
   const autoContextFiles = [...contextFiles];
   if (role === 'coding-agent') {
-    const nodePath = require('path');
     const projectRoot = (options && options.projectRoot)
       ? options.projectRoot
-      : require('../core/constants').WORKFLOW_ROOT;
+      : WORKFLOW_ROOT;
     const featureListPath = nodePath.join(projectRoot, 'output', 'feature-list.json');
     const alreadyIncluded = autoContextFiles.some(f => nodePath.basename(f) === 'feature-list.json');
     if (!alreadyIncluded && fs.existsSync(featureListPath)) {
-      autoContextFiles.unshift(featureListPath); // Prepend so it appears first
+      autoContextFiles.unshift(featureListPath);
     }
   }
+  return autoContextFiles;
+}
 
-  // ── Auto-inject: skills + ADR digest via ContextLoader ─────────────────────
-  // This is the fix for "Agent won't read skills/ or decision-log.md unless prompted".
-  // ContextLoader matches task keywords → relevant skill files + ADR entries,
-  // then injects them into the dynamic suffix automatically.
-  // D1 optimisation: uses _getOrCreateLoader() to cache the ContextLoader instance
-  // across multiple buildAgentPrompt() calls, avoiding redundant disk I/O.
+/**
+ * Phase 3: Load auto-injected sections (skills + ADR digest) via ContextLoader.
+ */
+function _loadAutoInjectedSections(role, dynamicInput, options) {
+  // P1 fix: expand query with synonyms before passing to ContextLoader
+  const expandedInput = _expandQueryWithSynonyms(dynamicInput);
+
   const loaderOptions = {
-    workflowRoot:     require('../core/constants').WORKFLOW_ROOT,
+    workflowRoot:     WORKFLOW_ROOT,
     projectRoot:      options && options.projectRoot ? options.projectRoot : null,
     skillKeywords:    options && options.skillKeywords ? options.skillKeywords : {},
     alwaysLoadSkills: options && options.alwaysLoadSkills ? options.alwaysLoadSkills : [],
     globalSkills:     options && options.globalSkills ? options.globalSkills : (getConfig().globalSkills || []),
     projectSkills:    options && options.projectSkills ? options.projectSkills : (getConfig().projectSkills || []),
-    // Gap 1 fix: dynamically fetch retired skill names from SkillEvolutionEngine.
-    // This ensures newly-retired skills are excluded immediately without restarting.
     retiredSkills:    _skillEvolutionEngine ? _getRetiredSkillNames(_skillEvolutionEngine) : null,
-    // P0: pass shared CodeGraph instance to avoid redundant disk I/O in ContextLoader
     codeGraph:        options && options.codeGraph ? options.codeGraph : null,
+    orchestrator:     _orchestrator,  // ADR-45: for lazy skill enrichment
   };
   const loader = _getOrCreateLoader(loaderOptions);
-  const { sections: autoSections, sources: autoSources } = loader.resolve(dynamicInput, role);
+  const { sections: autoSections, sources: autoSources } = loader.resolve(expandedInput, role);
 
-  // ── Skill Lifecycle: record which skills were injected this call ──────────
-  // Extract skill names from sources (e.g. "flutter-dev.md") and pass to
-  // Observability for cross-session effectiveness tracking.
   const injectedSkillNames = (autoSources || [])
     .filter(s => s.endsWith('.md') && !s.includes('decision-log') && !s.includes('architecture-constraints') && !s.includes('code-graph'))
     .map(s => s.replace(/\.md$/, '').replace(/\s*\(.*\)$/, ''));
 
-  // Load additional context files into the dynamic suffix
-  const contextSections = [];
-  for (const filePath of autoContextFiles) {
+  return { autoSections, injectedSkillNames };
+}
+
+/**
+ * P1 fix: Expands query text with synonyms from the ExperienceStore synonym table.
+ * This improves skill matching recall by including related terms.
+ *
+ * @param {string} query - Original query text
+ * @returns {string} - Expanded query with synonyms appended
+ */
+function _expandQueryWithSynonyms(query) {
+  if (!_experienceStore || typeof query !== 'string') return query;
+
+  try {
+    const synonymTable = _experienceStore.getSynonymTable();
+    if (!synonymTable || Object.keys(synonymTable).length === 0) return query;
+
+    const lower = query.toLowerCase();
+    const expandedTerms = new Set();
+
+    // Find matching entries and collect their expanded terms
+    for (const [key, entry] of Object.entries(synonymTable)) {
+      const keywords = key.split('|');
+      for (const kw of keywords) {
+        if (lower.includes(kw.toLowerCase())) {
+          for (const term of (entry.expandedTerms || [])) {
+            expandedTerms.add(term);
+          }
+          break; // Only count each entry once
+        }
+      }
+    }
+
+    if (expandedTerms.size === 0) return query;
+
+    // Append expanded terms (limit to avoid bloat)
+    const termsArray = [...expandedTerms].slice(0, 10);
+    const expanded = `${query} ${termsArray.join(' ')}`;
+
+    if (termsArray.length > 0) {
+      console.log(`[PromptBuilder] 🔍 Query expanded with ${termsArray.length} synonym(s): ${termsArray.slice(0, 5).join(', ')}${termsArray.length > 5 ? '...' : ''}`);
+    }
+
+    return expanded;
+  } catch (_) {
+    return query; // Non-fatal: return original query on error
+  }
+}
+
+/**
+ * Phase 4: Read explicit context files into sections.
+ */
+function _readContextFileSections(contextFilePaths) {
+  const sections = [];
+  for (const filePath of contextFilePaths) {
     if (fs.existsSync(filePath)) {
       const content = fs.readFileSync(filePath, 'utf-8');
-      contextSections.push(`### Context: ${require('path').basename(filePath)}\n${content}`);
+      sections.push(`### Context: ${nodePath.basename(filePath)}\n${content}`);
     }
   }
+  return sections;
+}
 
-  // ── Auto-inject: Runtime Environment Info ─────────────────────────────────
-  // Inject OS and shell information so agents use correct command syntax.
-  // This prevents recurring errors like using `&&` on PowerShell (which only
-  // supports `&&` in PowerShell 7+, not Windows PowerShell 5.x).
+/**
+ * Phase 5a: Inject runtime environment info (OS, shell).
+ */
+function _injectRuntimeInfo(autoSections) {
   try {
-    const osType = process.platform; // 'win32', 'darwin', 'linux'
+    const osType = process.platform;
     const shellHint = osType === 'win32' ? 'PowerShell' : (process.env.SHELL || '/bin/bash');
     const envLines = [
       `### Runtime Environment`,
@@ -889,105 +1037,85 @@ function buildAgentPrompt(role, dynamicInput, contextFiles = [], options = {}) {
       );
     }
     autoSections.push(envLines.join('\n'));
-  } catch (_) { /* Non-fatal: don't block prompt building */ }
+  } catch (_) { /* Non-fatal */ }
+}
 
-  // ── Auto-inject: Self-Reflection known-issues summary ────────────────────
-  // P1 Integration: inject compact summary of known critical/high issues so
-  // agents are aware of recurring problems and can proactively avoid them.
-  // Uses module-level _selfReflectionEngine set by Orchestrator constructor.
+/**
+ * Phase 5a-IDE: Inject IDE tool guidance when running inside an IDE.
+ * Instructs AI Agents to prefer IDE-native tools (codebase_search, grep_search,
+ * view_code_item) over self-built modules (CodeGraph.search, LSPAdapter) for
+ * maximum accuracy and speed. Self-built modules remain available as fallback.
+ */
+function _injectIDEToolGuidance(autoSections) {
+  try {
+    const guidance = generateIDEToolGuidance();
+    if (guidance) {
+      autoSections.push(guidance);
+    }
+  } catch (_) { /* Non-fatal: IDE guidance is optional enhancement */ }
+}
+
+/**
+ * Phase 5b: Inject self-reflection known-issues summary.
+ */
+function _injectSelfReflection(autoSections, options) {
   if (_selfReflectionEngine) {
     try {
       const reflectionSummary = _selfReflectionEngine.getReflectionSummary(1500);
       if (reflectionSummary) {
         autoSections.push(`### Known Issues (Self-Reflection)\n${reflectionSummary}`);
       }
-    } catch (_) { /* Non-fatal: don't block prompt building */ }
+    } catch (_) { /* Non-fatal */ }
   } else if (options && options.selfReflectionSummary) {
-    // Fallback: accept summary via options (for testing or standalone usage)
     autoSections.push(`### Known Issues (Self-Reflection)\n${options.selfReflectionSummary}`);
   }
+}
 
-  // Build dynamic suffix: auto-injected context first, then explicit context, then input
-  let dynamicSuffix = [...autoSections, ...contextSections, `### Input\n${dynamicInput}`].join('\n\n');
-  let result = buildKVCacheFriendlyPrompt(fixedPrefix, dynamicSuffix);
+/**
+ * Phase 6 (degradation): Progressively drop low-priority sections when over
+ * the hallucination risk threshold.
+ */
+function _applyContextDegradation(fixedPrefix, dynamicInput, autoSections, contextSections) {
+  const degradedAutoSections = [];
+  const inputSection = `### Input\n${dynamicInput}`;
 
-  // Run noise analysis with automatic degradation strategy (D5 optimisation).
-  // When the total prompt exceeds the hallucination risk threshold, automatically
-  // drop the lowest-priority context sections (auto-injected skills/ADRs first,
-  // then explicit context files) until we're back under budget.
-  // This prevents the "warn but do nothing" anti-pattern where the system logs a
-  // ⚠️ warning but still sends an oversized prompt, leading to hallucination.
-  const noiseAnalysis = analysePromptNoise(result.prompt);
-  if (noiseAnalysis.isHighRisk && (autoSections.length > 0 || contextSections.length > 0)) {
-    // Strategy: progressively drop sections from lowest to highest priority.
-    // Priority order (highest → lowest):
-    //   1. ### Input (NEVER drop – this is the actual task)
-    //   2. Explicit context files (high priority – caller explicitly requested these)
-    //   3. Auto-injected skills/ADRs (lowest – these are supplementary)
-    const degradedAutoSections = [];
-    const inputSection = `### Input\n${dynamicInput}`;
+  // Phase 1: try dropping all auto-injected sections
+  let degradedSuffix = [...contextSections, inputSection].join('\n\n');
+  let degradedResult = buildKVCacheFriendlyPrompt(fixedPrefix, degradedSuffix);
+  let degradedNoise = analysePromptNoise(degradedResult.prompt);
 
-    // Phase 1: try dropping all auto-injected sections
-    let degradedSuffix = [...contextSections, inputSection].join('\n\n');
-    let degradedResult = buildKVCacheFriendlyPrompt(fixedPrefix, degradedSuffix);
-    let degradedNoise = analysePromptNoise(degradedResult.prompt);
-
-    if (!degradedNoise.isHighRisk) {
-      // Dropping auto-sections was sufficient. Now try to add back as many as fit.
-      let restoredBudget = LLM.HALLUCINATION_RISK_THRESHOLD - degradedNoise.estimatedTokens;
-      for (const section of autoSections) {
-        const sectionTokens = estimateTokens(section);
-        if (sectionTokens <= restoredBudget) {
-          degradedAutoSections.push(section);
-          restoredBudget -= sectionTokens;
-        }
+  if (!degradedNoise.isHighRisk) {
+    // Restore as many auto-sections as fit
+    let restoredBudget = LLM.HALLUCINATION_RISK_THRESHOLD - degradedNoise.estimatedTokens;
+    for (const section of autoSections) {
+      const sectionTokens = estimateTokens(section);
+      if (sectionTokens <= restoredBudget) {
+        degradedAutoSections.push(section);
+        restoredBudget -= sectionTokens;
       }
-      const droppedCount = autoSections.length - degradedAutoSections.length;
-      if (droppedCount > 0) {
-        console.log(`[PromptBuilder] 🔽 Context degradation: dropped ${droppedCount}/${autoSections.length} auto-injected section(s) to stay under hallucination threshold.`);
-      }
-      dynamicSuffix = [...degradedAutoSections, ...contextSections, inputSection].join('\n\n');
-      result = buildKVCacheFriendlyPrompt(fixedPrefix, dynamicSuffix);
-    } else {
-      // Phase 2: still over budget even without auto-sections.
-      // Drop explicit context files from the end (least relevant first).
-      const keptContextSections = [];
-      let contextBudget = LLM.HALLUCINATION_RISK_THRESHOLD - estimateTokens(fixedPrefix) - estimateTokens(inputSection) - 200; // 200 token safety margin
-      for (const section of contextSections) {
-        const sectionTokens = estimateTokens(section);
-        if (sectionTokens <= contextBudget) {
-          keptContextSections.push(section);
-          contextBudget -= sectionTokens;
-        }
-      }
-      const droppedContext = contextSections.length - keptContextSections.length;
-      console.log(`[PromptBuilder] 🔽 Context degradation (phase 2): dropped all auto-injected sections + ${droppedContext}/${contextSections.length} context file(s).`);
-      dynamicSuffix = [...keptContextSections, inputSection].join('\n\n');
-      result = buildKVCacheFriendlyPrompt(fixedPrefix, dynamicSuffix);
     }
-    result.meta.contextDegraded = true;
+    const droppedCount = autoSections.length - degradedAutoSections.length;
+    if (droppedCount > 0) {
+      console.log(`[PromptBuilder] 🔽 Context degradation: dropped ${droppedCount}/${autoSections.length} auto-injected section(s) to stay under hallucination threshold.`);
+    }
+    degradedSuffix = [...degradedAutoSections, ...contextSections, inputSection].join('\n\n');
+    return buildKVCacheFriendlyPrompt(fixedPrefix, degradedSuffix);
   }
 
-  // R1-2 audit: reuse the noise analysis from the degradation check above instead
-  // of calling analysePromptNoise() a second time on the (possibly degraded) prompt.
-  // If degradation was triggered, result.prompt has already changed and we need a
-  // fresh analysis; otherwise reuse the first one. In BOTH cases the degradation
-  // branch already assigned `result` correctly, so one final analysis suffices.
-  result.meta.noiseAnalysis = result.meta.contextDegraded
-    ? analysePromptNoise(result.prompt)
-    : noiseAnalysis;
-  result.meta.agentRole = role;
-  // Attach injected skill names for downstream Observability tracking
-  if (injectedSkillNames && injectedSkillNames.length > 0) {
-    result.meta.injectedSkillNames = injectedSkillNames;
+  // Phase 2: still over budget — drop explicit context files too
+  const keptContextSections = [];
+  let contextBudget = LLM.HALLUCINATION_RISK_THRESHOLD - estimateTokens(fixedPrefix) - estimateTokens(inputSection) - 200;
+  for (const section of contextSections) {
+    const sectionTokens = estimateTokens(section);
+    if (sectionTokens <= contextBudget) {
+      keptContextSections.push(section);
+      contextBudget -= sectionTokens;
+    }
   }
-  // Attach A/B variant info for downstream outcome tracking
-  if (_resolvedVariantId) {
-    result.meta.promptVariantId = _resolvedVariantId;
-    result.meta.promptVariantExploration = _isExploration;
-  }
-
-  return result;
+  const droppedContext = contextSections.length - keptContextSections.length;
+  console.log(`[PromptBuilder] 🔽 Context degradation (phase 2): dropped all auto-injected sections + ${droppedContext}/${contextSections.length} context file(s).`);
+  degradedSuffix = [...keptContextSections, inputSection].join('\n\n');
+  return buildKVCacheFriendlyPrompt(fixedPrefix, degradedSuffix);
 }
 
 // ─── Internal Helpers ─────────────────────────────────────────────────────────
@@ -1022,6 +1150,10 @@ module.exports = {
   setSelfReflectionEngine,
   // Skill Evolution context injection (Gap 1: retired skill exclusion)
   setSkillEvolutionEngine,
+  // ExperienceStore for synonym expansion (P1 fix)
+  setExperienceStore,
+  // Orchestrator reference for lazy skill enrichment (ADR-45)
+  setOrchestrator,
   // Long-running agent pattern modules
   FeatureList:    require('./feature-list').FeatureList,
   FeatureStatus:  require('./feature-list').FeatureStatus,

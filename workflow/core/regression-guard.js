@@ -38,6 +38,35 @@ const METRIC_KEY = {
   SKILL_EFFECTIVE:  'skillEffectiveRate',
 };
 
+// ─── Metric Direction Registry ──────────────────────────────────────────────
+// Defines whether each metric improves by going UP or DOWN.
+// Inspired by pi-autoresearch's metric+direction pattern.
+
+const METRIC_DIRECTION = {
+  [METRIC_KEY.ERROR_RATE]:      'minimize', // lower is better
+  [METRIC_KEY.TOKEN_USAGE]:     'minimize', // lower is better
+  [METRIC_KEY.DURATION_MS]:     'minimize', // lower is better
+  [METRIC_KEY.TEST_PASS_RATE]:  'maximize', // higher is better
+  [METRIC_KEY.EXP_HIT_RATE]:    'maximize', // higher is better
+  [METRIC_KEY.GATE_PASS_RATE]:  'maximize', // higher is better
+  [METRIC_KEY.SKILL_EFFECTIVE]: 'maximize', // higher is better
+};
+
+// ─── Metric Target Registry ─────────────────────────────────────────────────
+// Defines target thresholds. Once a metric reaches its target, it is considered
+// "healthy" and optimization effort shifts to other metrics.
+// Targets can be overridden via constructor opts.targets.
+
+const DEFAULT_METRIC_TARGETS = {
+  [METRIC_KEY.ERROR_RATE]:      0,     // zero errors
+  [METRIC_KEY.TOKEN_USAGE]:     5000,  // ≤5K tokens per session
+  [METRIC_KEY.DURATION_MS]:     60000, // ≤60s per session
+  [METRIC_KEY.TEST_PASS_RATE]:  0.95,  // ≥95% test pass
+  [METRIC_KEY.EXP_HIT_RATE]:    0.6,   // ≥60% experience relevance
+  [METRIC_KEY.GATE_PASS_RATE]:  0.9,   // ≥90% quality gates pass
+  [METRIC_KEY.SKILL_EFFECTIVE]: 0.7,   // ≥70% skill effectiveness
+};
+
 // ─── Regression Guard Class ─────────────────────────────────────────────────
 
 class RegressionGuard {
@@ -51,6 +80,7 @@ class RegressionGuard {
     this._verbose   = opts.verbose ?? false;
     this._baselinePath = path.join(this._outputDir, 'evolve-baseline.json');
     this._historyPath  = path.join(this._outputDir, 'evolve-history.jsonl');
+    this._targets   = { ...DEFAULT_METRIC_TARGETS, ...(opts.targets || {}) };
   }
 
   // ─── Capture Baseline ─────────────────────────────────────────────────
@@ -198,13 +228,14 @@ class RegressionGuard {
         pctChange: +pctChange.toFixed(1),
       };
 
-      // Determine direction (lower is better for errors/tokens/duration, higher is better for rates)
-      const lowerIsBetter = [METRIC_KEY.ERROR_RATE, METRIC_KEY.TOKEN_USAGE, METRIC_KEY.DURATION_MS].includes(key);
+      // Determine direction from the registry (replaces hardcoded list)
+      const direction = METRIC_DIRECTION[key] || 'maximize';
+      const isMinimize = direction === 'minimize';
       const threshold = 0.05; // 5% change threshold
 
       if (Math.abs(pctChange) < threshold * 100) {
         unchanged.push(key);
-      } else if ((lowerIsBetter && diff < 0) || (!lowerIsBetter && diff > 0)) {
+      } else if ((isMinimize && diff < 0) || (!isMinimize && diff > 0)) {
         improved.push(key);
       } else {
         degraded.push(key);
@@ -218,7 +249,109 @@ class RegressionGuard {
       console.log(`[RegressionGuard] 📊 Comparison: ${improved.length} improved, ${degraded.length} degraded, ${unchanged.length} unchanged, ${regressions.length} regression(s)`);
     }
 
-    return { improved, degraded, unchanged, regressions, delta };
+    // Compute target gap analysis — which metrics are still below target?
+    const targetGaps = this._computeTargetGaps(current);
+
+    return { improved, degraded, unchanged, regressions, delta, targetGaps };
+  }
+
+  // ─── Target Gap Analysis ──────────────────────────────────────────────
+
+  /**
+   * Computes which metrics have not yet reached their targets.
+   * Returns an array of { metric, direction, current, target, gapPct }.
+   *
+   * @param {object} currentMetrics
+   * @returns {object[]}
+   */
+  _computeTargetGaps(currentMetrics) {
+    const gaps = [];
+    for (const [key, target] of Object.entries(this._targets)) {
+      const current = currentMetrics?.[key];
+      if (current == null || target == null) continue;
+
+      const direction = METRIC_DIRECTION[key] || 'maximize';
+      const isMinimize = direction === 'minimize';
+
+      // Check if target is met
+      const targetMet = isMinimize ? current <= target : current >= target;
+      if (targetMet) continue;
+
+      // Compute gap percentage
+      const gap = isMinimize ? current - target : target - current;
+      const gapPct = target !== 0 ? +((gap / target) * 100).toFixed(1) : Infinity;
+
+      gaps.push({
+        metric: key,
+        direction,
+        current,
+        target,
+        gap: +gap.toFixed(3),
+        gapPct,
+      });
+    }
+
+    // Sort by gap percentage (largest gap first = highest priority)
+    gaps.sort((a, b) => b.gapPct - a.gapPct);
+    return gaps;
+  }
+
+  // ─── Snapshot / Rollback Helpers (for MAPE Micro-Loop) ────────────────
+
+  /**
+   * Takes a lightweight metrics snapshot for micro-loop comparison.
+   * Unlike captureBaseline(), this is fast and doesn't persist to disk.
+   *
+   * @returns {object} { metrics: {...}, snapshotAt: string }
+   */
+  snapshotMetrics() {
+    const metrics = this._loadCurrentMetrics() || {};
+    return {
+      metrics,
+      snapshotAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Compares a post-action snapshot against a pre-action snapshot.
+   * Returns { improved, degraded, shouldRollback }.
+   *
+   * @param {object} before — From snapshotMetrics()
+   * @param {object} after  — From snapshotMetrics() or direct metrics
+   * @param {object} [opts]
+   * @param {number} [opts.degradationThreshold=0.1] — 10% degradation triggers rollback
+   * @returns {{ improved: string[], degraded: string[], shouldRollback: boolean, reason: string }}
+   */
+  evaluateMicroDelta(before, after, opts = {}) {
+    const { degradationThreshold = 0.1 } = opts;
+    const improved = [];
+    const degraded = [];
+
+    for (const [key, beforeVal] of Object.entries(before.metrics || {})) {
+      const afterVal = (after.metrics || after)[key];
+      if (afterVal == null) continue;
+
+      const diff = afterVal - beforeVal;
+      const pctChange = beforeVal !== 0 ? Math.abs(diff / beforeVal) : 0;
+      if (pctChange < 0.01) continue; // < 1% = noise
+
+      const direction = METRIC_DIRECTION[key] || 'maximize';
+      const isMinimize = direction === 'minimize';
+      const isImproved = (isMinimize && diff < 0) || (!isMinimize && diff > 0);
+
+      if (isImproved) {
+        improved.push(key);
+      } else if (pctChange >= degradationThreshold) {
+        degraded.push(key);
+      }
+    }
+
+    const shouldRollback = degraded.length > 0 && degraded.length >= improved.length;
+    const reason = shouldRollback
+      ? `${degraded.length} metric(s) degraded ≥${(degradationThreshold * 100).toFixed(0)}%: ${degraded.join(', ')}`
+      : '';
+
+    return { improved, degraded, shouldRollback, reason };
   }
 
   // ─── Detect Skill Regressions ─────────────────────────────────────────
@@ -408,4 +541,4 @@ class RegressionGuard {
   }
 }
 
-module.exports = { RegressionGuard, METRIC_KEY };
+module.exports = { RegressionGuard, METRIC_KEY, METRIC_DIRECTION, DEFAULT_METRIC_TARGETS };

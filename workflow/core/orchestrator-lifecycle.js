@@ -25,6 +25,9 @@ const { STATE_ORDER } = require('./types');
 const { SkillWatcher } = require('./skill-watcher');
 const { getCachedLoader, onLoaderReady } = require('./prompt-builder');
 const { ComplaintStatus } = require('./complaint-wall');
+const { SessionSignalDetector } = require('./session-signal-detector');
+const { SessionQualityScorer } = require('./session-quality-scorer');
+const { KnowledgeLayer, getLayerForCategory } = require('./experience-types');
 
 // ─── P1 Recovery Hook: Recoverable Error Classification ────────────────────
 // Defines which error types are safe to auto-retry in _runStage().
@@ -515,6 +518,115 @@ const resolvedComplaints = this.complaintWall.complaints.filter(c => c.status ==
       }
     } else if (this.complaintWall && !shouldEvolve.aefRefinement) {
       console.log(`[Orchestrator] ⏭️  AEF Self-Refinement skipped (no open complaints or negative experiences)`);
+    }
+
+    // ── ADR-43: Session Signal Detection + Quality Scoring ──────────────────
+    // Automatic capture of "pitfall moments" from workflow sessions.
+    // Only runs if session has meaningful signals (errors, retries, complaints).
+    if (this._sessionSignalDetector && this.experienceStore) {
+      try {
+        // 1. Gather session context for signal detection
+        const decisionLogContent = this.decisionTrail
+          ? this.decisionTrail.getTimeline().map(t => `${t.stage}: ${t.decision}`).join('\n')
+          : '';
+        const errorLogContent = this.complaintWall
+          ? this.complaintWall.getOpenComplaints().map(c => c.description).join('\n')
+          : '';
+
+        // 2. Detect signals from session
+        const signalResult = this._sessionSignalDetector.detectSignals({
+          decisionLog: decisionLogContent,
+          errorLog: errorLogContent,
+        });
+
+        // 3. Score session quality
+        const qualityScorer = new SessionQualityScorer({
+          experienceStore: this.experienceStore,
+          verbose: this._verbose,
+        });
+        const qualityResult = qualityScorer.scoreWithSignals(
+          { decisionLog: decisionLogContent, errorLog: errorLogContent },
+          signalResult
+        );
+
+        // 4. Capture experience if warranted
+        if (qualityResult.shouldCapture && signalResult.signals.length > 0) {
+          console.log(`\n${'─'.repeat(60)}`);
+          console.log(`  🎯 SESSION SIGNAL CAPTURE (ADR-43)`);
+          console.log(`${'─'.repeat(60)}`);
+          console.log(`  Signals: ${signalResult.signals.length} (score: ${signalResult.score.toFixed(2)})`);
+          console.log(`  Quality: ${qualityResult.qualityScore.toFixed(2)}`);
+          console.log(`  Reason: ${qualityResult.reason}`);
+          console.log(`${'─'.repeat(60)}\n`);
+
+          // 5. Extract experience using LLM (only if signals detected)
+          if (this._rawLlmCall && signalResult.signals.length > 0) {
+            const extractionPrompt = this._sessionSignalDetector.buildExtractionPrompt({
+              decisionLog: decisionLogContent,
+              errorLog: errorLogContent,
+            });
+
+            this._rawLlmCall(extractionPrompt, 'session-signal-extraction')
+              .then(response => {
+                if (!response) return;
+
+                // Parse JSON response
+                let extracted = null;
+                try {
+                  let cleaned = response.trim();
+                  if (cleaned.startsWith('```json')) cleaned = cleaned.slice(7);
+                  else if (cleaned.startsWith('```')) cleaned = cleaned.slice(3);
+                  if (cleaned.endsWith('```')) cleaned = cleaned.slice(0, -3);
+                  const startIdx = cleaned.indexOf('{');
+                  const endIdx = cleaned.lastIndexOf('}');
+                  if (startIdx !== -1 && endIdx !== -1) {
+                    extracted = JSON.parse(cleaned.slice(startIdx, endIdx + 1));
+                  }
+                } catch (_) { /* parse error, ignore */ }
+
+                // Record extracted experiences
+                if (extracted && extracted.experiences && Array.isArray(extracted.experiences)) {
+                  for (const exp of extracted.experiences.slice(0, 2)) {
+                    if (!exp.title || !exp.content) continue;
+
+                    // Ensure category is in PRACTICE layer
+                    const category = exp.category || 'pitfall';
+                    const layer = getLayerForCategory(category);
+
+                    this.experienceStore.record({
+                      type: exp.type || 'negative',
+                      category,
+                      title: exp.title,
+                      content: `${exp.content}\n> _Source: Session Signal Detection (ADR-43)_`,
+                      tags: [...(exp.tags || []), 'signal-captured', `layer:${layer}`],
+                      ttlDays: exp.type === 'negative' ? 90 : 180,
+                    });
+
+                    console.log(`[Orchestrator] 📝 Captured experience: "${exp.title.slice(0, 50)}..." (layer: ${layer})`);
+                  }
+                }
+              })
+              .catch(err => {
+                console.warn(`[Orchestrator] ⚠️  Signal extraction failed (non-fatal): ${err.message}`);
+              });
+          }
+        } else {
+          console.log(`[Orchestrator] ⏭️  Session Signal Capture skipped (${qualityResult.reason})`);
+        }
+
+        // 6. Check experience store layer health
+        if (this.experienceStore.checkLayerHealth) {
+          const layerHealth = this.experienceStore.checkLayerHealth(0.5);
+          if (!layerHealth.healthy) {
+            console.warn(`[Orchestrator] ⚠️  ${layerHealth.recommendation}`);
+          }
+        }
+
+        // 7. Reset detector for next session
+        this._sessionSignalDetector.reset();
+      } catch (ssErr) {
+        console.warn(`[Orchestrator] ⚠️  Session Signal Detection failed (non-fatal): ${ssErr.message}`);
+      }
     }
 
     // ── Prompt A/B: snapshot variant stats into Observability before flush ──

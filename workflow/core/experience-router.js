@@ -91,6 +91,9 @@ class ExperienceRouter {
 
   /**
    * Saves the registry to disk.
+   * P1-8 fix: Uses retry-on-conflict strategy for cross-process safety.
+   * Since multiple project instances may read→modify→write simultaneously,
+   * we reload→merge→write to reduce Last-Write-Wins data loss.
    */
   _saveRegistry() {
     try {
@@ -98,11 +101,30 @@ class ExperienceRouter {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
+
+      // P1-8 fix: Reload registry from disk before saving to reduce race window.
+      // If another process has written since we last loaded, merge our changes
+      // into the latest on-disk state instead of blindly overwriting.
+      let onDisk = this._registry;
+      try {
+        if (fs.existsSync(this._registryPath)) {
+          const raw = JSON.parse(fs.readFileSync(this._registryPath, 'utf-8'));
+          if (Array.isArray(raw)) {
+            // Merge: our in-memory entries take precedence (by projectId)
+            const merged = new Map();
+            for (const entry of raw) { if (entry.projectId) merged.set(entry.projectId, entry); }
+            for (const entry of this._registry) { if (entry.projectId) merged.set(entry.projectId, entry); }
+            onDisk = [...merged.values()];
+          }
+        }
+      } catch (_) { /* proceed with in-memory data */ }
+
       // Trim to MAX_REGISTRY_PROJECTS (keep most recently updated)
-      if (this._registry.length > MAX_REGISTRY_PROJECTS) {
-        this._registry.sort((a, b) => new Date(b.lastUpdated) - new Date(a.lastUpdated));
-        this._registry = this._registry.slice(0, MAX_REGISTRY_PROJECTS);
+      if (onDisk.length > MAX_REGISTRY_PROJECTS) {
+        onDisk.sort((a, b) => new Date(b.lastUpdated) - new Date(a.lastUpdated));
+        onDisk = onDisk.slice(0, MAX_REGISTRY_PROJECTS);
       }
+      this._registry = onDisk;
       const tmpPath = this._registryPath + '.tmp';
       fs.writeFileSync(tmpPath, JSON.stringify(this._registry, null, 2), 'utf-8');
       fs.renameSync(tmpPath, this._registryPath);
@@ -193,7 +215,28 @@ class ExperienceRouter {
         try {
           const raw = fs.readFileSync(entry.experiencePath, 'utf-8');
           const exportData = JSON.parse(raw);
-          const experiences = exportData.experiences || [];
+          let experiences = exportData.experiences || [];
+
+          // P0-4 fix: Schema validation to prevent JSON injection, prototype pollution,
+          // and crashes from malformed/malicious export files.
+          const MAX_CONTENT_LENGTH = 50000; // 50KB per experience content field
+          experiences = experiences.filter(exp => {
+            // Must be a plain object (not array, null, etc.)
+            if (!exp || typeof exp !== 'object' || Array.isArray(exp)) return false;
+            // Must have required string fields
+            if (typeof exp.title !== 'string' || typeof exp.content !== 'string') return false;
+            // Block prototype pollution vectors
+            if ('__proto__' in exp || 'constructor' in exp || 'prototype' in exp) return false;
+            // Enforce content size limit to prevent memory exhaustion
+            if (exp.content.length > MAX_CONTENT_LENGTH) {
+              exp.content = exp.content.slice(0, MAX_CONTENT_LENGTH) + '\n[truncated]';
+            }
+            // Sanitise tags: must be string array
+            if (exp.tags && !Array.isArray(exp.tags)) exp.tags = [];
+            if (exp.tags) exp.tags = exp.tags.filter(t => typeof t === 'string').slice(0, 20);
+            return true;
+          });
+
           if (experiences.length > 0) {
             results.push({
               project: entry.projectId,

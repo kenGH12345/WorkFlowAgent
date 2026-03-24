@@ -80,11 +80,22 @@ async function enrichSkillFromExternalKnowledge(orch, skillName, opts = {}) {
   await _acquireEnrichmentSlot();
 
   try {
+    // ── A-2 architecture fix: Resolve dependencies from orch via service locator.
+    // All downstream code uses these local variables instead of accessing orch directly.
+    // Tests can pass services via opts to avoid needing a real Orchestrator instance.
+    const _resolveService = (name) => {
+      if (opts[name]) return opts[name];
+      if (orch.services && orch.services.has(name)) return orch.services.resolve(name);
+      return null;
+    };
+    const skillEvolution = _resolveService('skillEvolution');
+    const mcpRegistry    = _resolveService('mcpRegistry');
+    const llmCall        = opts.llmCall || orch._rawLlmCall || orch.llmCall || null;
+
     // ── 1. Validate: skill must exist in registry ────────────────────────
-    if (!orch.services || !orch.services.has('skillEvolution')) {
+    if (!skillEvolution) {
       return { success: false, sectionsAdded: 0, sources: [], error: 'SkillEvolutionEngine not available' };
     }
-    const skillEvolution = orch.services.resolve('skillEvolution');
     const meta = skillEvolution.registry.get(skillName);
     if (!meta) {
       return { success: false, sectionsAdded: 0, sources: [], error: `Skill "${skillName}" not found in registry` };
@@ -146,8 +157,7 @@ async function enrichSkillFromExternalKnowledge(orch, skillName, opts = {}) {
     const pagesToFetch = uniqueResults.slice(0, maxFetchPages);
     let wsAdapter = null;
     try {
-      const registry = orch.services.resolve('mcpRegistry');
-      wsAdapter = registry.get('websearch');
+      if (mcpRegistry) wsAdapter = mcpRegistry.get('websearch');
     } catch (_) { /* no adapter */ }
 
     let fetchedContent = '';
@@ -183,11 +193,8 @@ async function enrichSkillFromExternalKnowledge(orch, skillName, opts = {}) {
     const analysisPrompt = _buildEnrichmentAnalysisPrompt(skillName, meta, fetchedContent);
     let analysisResult = null;
 
-    if (orch._rawLlmCall) {
-      const llmResponse = await orch._rawLlmCall(analysisPrompt, 'enrichment-analyst');
-      analysisResult = _parseEnrichmentResponse(llmResponse);
-    } else if (orch.llmCall) {
-      const llmResponse = await orch.llmCall(analysisPrompt, 'enrichment-analyst');
+    if (llmCall) {
+      const llmResponse = await llmCall(analysisPrompt, 'enrichment-analyst');
       analysisResult = _parseEnrichmentResponse(llmResponse);
     }
 
@@ -223,11 +230,8 @@ async function enrichSkillFromExternalKnowledge(orch, skillName, opts = {}) {
       // Build focused second-pass prompt targeting only thin sections
       const secondPassPrompt = _buildSecondPassPrompt(skillName, meta, thinSections, additionalContent || fetchedContent);
       let secondPassResult = null;
-      if (orch._rawLlmCall) {
-        const llmResponse2 = await orch._rawLlmCall(secondPassPrompt, 'enrichment-analyst');
-        secondPassResult = _parseEnrichmentResponse(llmResponse2);
-      } else if (orch.llmCall) {
-        const llmResponse2 = await orch.llmCall(secondPassPrompt, 'enrichment-analyst');
+      if (llmCall) {
+        const llmResponse2 = await llmCall(secondPassPrompt, 'enrichment-analyst');
         secondPassResult = _parseEnrichmentResponse(llmResponse2);
       }
 
@@ -280,15 +284,16 @@ async function enrichSkillFromExternalKnowledge(orch, skillName, opts = {}) {
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`[SkillEnrich] ✅ Enriched skill "${skillName}": ${sectionsAdded} entries added from ${sources.length} source(s) [${sourceType}] in ${elapsed}s`);
-    // P2: Release concurrency slot
-    _releaseEnrichmentSlot();
     return { success: true, sectionsAdded, sources, sourceType };
 
   } catch (err) {
-    // P2: Release concurrency slot on error
-    _releaseEnrichmentSlot();
     console.warn(`[SkillEnrich] ❌ Enrichment failed for "${skillName}": ${err.message}`);
     return { success: false, sectionsAdded: 0, sources: [], error: err.message };
+  } finally {
+    // P0-5 + P1-11 fix: Always release the concurrency slot in finally block.
+    // Previous code had release in both success and catch branches separately,
+    // risking slot leak if a new early-return or unexpected throw was added.
+    _releaseEnrichmentSlot();
   }
 }
 
@@ -593,12 +598,21 @@ async function preheatExperienceStore(orch, opts = {}) {
   const startTime = Date.now();
 
   try {
-    if (!orch.experienceStore) {
+    // A-2 architecture fix: Resolve dependencies via service locator pattern.
+    // All downstream code uses these local variables instead of accessing orch directly.
+    const experienceStore = opts.experienceStore || orch.experienceStore || null;
+    const llmCall         = opts.llmCall || orch._rawLlmCall || orch.llmCall || null;
+    let mcpRegistry       = opts.mcpRegistry || null;
+    if (!mcpRegistry && orch.services) {
+      try { mcpRegistry = orch.services.resolve('mcpRegistry'); } catch (_) {}
+    }
+
+    if (!experienceStore) {
       return { success: false, seeded: 0, error: 'ExperienceStore not available' };
     }
 
     // Only preheat if the store is empty or nearly empty (< 3 entries)
-    const stats = orch.experienceStore.getStats();
+    const stats = experienceStore.getStats();
     if (stats.total >= 3) {
       console.log(`[ExpPreheat] ℹ️  Experience store already has ${stats.total} entries. Skipping preheat.`);
       return { success: true, seeded: 0 };
@@ -662,8 +676,7 @@ async function preheatExperienceStore(orch, opts = {}) {
     const pagesToFetch = uniqueResults.slice(0, maxFetchPages);
     let wsAdapter = null;
     try {
-      const registry = orch.services.resolve('mcpRegistry');
-      wsAdapter = registry.get('websearch');
+      if (mcpRegistry) wsAdapter = mcpRegistry.get('websearch');
     } catch (_) { /* no adapter */ }
 
     let fetchedContent = '';
@@ -757,8 +770,8 @@ async function preheatExperienceStore(orch, opts = {}) {
     ].join('\n');
 
     let experiences = null;
-    if (orch._rawLlmCall) {
-      const llmResponse = await orch._rawLlmCall(analysisPrompt);
+    if (llmCall) {
+      const llmResponse = await llmCall(analysisPrompt);
       experiences = _parsePreheatResponse(llmResponse);
     }
 
@@ -782,7 +795,7 @@ async function preheatExperienceStore(orch, opts = {}) {
         };
         const category = categoryMap[exp.category] || ExperienceCategory.STABLE_PATTERN;
 
-        orch.experienceStore.record({
+        experienceStore.record({
           type,
           category,
           title: exp.title,

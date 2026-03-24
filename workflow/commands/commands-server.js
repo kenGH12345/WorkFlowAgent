@@ -17,6 +17,57 @@
  */
 function registerServerCommands(registerCommand) {
 
+  // ─── /serve-mcp: Start MCP Server (stdio transport for IDE integration) ───
+  registerCommand('serve-mcp', 'Start the MCP protocol server on stdio for IDE plugin integration', async (args, context) => {
+    const path = require('path');
+    const { MCPServer } = require('../core/mcp-server');
+
+    // Parse --project-root argument
+    let projectRoot = context.projectRoot || context.orchestrator?.projectRoot || process.cwd();
+    const rootMatch = args.match(/--project-root\s+(\S+)/);
+    if (rootMatch) projectRoot = path.resolve(rootMatch[1]);
+
+    // Build orchestrator factory if llmCall is available
+    let orchestratorFactory = null;
+    if (context.llmCall) {
+      orchestratorFactory = (opts) => {
+        const { Orchestrator } = require('../index');
+        return new Orchestrator({
+          llmCall: context.llmCall,
+          projectRoot: opts.projectRoot || projectRoot,
+          ...opts,
+        });
+      };
+    }
+
+    const server = new MCPServer({
+      projectRoot,
+      orchestratorFactory,
+      llmCall: context.llmCall || null,
+    });
+
+    server.start();
+
+    return [
+      `🔌 MCP Server started on stdio transport.`,
+      ``,
+      `   Project root: ${projectRoot}`,
+      `   Protocol: JSON-RPC 2.0 over stdin/stdout`,
+      `   Tools: workflow_triage, workflow_run, workflow_init, workflow_status`,
+      `   Workflow execution: ${orchestratorFactory ? '✅ Available (LLM configured)' : '⚠️ Limited (no LLM provider)'}`,
+      ``,
+      `   To connect from an IDE, add to MCP config:`,
+      `   {`,
+      `     "mcpServers": {`,
+      `       "workflowagent": {`,
+      `         "command": "node",`,
+      `         "args": ["workflow/core/mcp-server.js", "--project-root", "${projectRoot}"]`,
+      `       }`,
+      `     }`,
+      `   }`,
+    ].join('\n');
+  });
+
   registerCommand('serve', 'Start the workflow server in long-running HTTP service mode (POST /workflow to trigger)', async (args, context) => {
     const { WorkflowServer } = require('../core/workflow-server');
 

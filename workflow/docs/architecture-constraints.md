@@ -13,6 +13,36 @@
 | `commands/command-router.js` | 100 lines | Hub only; delegate to sub-routers |
 | `commands/commands-*.js` | 500 lines | Split by command domain |
 
+## IDE-First Principle (Foundational Constraint, ADR-37)
+
+> **Rule**: When running inside an IDE (Cursor, VS Code, Claude Code, Windsurf),
+> always prefer IDE-native capabilities over self-built equivalents.
+
+**Enforced constraints:**
+
+1. **No redundant LSP spawn**: `LSPAdapter.connect()` MUST skip spawning a language
+   server when `shouldSkipLSPAdapter()` returns true (IDE already has one running)
+
+2. **Prompt guidance injection**: `PromptBuilder` MUST inject the IDE Tool Guidance
+   block (from `generateIDEToolGuidance()`) into every Agent prompt when IDE is detected
+
+3. **New capability check**: Before implementing any new code intelligence feature,
+   the developer MUST check whether the IDE already provides it. If yes, add the
+   IDE tool to the guidance table instead of building a new module.
+
+4. **Self-built retention**: Self-built modules (CodeGraph, ContextLoader, ExperienceRouter)
+   MUST be retained as fallback — they serve non-IDE environments and provide unique
+   capabilities (hotspot analysis, skill matching, experience routing) that no IDE offers
+
+5. **IDE detection stability**: `core/ide-detection.js` detection results are cached
+   per-process (singleton). Never bypass the cache except in tests.
+
+6. **Configuration override**: Users can force-disable IDE-first mode by setting
+   `ide.forceStandalone: true` in `workflow.config.js`
+
+**Violation = P0 bug**. Spawning a redundant language server inside an IDE wastes
+memory, causes port conflicts, and degrades performance.
+
 ## Module Boundaries
 
 ```

@@ -28,6 +28,16 @@ module.exports = {
     scopeDirs: [],             // Large monorepo only: ['packages/core']. Empty = full scan
   },
 
+  // ─── IDE-First Architecture (ADR-37) ────────────────────────────────────
+  //
+  // Foundational principle: IDE capabilities first, self-built as fallback.
+  // Auto-detects IDE environment (Cursor, VS Code, Claude Code, Windsurf, CodeBuddy).
+  // No config needed — override only to force standalone mode in CI/CD.
+  //
+  ide: {
+    forceStandalone: false,    // Set to true to disable IDE-first mode entirely
+  },
+
   // ─── Automated Verification Loop ─────────────────────────────────────────
   //
   // Set testCommand to enable the automated verification loop.

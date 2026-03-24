@@ -1791,6 +1791,160 @@ Add staleness check to ArticleScout following the same pattern as TechRadar:
 
 
 
+---
+
+## ADR-43: Signal-Driven Experience Capture — Session Signal Detector, Knowledge Layer, Session Quality Scorer
+
+**Status**: Accepted
+**Date**: 2026-03-24
+
+### Context
+
+Inspired by the insight from a technical article: "1% of sessions contain real knowledge":
+
+- Most workflow sessions are routine and produce no novel experience
+- Only sessions with "pitfall signals" (errors, retries, contradictions) contain actionable knowledge
+- The existing ExperienceStore relies on manual recording or explicit negative experiences
+- No automatic mechanism to capture "踩坑现场" (pitfall moments) from sessions
+
+Additionally, the experience store has no knowledge stratification:
+- Framework documentation, API references, and practical experiences are mixed together
+- No clear ownership boundaries (platform vs domain vs practice)
+- Risk of experience store pollution with non-actionable content
+
+### Decision
+
+Three components implemented as P0/P1/P2 priorities:
+
+#### P0: SessionSignalDetector (core/session-signal-detector.js) ~280 lines
+
+Automatic capture of "pitfall moments" from workflow sessions:
+
+**Signal Types:**
+1. `ERROR_KEYWORD` — Explicit error/exception/failure mentions (HIGH severity)
+2. `NEGATION` — "doesn't work", "not supported", "can't do" (MEDIUM severity)
+3. `RETRY_PATTERN` — Same file edited ≥3 times in short succession (HIGH severity)
+4. `TOOL_DENSITY` — High tool call density (>5 calls/min, indicates debugging)
+5. `COMPLAINT_FILED` — ComplaintWall.file() was called during session (HIGH severity)
+
+**Detection Flow:**
+```
+Session starts → Track file edits, tool calls, complaints
+                  ↓
+_finalizeWorkflow() → detectSignals(sessionContext)
+                  ↓
+score >= 1.0 OR HIGH severity? → buildExtractionPrompt() → LLM → ExperienceStore.record()
+                  ↓
+No signals? → Skip capture (avoid token waste)
+```
+
+**Integration Points:**
+- `Orchestrator constructor` — Initialize SessionSignalDetector
+- `_finalizeWorkflow()` — Run signal detection and experience extraction
+- `ComplaintWall.file()` — Mark complaint filed flag
+
+#### P1: Knowledge Layer (core/experience-types.js extension) ~60 lines
+
+Knowledge stratification to prevent experience store pollution:
+
+**Layer Classification:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Knowledge Layer Architecture (ADR-43)                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  PLATFORM (maintained by platform teams)                        │
+│  ├── Framework documentation                                    │
+│  ├── API references                                             │
+│  └── Engine-specific patterns                                   │
+│                                                                 │
+│  DOMAIN (maintained by domain experts)                          │
+│  ├── Business rules                                             │
+│  ├── Project-specific patterns                                  │
+│  └── Architecture decisions                                     │
+│                                                                 │
+│  PRACTICE (captured from real sessions) ← Focus of ADR-43       │
+│  ├── Pitfalls encountered                                       │
+│  ├── Debug techniques discovered                                │
+│  └── Workarounds found                                          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Category → Layer Mapping:**
+- `FRAMEWORK_LIMIT`, `ENGINE_API`, `MODULE_USAGE` → PLATFORM
+- `ARCHITECTURE`, `WORKFLOW_PROCESS`, `CONFIG_SYSTEM` → DOMAIN
+- `PITFALL`, `DEBUG_TECHNIQUE`, `STABLE_PATTERN` → PRACTICE
+
+**New Methods in ExperienceStore:**
+- `getByLayer(layer)` — Filter experiences by knowledge layer
+- `getLayerStats()` — Get statistics grouped by layer
+- `checkLayerHealth(threshold)` — Quality gate for PRACTICE ratio
+
+#### P2: SessionQualityScorer (core/session-quality-scorer.js) ~220 lines
+
+Session quality scoring using heuristics similar to KnowledgePipeline.evaluate():
+
+**Quality Dimensions:**
+1. `ACTIONABILITY` (0.3 weight) — Presence of actionable keywords
+2. `SPECIFICITY` (0.2 weight) — Presence of specific technical terms
+3. `NOVELTY` (0.3 weight) — Check against existing experiences
+4. `RELEVANCE` (0.2 weight) — Presence of project-specific context
+
+**Combined Decision Logic:**
+```
+signalResult.shouldCapture → Always capture (signal-driven)
+qualityResult.passed && signalScore > 0.5 → Capture (quality + signal)
+Otherwise → Skip capture
+```
+
+### Self-Evolution Closed Loop (Updated)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  WorkFlowAgent Self-Evolution - Experience Capture              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Session runs → SessionSignalDetector tracks events             │
+│       ↓                                                         │
+│  _finalizeWorkflow() → detectSignals() + scoreWithSignals()     │
+│       ↓                                                         │
+│  Signals detected? → LLM extraction → ExperienceStore.record()  │
+│       ↓                                                         │
+│  Layer health check → Warn if PRACTICE ratio < 50%              │
+│                                                                 │
+│  Zero daemon, condition-triggered, IDE-First compliant          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Consequences
+
+**Positive:**
+- Automatic capture of "pitfall moments" without manual recording
+- Token-efficient: regex-based detection, LLM only for extraction
+- Knowledge layer prevents experience store pollution
+- Quality scoring ensures only valuable experiences are captured
+- Consistent with ADR-37 IDE-First principle (runs in _finalizeWorkflow)
+
+**Negative:**
+- Additional LLM call for experience extraction (only when signals detected)
+- Signal patterns may need tuning for different project types
+
+### Files Changed
+
+- `core/session-signal-detector.js` — **NEW**: SessionSignalDetector class, signal patterns
+- `core/session-quality-scorer.js` — **NEW**: SessionQualityScorer class, quality dimensions
+- `core/experience-types.js` — **EXTENDED**: KnowledgeLayer, CATEGORY_TO_LAYER, getLayerForCategory()
+- `core/experience-store.js` — **EXTENDED**: getByLayer(), getLayerStats(), checkLayerHealth()
+- `core/orchestrator-lifecycle.js` — **EXTENDED**: Signal detection + quality scoring in _finalizeWorkflow()
+- `workflow/index.js` — **EXTENDED**: SessionSignalDetector initialization
+- `docs/decision-log.md` — ADR-43
+
+
+
+
+
 
 
 

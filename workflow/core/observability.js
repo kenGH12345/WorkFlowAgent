@@ -498,6 +498,40 @@ class Observability {
     this._toolResultFilterStats.filteredBlocks += (stats.filteredLabels || []).length;
   }
 
+  // ─── Custom Metrics Recording ───────────────────────────────────────────
+
+  /**
+   * Records a custom metric for extensibility.
+   * Used by Sleeptime pipeline and other extensions.
+   *
+   * @param {string} name - Metric name
+   * @param {object} value - Metric value
+   */
+  recordCustomMetric(name, value) {
+    if (!this._customMetrics) {
+      this._customMetrics = {};
+    }
+    this._customMetrics[name] = value;
+  }
+
+  // ─── RunGuard Summary Recording ─────────────────────────────────────────
+
+  /**
+   * Records the RunGuard summary for cross-session cost analysis.
+   * Called by orchestrator-lifecycle.js during _finalizeWorkflow().
+   *
+   * @param {object} summary - From RunGuard.getSummary()
+   */
+  recordRunGuardSummary(summary) {
+    if (!summary) return;
+    this._runGuardSummary = {
+      totalCalls: summary.totalCalls || 0,
+      totalTokens: summary.totalTokens || 0,
+      estimatedCost: summary.estimatedCost || 0,
+      tierDowngrades: summary.tierDowngrades || 0,
+    };
+  }
+
   // ─── Self-Reflection: Gating Result Recording ──────────────────────────
 
   /**

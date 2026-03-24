@@ -763,6 +763,78 @@ registerCommand(
 );
 
 registerCommand(
+  'techradar',
+  'Scan for new AI/Agent techniques and evaluate upgrade opportunities. Usage: /techradar [--topic <custom topic>] [--inject] [--verbose]',
+  async (args, context) => {
+    const { TechRadar } = require('../core/techradar');
+
+    // Parse arguments
+    const parts = (args || '').trim().split(/\s+/).filter(Boolean);
+    const verbose = parts.includes('--verbose');
+    const autoInject = parts.includes('--inject');
+
+    let customTopics = null;
+    const topicIdx = parts.indexOf('--topic');
+    if (topicIdx !== -1) {
+      const topicQuery = parts.slice(topicIdx + 1).filter(p => !p.startsWith('--')).join(' ');
+      if (topicQuery) {
+        customTopics = [{ query: topicQuery, label: `Custom: ${topicQuery.slice(0, 50)}`, category: 'custom' }];
+      }
+    }
+
+    const orchestrator = context.orchestrator || null;
+    const radar = new TechRadar({ orchestrator, verbose });
+
+    const radarOpts = { autoInject };
+    if (customTopics) radarOpts.topics = customTopics;
+
+    const result = await radar.run(radarOpts);
+
+    const lines = [
+      `## 📡 TechRadar Report`,
+      ``,
+      `**Duration**: ${(result.elapsedMs / 1000).toFixed(1)}s`,
+      `**Techniques evaluated**: ${result.evaluations.length}`,
+      `**Adoptable techniques**: ${result.adoptableCount}`,
+      `**Knowledge entries injected**: ${result.injectedCount}${!autoInject ? ' (use --inject to enable)' : ''}`,
+      ``,
+    ];
+
+    if (result.evaluations.length > 0) {
+      lines.push(`| Technique | Score | Relevance | Novelty | Actionability | Urgency | Effort |`);
+      lines.push(`|-----------|-------|-----------|---------|---------------|---------|--------|`);
+      for (const e of result.evaluations.sort((a, b) => b.adoptScore - a.adoptScore)) {
+        const flag = e.adoptScore >= 0.50 ? '✅' : '⚪';
+        lines.push(`| ${flag} ${e.title.slice(0, 35)} | **${e.adoptScore.toFixed(2)}** | ${e.scores.relevance} | ${e.scores.novelty} | ${e.scores.actionability} | ${e.scores.upgradeUrgency} | ${e.implementationEffort} |`);
+      }
+      lines.push(``);
+
+      // Show top recommendation
+      const adoptable = result.evaluations.filter(e => e.adoptScore >= 0.50);
+      if (adoptable.length > 0 && adoptable[0].summary) {
+        lines.push(`### Top Recommendation`);
+        lines.push(`> ${adoptable[0].summary}`);
+        lines.push(``);
+        if (adoptable[0].recommendation) {
+          lines.push(`**Action**: ${adoptable[0].recommendation}`);
+        }
+        if (adoptable[0].relatedModules && adoptable[0].relatedModules.length > 0) {
+          lines.push(`**Related Modules**: ${adoptable[0].relatedModules.join(', ')}`);
+        }
+        lines.push(``);
+      }
+    } else {
+      lines.push(`### ℹ️ No Techniques Found`);
+      lines.push(`No techniques retrieved. This may be due to API rate limiting or network issues.`);
+    }
+
+    lines.push(`> 📄 Full report: \`output/techradar-report.md\``);
+
+    return lines.join('\n');
+  }
+);
+
+registerCommand(
   'deep-audit',
   'Run a comprehensive deep audit across all system dimensions (logic, config, architecture, coupling, knowledge, performance). Usage: /deep-audit [--dimension <name>] [--verbose]',
   async (args, context) => {
@@ -962,6 +1034,27 @@ registerCommand(
       log(`⚠️ MAPE analysis failed (non-fatal): ${err.message}`);
     }
 
+    // ── MAPE Micro-Loop: Hypothesize → Execute → Measure → Keep/Rollback ──
+    let microLoopReport = null;
+    if (!dryRun && mapeReport && mapeReport.phases.plan.actionCount > 0) {
+      try {
+        const { MAPEEngine: MAPEMicro } = require('../core/mape-engine');
+        const microMape = new MAPEMicro({ orchestrator: orch, verbose, microLoopMaxIter: 3 });
+        microLoopReport = await microMape.runMicroLoop({ maxIterations: 3, degradationThreshold: 0.1 });
+
+        report.steps.push({
+          name: 'MAPE Micro-Loop',
+          icon: microLoopReport.rolledBack > 0 ? '↩️' : '✅',
+          status: 'done',
+          summary: `${microLoopReport.iterations.length} iteration(s): ${microLoopReport.kept} kept, ${microLoopReport.rolledBack} rolled back${microLoopReport.stopped ? ' (stopped early)' : ''}`,
+          microLoop: microLoopReport,
+        });
+        log(`🔄 Micro-Loop: ${microLoopReport.kept} kept, ${microLoopReport.rolledBack} rolled back`);
+      } catch (err) {
+        report.steps.push({ name: 'MAPE Micro-Loop', icon: '⚠️', status: 'error', summary: err.message });
+        log(`⚠️ MAPE Micro-Loop failed (non-fatal): ${err.message}`);
+      }
+    }
 
     // ── Step 1: Deep Audit (skip in incremental mode if no changes) ─────
     const totalSteps = quick ? 4 : 5;
@@ -1405,6 +1498,32 @@ registerCommand(
         lines.push(`**⚠️ Skill Regressions Detected:**`);
         for (const r of comparison.regressions) {
           lines.push(`- \`${r.skillName}\`: ${r.reason} (action: ${r.action})`);
+        }
+        lines.push(``);
+      }
+
+      // Target Gap Analysis — show metrics that haven't reached targets
+      if (comparison.targetGaps && comparison.targetGaps.length > 0) {
+        lines.push(`**🎯 Target Gap Analysis (metrics below target):**`);
+        lines.push(`| Metric | Current | Target | Direction | Gap |`);
+        lines.push(`|--------|---------|--------|-----------|-----|`);
+        for (const g of comparison.targetGaps.slice(0, 7)) {
+          const arrow = g.direction === 'minimize' ? '↓' : '↑';
+          lines.push(`| ${g.metric} | ${g.current} | ${g.target} | ${arrow} ${g.direction} | ${g.gapPct}% |`);
+        }
+        lines.push(``);
+      }
+
+      // MAPE Micro-Loop results
+      if (microLoopReport && microLoopReport.iterations.length > 0) {
+        lines.push(`**🔄 MAPE Micro-Loop (Hypothesize → Execute → Measure → Keep/Rollback):**`);
+        lines.push(`| # | Action | Status | Improved | Degraded |`);
+        lines.push(`|---|--------|--------|----------|----------|`);
+        for (const it of microLoopReport.iterations) {
+          const statusIcon = it.status === 'kept' ? '✅' : it.status === 'rolled-back' ? '↩️' : '❌';
+          const improved = it.delta?.improved?.join(', ') || '-';
+          const degraded = it.delta?.degraded?.join(', ') || '-';
+          lines.push(`| ${it.iteration} | ${it.action.slice(0, 50)} | ${statusIcon} ${it.status} | ${improved} | ${degraded} |`);
         }
         lines.push(``);
       }

@@ -91,6 +91,83 @@ function _setJaccard(a, b) {
   return intersection / (a.size + b.size - intersection);
 }
 
+// ─── Conflict Detection ─────────────────────────────────────────────────────
+
+/**
+ * Contradiction signal keywords. When the newer experience's content contains
+ * one of these relative to the older experience, it indicates a conflict.
+ * We compare whether old and new content give opposite advice.
+ */
+const CONTRADICTION_SIGNALS = [
+  // Direct negation pairs
+  ['should', 'should not'],
+  ['must', 'must not'],
+  ['always', 'never'],
+  ['recommended', 'deprecated'],
+  ['use', 'avoid'],
+  ['enable', 'disable'],
+  ['correct', 'incorrect'],
+  ['safe', 'unsafe'],
+  ['required', 'optional'],
+  ['do', "don't"],
+  ['do', 'do not'],
+];
+
+/**
+ * Detects if two experiences in the same category have contradictory content.
+ * Uses lightweight heuristic (no LLM calls):
+ *   1. Both must be in the same category
+ *   2. Both must have high title similarity (>= 0.5 bigram Jaccard)
+ *   3. Content contains opposing signals (e.g. "use X" vs "avoid X")
+ *
+ * @param {object} older - Older experience record
+ * @param {object} newer - Newer experience record
+ * @returns {{ isConflict: boolean, reason: string }}
+ */
+function detectConflict(older, newer) {
+  // Must be same category to be a meaningful conflict
+  if (older.category !== newer.category) {
+    return { isConflict: false, reason: '' };
+  }
+
+  // Title similarity check — only flag conflicts for closely related experiences
+  const titleSim = _bigramJaccard(older.title || '', newer.title || '');
+  if (titleSim < 0.5) {
+    return { isConflict: false, reason: '' };
+  }
+
+  const olderContent = (older.content || '').toLowerCase();
+  const newerContent = (newer.content || '').toLowerCase();
+
+  // Check for contradiction signals
+  for (const [positive, negative] of CONTRADICTION_SIGNALS) {
+    // Case 1: old says "positive", new says "negative"
+    if (olderContent.includes(positive) && newerContent.includes(negative)) {
+      return {
+        isConflict: true,
+        reason: `Opposing advice detected: older uses "${positive}", newer uses "${negative}"`,
+      };
+    }
+    // Case 2: old says "negative", new says "positive"
+    if (olderContent.includes(negative) && newerContent.includes(positive)) {
+      return {
+        isConflict: true,
+        reason: `Opposing advice detected: older uses "${negative}", newer uses "${positive}"`,
+      };
+    }
+  }
+
+  // Check for type mismatch: one positive, one negative on the same topic
+  if (older.type !== newer.type && titleSim >= 0.6) {
+    return {
+      isConflict: true,
+      reason: `Type conflict: older is ${older.type}, newer is ${newer.type} (title similarity: ${(titleSim * 100).toFixed(0)}%)`,
+    };
+  }
+
+  return { isConflict: false, reason: '' };
+}
+
 // ─── Distillation Mixin ─────────────────────────────────────────────────────
 
 const ExperienceDistillationMixin = {
@@ -127,23 +204,90 @@ const ExperienceDistillationMixin = {
     }
 
     // Step 2+3: Find clusters within each category
+    // P1-1 fix: Use blocking (first 3 bigrams of title) to reduce O(N²) to O(N × B),
+    // where B is the block size. Only experiences in the same block are compared.
+    // P1-3 fix: Pre-compute bigram sets for all titles to avoid redundant recomputation.
     const allClusters = [];
     for (const [, catExps] of byCategory) {
       if (catExps.length < minClusterSize) continue;
 
-      // Build adjacency based on similarity threshold
+      // Pre-compute bigram sets and blocking keys for this category
       const n = catExps.length;
-      const visited = new Set();
+      const bigramCache = new Array(n);
+      const tagSetCache = new Array(n);
+      const blocks = new Map(); // blockKey → [indices]
 
       for (let i = 0; i < n; i++) {
+        bigramCache[i] = _bigrams((catExps[i].title || '').toLowerCase());
+        tagSetCache[i] = new Set(catExps[i].tags || []);
+        // Blocking: use first 3 bigrams as block keys (each experience can be in multiple blocks)
+        const title = (catExps[i].title || '').toLowerCase();
+        const blockKeys = new Set();
+        for (let c = 0; c < Math.min(title.length - 1, 3); c++) {
+          blockKeys.add(title.slice(c, c + 2));
+        }
+        if (blockKeys.size === 0) blockKeys.add('__default__');
+        for (const key of blockKeys) {
+          if (!blocks.has(key)) blocks.set(key, []);
+          blocks.get(key).push(i);
+        }
+      }
+
+      // Build adjacency based on similarity threshold (only within blocks)
+      const visited = new Set();
+      const candidatePairs = new Set(); // "i:j" strings to avoid duplicate pair checks
+
+      for (const [, blockIndices] of blocks) {
+        if (blockIndices.length < 2) continue;
+        for (let bi = 0; bi < blockIndices.length; bi++) {
+          for (let bj = bi + 1; bj < blockIndices.length; bj++) {
+            const i = blockIndices[bi];
+            const j = blockIndices[bj];
+            const pairKey = i < j ? `${i}:${j}` : `${j}:${i}`;
+            candidatePairs.add(pairKey);
+          }
+        }
+      }
+
+      // Now compute similarity only for candidate pairs and build clusters
+      const adjList = new Map(); // index → Set of similar indices
+      for (const pairKey of candidatePairs) {
+        const [iStr, jStr] = pairKey.split(':');
+        const i = Number(iStr);
+        const j = Number(jStr);
+
+        // Compute similarity using pre-cached bigrams and tag sets
+        const bg1 = bigramCache[i];
+        const bg2 = bigramCache[j];
+        let bgIntersection = 0;
+        for (const bg of bg1) { if (bg2.has(bg)) bgIntersection++; }
+        const titleSim = (bg1.size === 0 && bg2.size === 0) ? 1.0
+          : (bg1.size === 0 || bg2.size === 0) ? 0.0
+          : bgIntersection / (bg1.size + bg2.size - bgIntersection);
+
+        const tagSim = _setJaccard(tagSetCache[i], tagSetCache[j]);
+        const catMatch = (catExps[i].category === catExps[j].category) ? 1.0 : 0.0;
+        const typeMatch = (catExps[i].type === catExps[j].type) ? 1.0 : 0.0;
+        const sim = 0.4 * titleSim + 0.3 * tagSim + 0.2 * catMatch + 0.1 * typeMatch;
+
+        if (sim >= similarityThreshold) {
+          if (!adjList.has(i)) adjList.set(i, new Set());
+          if (!adjList.has(j)) adjList.set(j, new Set());
+          adjList.get(i).add(j);
+          adjList.get(j).add(i);
+        }
+      }
+
+      // Greedy single-linkage clustering from adjacency list
+      for (let i = 0; i < n; i++) {
         if (visited.has(i)) continue;
+        const neighbors = adjList.get(i);
+        if (!neighbors || neighbors.size === 0) continue;
+
         const cluster = [i];
         visited.add(i);
-
-        for (let j = i + 1; j < n; j++) {
-          if (visited.has(j)) continue;
-          const sim = computeSimilarity(catExps[i], catExps[j]);
-          if (sim >= similarityThreshold) {
+        for (const j of neighbors) {
+          if (!visited.has(j)) {
             cluster.push(j);
             visited.add(j);
           }
@@ -159,11 +303,53 @@ const ExperienceDistillationMixin = {
       return { merged: 0, removed: 0, clusters: [] };
     }
 
-    // Step 4: Merge each cluster
+    // Step 4: Conflict detection + Merge each cluster
     const clusterDetails = [];
     const idsToRemove = new Set();
+    const conflicts = [];
 
     for (const cluster of allClusters) {
+      // ── Conflict Detection (within cluster) ─────────────────────────
+      // Before merging, check if any pair within the cluster has contradictory
+      // content. When a conflict is detected, the NEWER experience wins
+      // (recency bias: latest knowledge is most likely correct).
+      const sortedByDate = [...cluster].sort(
+        (a, b) => new Date(a.updatedAt || a.createdAt).getTime() - new Date(b.updatedAt || b.createdAt).getTime()
+      );
+
+      // Compare each pair within the cluster for conflicts
+      for (let ci = 0; ci < sortedByDate.length; ci++) {
+        for (let cj = ci + 1; cj < sortedByDate.length; cj++) {
+          const older = sortedByDate[ci];
+          const newer = sortedByDate[cj];
+          const { isConflict, reason } = detectConflict(older, newer);
+          if (isConflict) {
+            conflicts.push({
+              olderId: older.id,
+              olderTitle: older.title,
+              newerId: newer.id,
+              newerTitle: newer.title,
+              reason,
+              resolution: 'keep-newer',
+            });
+            // Mark the older conflicting experience for removal (newer wins)
+            idsToRemove.add(older.id);
+            if (!dryRun) {
+              // Annotate the newer experience with conflict resolution metadata
+              if (!newer.conflictResolutions) newer.conflictResolutions = [];
+              newer.conflictResolutions.push({
+                timestamp: new Date().toISOString(),
+                supersededId: older.id,
+                supersededTitle: older.title,
+                reason,
+              });
+              newer.updatedAt = new Date().toISOString();
+              console.log(`[ExperienceStore] ⚡ Conflict detected [${older.category}]: "${older.title}" → superseded by "${newer.title}" (${reason})`);
+            }
+          }
+        }
+      }
+
       // Pick representative: highest hitCount, then newest
       const sorted = [...cluster].sort((a, b) => {
         if ((b.hitCount || 0) !== (a.hitCount || 0)) return (b.hitCount || 0) - (a.hitCount || 0);
@@ -231,10 +417,12 @@ const ExperienceDistillationMixin = {
       merged: allClusters.length,
       removed: dryRun ? idsToRemove.size : removed,
       clusters: clusterDetails,
+      conflicts,
     };
 
+    const conflictMsg = conflicts.length > 0 ? `, ${conflicts.length} conflict(s) resolved (keep-newer)` : '';
     console.log(`[ExperienceStore] 🧪 Distillation ${dryRun ? '(dry-run)' : 'complete'}: ` +
-      `${result.merged} cluster(s) merged, ${result.removed} redundant record(s) removed ` +
+      `${result.merged} cluster(s) merged, ${result.removed} redundant record(s) removed${conflictMsg} ` +
       `(${elapsed}ms)`);
 
     return result;
@@ -260,4 +448,4 @@ const ExperienceDistillationMixin = {
   },
 };
 
-module.exports = { ExperienceDistillationMixin, computeSimilarity };
+module.exports = { ExperienceDistillationMixin, computeSimilarity, detectConflict };

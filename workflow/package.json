@@ -3,8 +3,12 @@
   "version": "1.0.0",
   "description": "AI-driven multi-agent automated software development workflow",
   "main": "index.js",
+  "bin": {
+    "workflowagent-mcp": "core/mcp-server.js"
+  },
   "scripts": {
     "start": "node index.js",
+    "mcp": "node core/mcp-server.js",
     "pretest": "node scripts/syntax-check.js",
     "test": "node tests/e2e.test.js && node tests/unit.test.js",
     "lint": "node scripts/syntax-check.js",

@@ -1334,6 +1334,113 @@ async function runRegressionGuardTests() {
     assert.ok(['improving', 'stable', 'degrading'].includes(trend.trend), 'Trend should be valid');
     fs.rmSync(dir, { recursive: true });
   });
+
+  await test('RegressionGuard: METRIC_DIRECTION and DEFAULT_METRIC_TARGETS are exported', async () => {
+    const { METRIC_DIRECTION, DEFAULT_METRIC_TARGETS, METRIC_KEY } = require('../core/regression-guard');
+    assert.ok(METRIC_DIRECTION, 'METRIC_DIRECTION should be exported');
+    assert.ok(DEFAULT_METRIC_TARGETS, 'DEFAULT_METRIC_TARGETS should be exported');
+    assertEqual(METRIC_DIRECTION[METRIC_KEY.ERROR_RATE], 'minimize', 'Error rate should be minimize');
+    assertEqual(METRIC_DIRECTION[METRIC_KEY.TEST_PASS_RATE], 'maximize', 'Test pass rate should be maximize');
+    assert.ok(DEFAULT_METRIC_TARGETS[METRIC_KEY.ERROR_RATE] != null, 'Should have error rate target');
+    assert.ok(DEFAULT_METRIC_TARGETS[METRIC_KEY.TEST_PASS_RATE] != null, 'Should have test pass rate target');
+  });
+
+  await test('RegressionGuard: compareWithBaseline includes targetGaps', async () => {
+    const { RegressionGuard, METRIC_KEY } = require('../core/regression-guard');
+    const dir = makeTempDir();
+    const guard = new RegressionGuard({ outputDir: dir, verbose: false, targets: {
+      [METRIC_KEY.ERROR_RATE]: 0,
+      [METRIC_KEY.TEST_PASS_RATE]: 0.95,
+    }});
+
+    const baseline = {
+      capturedAt: new Date().toISOString(),
+      metrics: {
+        [METRIC_KEY.ERROR_RATE]: 5,
+        [METRIC_KEY.TEST_PASS_RATE]: 0.8,
+      },
+      skillVersions: {},
+    };
+    fs.writeFileSync(path.join(dir, 'evolve-baseline.json'), JSON.stringify(baseline), 'utf-8');
+
+    const currentMetrics = {
+      [METRIC_KEY.ERROR_RATE]: 3,
+      [METRIC_KEY.TEST_PASS_RATE]: 0.85,
+    };
+
+    const result = guard.compareWithBaseline(currentMetrics);
+    assert.ok(result.targetGaps, 'Should have targetGaps');
+    assert.ok(result.targetGaps.length > 0, 'Should have at least one gap');
+    const errorGap = result.targetGaps.find(g => g.metric === METRIC_KEY.ERROR_RATE);
+    assert.ok(errorGap, 'Should have error rate gap');
+    assertEqual(errorGap.direction, 'minimize', 'Error rate gap direction should be minimize');
+    assert.ok(errorGap.gapPct > 0, 'Error rate gap should be > 0');
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('RegressionGuard: snapshotMetrics returns metrics object', async () => {
+    const { RegressionGuard } = require('../core/regression-guard');
+    const dir = makeTempDir();
+    const guard = new RegressionGuard({ outputDir: dir, verbose: false });
+    const snapshot = guard.snapshotMetrics();
+    assert.ok(snapshot.metrics, 'Should have metrics');
+    assert.ok(snapshot.snapshotAt, 'Should have timestamp');
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('RegressionGuard: evaluateMicroDelta detects improvements and rollback', async () => {
+    const { RegressionGuard, METRIC_KEY } = require('../core/regression-guard');
+    const dir = makeTempDir();
+    const guard = new RegressionGuard({ outputDir: dir, verbose: false });
+
+    const before = {
+      metrics: { [METRIC_KEY.ERROR_RATE]: 5, [METRIC_KEY.TEST_PASS_RATE]: 0.8 },
+      snapshotAt: new Date().toISOString(),
+    };
+    const afterImproved = {
+      metrics: { [METRIC_KEY.ERROR_RATE]: 2, [METRIC_KEY.TEST_PASS_RATE]: 0.9 },
+      snapshotAt: new Date().toISOString(),
+    };
+    const afterDegraded = {
+      metrics: { [METRIC_KEY.ERROR_RATE]: 10, [METRIC_KEY.TEST_PASS_RATE]: 0.5 },
+      snapshotAt: new Date().toISOString(),
+    };
+
+    const improved = guard.evaluateMicroDelta(before, afterImproved);
+    assert.ok(improved.improved.length > 0, 'Should have improvements');
+    assertEqual(improved.shouldRollback, false, 'Should not rollback on improvement');
+
+    const degraded = guard.evaluateMicroDelta(before, afterDegraded);
+    assert.ok(degraded.degraded.length > 0, 'Should have degradations');
+    assertEqual(degraded.shouldRollback, true, 'Should rollback on degradation');
+    assert.ok(degraded.reason.length > 0, 'Should have reason');
+    fs.rmSync(dir, { recursive: true });
+  });
+}
+
+// ─── MAPE Micro-Loop Tests ──────────────────────────────────────────────────
+
+async function runMAPEMicroLoopTests() {
+  console.log('\n── MAPE Micro-Loop ─────────────────────────────────────────');
+
+  await test('MAPEEngine: runMicroLoop returns valid result structure', async () => {
+    const { MAPEEngine } = require('../core/mape-engine');
+    const dir = makeTempDir();
+    const engine = new MAPEEngine({ orchestrator: { _outputDir: dir }, verbose: false, microLoopMaxIter: 2 });
+
+    const result = await engine.runMicroLoop({ maxIterations: 2 });
+    assert.ok(result.iterations != null, 'Should have iterations array');
+    assert.ok(result.kept != null, 'Should have kept count');
+    assert.ok(result.rolledBack != null, 'Should have rolledBack count');
+    assert.ok(result.stopped != null, 'Should have stopped flag');
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  await test('MAPEEngine: TARGET_OPTIMIZATION action type exists', async () => {
+    const { ACTION_TYPE } = require('../core/mape-engine');
+    assert.ok(ACTION_TYPE.TARGET_OPTIMIZATION, 'Should have TARGET_OPTIMIZATION action type');
+    assertEqual(ACTION_TYPE.TARGET_OPTIMIZATION, 'target-optimization', 'TARGET_OPTIMIZATION should be correct');
+  });
 }
 
 // ─── Skill Marketplace Tests ────────────────────────────────────────────────
@@ -2105,6 +2212,7 @@ async function runTests() {
   await runAutoDeployerTests();
   await runMAPETests();
   await runRegressionGuardTests();
+  await runMAPEMicroLoopTests();
   await runSkillMarketplaceTests();
   await runRunGuardTests();
   await runEnrichmentCacheTests();

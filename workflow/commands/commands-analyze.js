@@ -99,7 +99,14 @@ function registerAnalyzeCommands(registerCommand) {
 
       // ── Run analysis ─────────────────────────────────────────────────────
       const { ProjectProfiler, renderCompactProfileSummary } = require('../core/project-profiler');
-      const profiler = new ProjectProfiler(projectRoot, { ignoreDirs });
+      // P2-3: Pass user-defined custom detection rules if configured
+      const customRules = (config && config.customDetectionRules) || {};
+      const profiler = new ProjectProfiler(projectRoot, {
+        ignoreDirs,
+        customFrameworkRules: customRules.frameworks,
+        customDataLayerRules: customRules.dataLayer,
+        customTestRules:      customRules.testFrameworks,
+      });
 
       let projectProfile;
       let profileMdPath;

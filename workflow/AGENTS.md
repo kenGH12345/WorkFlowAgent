@@ -43,6 +43,7 @@ workflow/
 ├── index.js                     ← Orchestrator entry point
 ├── agents/                      ← Specialist agents
 ├── core/                        ← Core services
+│   ├── agent-generator.js       ← IDE Agent definition generator (CodeBuddy, Cursor, Claude Code)
 │   ├── git-integration.js       ← Git: branch, commit, push, PR/MR creation
 │   ├── sandbox.js               ← Dry-run: intercept file writes, preview mode
 │   └── ...
@@ -73,6 +74,40 @@ workflow/
 
 ---
 
+## 🏠 Foundational Principle: IDE-First, Self-Built Fallback (ADR-37)
+
+> **This is the #1 architectural principle of WorkFlowAgent.**
+> All capability decisions MUST follow this rule: if the host IDE already provides
+> a capability, use the IDE's version first. Self-built modules are retained as
+> fallback for non-IDE environments and for unique capabilities no IDE offers.
+
+| Capability | IDE Tool (preferred) | Self-Built Fallback |
+|------------|---------------------|---------------------|
+| Semantic code search | `codebase_search` | CodeGraph.search() |
+| Exact text search | `grep_search` | CodeGraph (substring) |
+| Symbol navigation | `view_code_item` | CodeGraph.querySymbol() |
+| Go to definition | IDE built-in LSP | LSPAdapter (self-spawned) |
+| Find references | IDE built-in LSP | LSPAdapter (self-spawned) |
+| Type inference / hover | IDE built-in LSP (hover) | LSPAdapter.getHover() |
+| Read file content | `read_file` | ContextLoader cache |
+| **Hotspot analysis** | ❌ *no IDE equivalent* | **CodeGraph (unique)** |
+| **Module summary** | ❌ *no IDE equivalent* | **CodeGraph (unique)** |
+| **Skill matching** | ❌ *no IDE equivalent* | **ContextLoader (unique)** |
+| **Experience routing** | ❌ *no IDE equivalent* | **ExperienceRouter (unique)** |
+| **Project profiling** | ❌ *no IDE equivalent* | **ProjectProfiler (unique)** |
+
+**How it works (automatically):**
+- `core/ide-detection.js` detects the IDE environment at startup
+- `prompt-builder.js` injects an **IDE Tool Guidance** block into every Agent prompt when inside an IDE
+- `lsp-adapter.js` skips spawning a language server when IDE already has one
+- Agents see the guidance table and automatically prefer IDE tools
+- Self-built context (hotspot, skills, experience, ADRs) is always injected — these have no IDE equivalent
+
+> ⚠️ When adding new capabilities, always check: **does the IDE already provide this?**
+> If yes → add IDE-first guidance. If no → implement as self-built module.
+
+---
+
 ## Critical Rules (Summary)
 
 1. Work on **ONE task at a time**
@@ -81,6 +116,30 @@ workflow/
 4. All decisions go in `docs/decision-log.md`, not just chat
 5. Constraints in `docs/architecture-constraints.md` are **enforced**
 6. **New modules must be integrated into both `run()` and `runTaskBased()` paths** (see `docs/decision-log.md` N-series fixes)
+7. **IDE-First principle**: prefer IDE-native tools over self-built modules (see ADR-37)
+8. **Long Task Protocol**: for multi-step tasks, always show progress (see ADR-41 and `docs/agent-collaboration.md`)
+
+---
+
+## 📍 Progress Beacon (ADR-41)
+
+> Prevents "deep-dive amnesia" — the loss of global task awareness when drilling into details.
+
+**Automated workflow mode** (`runTaskBased()`):
+- The orchestrator automatically injects a Progress Beacon into every task's Agent context
+- Beacon shows: which tasks are ✅ done, 🔄 current, ⬜ remaining
+- Cost: ~100-200 tokens (negligible vs. total context)
+
+**Interactive dialogue mode** (`/wf` commands):
+- Agents MUST manually display progress after each step
+- Format: `📍 Progress: N/M completed` + checklist
+- Key decisions that affect later steps MUST be carried forward
+
+**User visibility**:
+- Users can see progress through: console phase markers, progress dashboard in responses,
+  `output/feature-list.json`, and optional `output/scratchpad.md`
+
+> Full protocol details: see `docs/agent-collaboration.md` → "Long Task Protocol"
 
 > Full details: see `docs/agent-collaboration.md`
 
@@ -196,3 +255,128 @@ orchestrator.sandbox.reset();
 **What dry-run does NOT intercept:**
 - `output/*.md` artifact files (requirement, architecture, test-report) — these are workflow metadata, not source code
 - Git operations (git is skipped entirely in dry-run mode)
+
+---
+
+## 🤖 IDE Agent Mode (Recommended)
+
+WorkFlowAgent can be installed as a **native IDE Agent**, appearing directly in the
+IDE's mode selector (e.g. CodeBuddy's Craft/Ask/Plan dropdown). This is the recommended
+integration — zero MCP config, zero external processes, full IDE context access.
+
+### How It Works
+
+`/wf init` automatically generates agent definition files for all supported IDEs:
+
+| IDE | Generated File | How to Use |
+|-----|---------------|------------|
+| **CodeBuddy** | `.codebuddy/agents/workflow-agent.md` | Select "workflow-agent" in mode dropdown |
+| **Cursor** | `.cursor/rules/workflow-agent.mdc` | Auto-loaded as agent rule |
+| **Claude Code** | `.claude/agents/workflow-agent.md` | Available as `/workflow-agent` |
+
+### What the Agent Knows
+
+The generated agent definition includes:
+- **Project context**: name, tech stack, frameworks, architecture pattern
+- **IDE-First principle**: tool preference table (ADR-37)
+- **Smart triage**: complexity scoring guide for routing decisions
+- **7-stage SOP**: full ANALYSE→ARCHITECT→PLAN→CODE→TEST pipeline
+- **Coding principles**: no over-engineering, minimal change, reuse, etc.
+- **DO/DON'T rules**: best practices distilled from workflow experience
+
+### Agent Mode vs MCP Mode
+
+| Dimension | IDE Agent Mode ⭐ | MCP Plugin Mode |
+|-----------|------------------|-----------------|
+| **Configuration** | Zero (auto-generated by `/wf init`) | Manual JSON config per IDE |
+| **User experience** | Native mode in IDE dropdown | External tool calls |
+| **IDE context** | Full (open files, cursor, LSP) | Isolated process |
+| **LLM** | IDE's built-in LLM (free) | None (needs standalone) |
+| **IDE tools** | Direct access | Self-built fallback |
+| **Team sharing** | Commit to Git, everyone gets it | Each person configures |
+| **Heavy compute** | ❌ (no CodeGraph build) | ✅ (runs Node.js) |
+
+> **Best practice**: Use IDE Agent Mode as the primary integration. Use MCP only for
+> heavy compute operations (init, CodeGraph build) that require Node.js execution.
+
+### Regenerating Agent Definitions
+
+Agent files are regenerated on every `/wf init`. To force regeneration:
+
+```bash
+node workflow/init-project.js --path /your/project
+```
+
+The generator respects existing files (won't overwrite unless `--force` is used).
+
+---
+
+## 🔌 MCP Plugin Mode
+
+WorkFlowAgent can also run as an MCP (Model Context Protocol) server, enabling any IDE
+(Cursor, VS Code, Claude Code, Windsurf) to call workflow tools directly.
+
+### Quick Start
+
+```bash
+# Start MCP server on stdio (for IDE integration)
+node workflow/core/mcp-server.js --project-root /path/to/project
+
+# Or via npm script
+cd workflow && npm run mcp -- --project-root /path/to/project
+```
+
+### IDE Configuration
+
+Add to your IDE's MCP config (e.g. `claude_desktop_config.json` or `.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "workflowagent": {
+      "command": "node",
+      "args": ["workflow/core/mcp-server.js", "--project-root", "/path/to/project"]
+    }
+  }
+}
+```
+
+### Available MCP Tools
+
+| Tool | Description | Auto-Triage |
+|------|------------|-------------|
+| `workflow_triage` | Evaluate requirement complexity (0 LLM cost) | — |
+| `workflow_run` | Execute workflow pipeline with auto-routing | ✅ |
+| `workflow_init` | Initialize project (tech detect + CodeGraph) | — |
+| `workflow_status` | Get project init state + staleness warnings | — |
+
+### Auto-Routing (RequestTriage)
+
+The `workflow_run` tool automatically evaluates requirement complexity before starting:
+
+- **Score < 15** → suggests IDE direct handling (simple fix, typo, rename)
+- **Score 15-40** → lightweight workflow (StageSmartSkip auto-skips stages)
+- **Score ≥ 40** → full pipeline (ANALYSE → ARCHITECT → PLAN → CODE → TEST)
+
+Use `force: true` to bypass triage. Use `workflow_triage` to preview the routing.
+
+> The `/wf` command also auto-triages. Use `--force` to bypass: `/wf fix typo --force`
+
+---
+
+## ⚡ RequestTriage: Smart Routing Best Practices (Auto-Enforced)
+
+The following best practices are **automatically enforced** by the RequestTriage module
+(`core/request-triage.js`). You do NOT need to remember or manually follow these rules.
+
+| Rule | Enforcement |
+|------|-------------|
+| Run `/wf init` before workflows | **InitStateGuard** blocks `/wf` if not initialized |
+| Simple tasks → use IDE directly | **RequestTriage** suggests IDE for score < 15 |
+| Complex tasks → use full pipeline | **RequestTriage** auto-routes to full pipeline for score ≥ 40 |
+| Don't use /wf for one-line fixes | **RequestTriage** catches and suggests IDE |
+| Refresh init when artifacts are stale | **StalenessDetector** warns when CodeGraph > 14 days old |
+| Let auto-injection handle context | **ContextLoader + prompt-builder** (unchanged, always active) |
+| Trust QualityGate rollbacks | **quality-gate.js** (unchanged, always active) |
+
+> Override any auto-routing decision with `--force` (CLI) or `force: true` (MCP).

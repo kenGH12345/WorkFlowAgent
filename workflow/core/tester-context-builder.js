@@ -66,8 +66,10 @@ async function buildTesterContextBlock(orch, upstreamCtx, tcExecutionReport) {
 
   const jsonInstruction = buildJsonBlockInstruction('tester');
 
+  // P1 fix: Detect tech stack for fallback experience matching
+  const techStack = orch._detectTechStackForPreheat ? orch._detectTechStackForPreheat() : [];
   const testMaxExpInjected = orch._adaptiveStrategy?.maxExpInjected ?? 5;
-  const { block: expCtx, ids: injectedExpIds } = await orch.experienceStore.getContextBlockWithIds('test-report', orch._currentRequirement, testMaxExpInjected);
+  const { block: expCtx, ids: injectedExpIds } = await orch.experienceStore.getContextBlockWithIds('test-report', orch._currentRequirement, testMaxExpInjected, { techStack });
   console.log(`[Orchestrator] 📚 Experience context injected for TesterAgent (${expCtx.length} chars, ${injectedExpIds.length} experience(s), limit=${testMaxExpInjected})`);
 
   const complaints = orch.complaintWall.getOpenComplaintsFor(ComplaintTarget.SKILL, 'test-report');
@@ -93,6 +95,14 @@ async function buildTesterContextBlock(orch, upstreamCtx, tcExecutionReport) {
   if (pluginRegistry) {
     const pluginResult = await pluginRegistry.collectPluginBlocks(orch, 'TESTER', _testProfile, 20);
     testPluginBlocks = pluginResult.blocks;
+    // P2 fix: Record Tool Search stats for observability
+    if (orch.obs && typeof orch.obs.recordToolSearchStats === 'function') {
+      orch.obs.recordToolSearchStats('TESTER', {
+        totalPlugins: pluginResult.blocks.length + (pluginResult.skippedByKeyword?.length || 0),
+        skippedByKeyword: pluginResult.skippedByKeyword || [],
+        executedCount: pluginResult.blocks.filter(b => b.content && b.content.length > 0).length,
+      });
+    }
   }
 
   // Real execution results block
@@ -187,12 +197,17 @@ async function buildTesterContextBlock(orch, upstreamCtx, tcExecutionReport) {
   if (testStats.compressionSaved > 0) {
     console.log(`[Orchestrator] 🗜️  TESTER compression: saved ${testStats.compressionSaved} chars.`);
   }
+  // P1 fix: Record ToolResultFilter stats for cross-session analysis
+  if (orch.obs && testStats.preFilterSaved > 0) {
+    orch.obs.recordToolResultFilterStats('TESTER', {
+      preFilterSaved: testStats.preFilterSaved,
+      filteredLabels: testStats.preFilterLabels || [],
+    });
+  }
 
-  // R2-3 audit: wrap in String object so ._injectedExpIds survives
-  // (primitive strings cannot hold expando properties).
-  const block = new String(testAssembled);
-  block._injectedExpIds = injectedExpIds;
-  return block;
+  // A-3 Architecture Fix: Return a proper struct instead of new String() hack.
+  // See architect-context-builder.js for the full rationale.
+  return { content: testAssembled, injectedExpIds };
 }
 
 module.exports = {

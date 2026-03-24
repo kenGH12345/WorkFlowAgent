@@ -15,7 +15,7 @@ const path = require('path');
  * @param {Function|null} llmCall - async (prompt: string) => string
  * @returns {Promise<string|null>} Path to the written .zh.md file, or null if skipped.
  */
-async function translateMdFile(mdPath, llmCall) {
+async function translateMdFile(mdPath, llmCall, opts = {}) {
   if (!llmCall || typeof llmCall !== 'function') return null;
   if (!fs.existsSync(mdPath)) return null;
 
@@ -27,6 +27,13 @@ async function translateMdFile(mdPath, llmCall) {
   try {
     const content = fs.readFileSync(mdPath, 'utf-8');
     if (!content.trim()) return null;
+
+    // P1-5 fix: optional scheduling delay to avoid LLM rate-limit competition
+    // with the next agent's prompt. Default 2 s unless overridden.
+    const delay = opts.delayMs ?? 2000;
+    if (delay > 0) {
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
 
     const prompt = buildTranslationPrompt(content);
     const translated = await llmCall(prompt);

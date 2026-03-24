@@ -15,8 +15,11 @@
 
 const { BaseAgent } = require('./base-agent');
 const { AgentRole } = require('../core/types');
-const { buildJsonBlockInstruction } = require('../core/agent-output-schema');
-const { extractAnchorFiles } = require('./analyst-agent');
+const { buildJsonBlockInstruction, extractJsonBlock, validateJsonBlock } = require('../core/agent-output-schema');
+// Arch-Fix-3: Removed direct import of extractAnchorFiles from analyst-agent.
+// Agents must not have cross-agent dependencies. If Architect needs anchor file
+// extraction in the future, the function should be moved to a shared utility
+// (e.g. workflow/utils/text-extraction.js) and imported from there.
 
 class ArchitectAgent extends BaseAgent {
   constructor(llmCall, hookEmitter, opts = {}) {
@@ -110,8 +113,7 @@ Remember: NO code, NO implementation, design decisions ONLY.
    * @returns {string}
    */
   parseResponse(llmResponse) {
-    // P0-NEW-1: validate JSON block presence
-    const { extractJsonBlock, validateJsonBlock } = require('../core/agent-output-schema');
+    // P0-NEW-1: validate JSON block presence (imports hoisted to file top – P1-1 fix)
     const jsonBlock = extractJsonBlock(llmResponse);
     if (!jsonBlock) {
       console.warn(`[ArchitectAgent] ⚠️  No structured JSON block found in output. Downstream agents will use regex-based extraction (degraded mode).`);
@@ -130,17 +132,23 @@ Remember: NO code, NO implementation, design decisions ONLY.
     while ((match = codeBlockPattern.exec(llmResponse)) !== null) {
       const blockContent = match[1];
       // Heuristic: if block contains assignment operators or control flow, it's likely code
-      if (/[=;{}]/.test(blockContent) && !/^[\s#\-*>|]/.test(blockContent.trim())) {
+      // P2-5 fix: exclude Mermaid diagrams and JSON/config blocks from false positives
+      if (/[=;{}]/.test(blockContent) && !/^[\s#\-*>|]/.test(blockContent.trim())
+        && !blockContent.includes('graph ') && !blockContent.includes('"role"')
+        && !blockContent.includes('sequenceDiagram') && !blockContent.includes('classDiagram')) {
         console.warn(`[ArchitectAgent] WARNING: Possible implementation code detected in architecture.md. Review recommended.`);
         break;
       }
     }
 
-    // ── Mandatory section compliance check ──────────────────────────────────
-    const mandatorySections = ['Architecture Design', 'Execution Plan'];
-    const missingSections = mandatorySections.filter(s => !llmResponse.includes(s));
+    // ── Mandatory section compliance check (P1-4: bilingual support) ─────────
+    const mandatorySections = [
+      { en: 'Architecture Design', zh: '架构设计' },
+      { en: 'Execution Plan', zh: '执行计划' },
+    ];
+    const missingSections = mandatorySections.filter(s => !llmResponse.includes(s.en) && !llmResponse.includes(s.zh));
     if (missingSections.length > 0) {
-      console.warn(`[ArchitectAgent] ⚠️  COMPLIANCE: Missing mandatory section(s): ${missingSections.join(', ')}. The agent output specification requires these sections.`);
+      console.warn(`[ArchitectAgent] ⚠️  COMPLIANCE: Missing mandatory section(s): ${missingSections.map(s => s.en).join(', ')}. The agent output specification requires these sections.`);
     } else {
       console.log(`[ArchitectAgent] ✅ Mandatory sections present: Architecture Design, Execution Plan.`);
     }

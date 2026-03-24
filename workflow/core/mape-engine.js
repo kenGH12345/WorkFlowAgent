@@ -1,20 +1,11 @@
 /**
- * MAPE Engine — Monitor-Analyze-Plan-Execute Closed-Loop (ADR-35, P2a)
+ * MAPE Engine - Monitor-Analyze-Plan-Execute Closed-Loop (ADR-35, P2a)
  *
- * Replaces the linear evolve pipeline with a unified feedback loop:
- *
- *   ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
- *   │ MONITOR  │ ──▶ │ ANALYZE  │ ──▶ │  PLAN    │ ──▶ │ EXECUTE  │
- *   │ Collect  │     │ Correlate│     │ Prioritise│     │ + Canary │
- *   └──────────┘     └──────────┘     └──────────┘     └──────────┘
- *        ▲                                                   │
- *        └───────────── feedback ────────────────────────────┘
- *
- * Monitor:  Collects anomaly signals from metrics-history, self-reflection,
- *           quality gates, and entropy scans
- * Analyze:  Cross-correlates findings from multiple sources, identifies root causes
- * Plan:     Generates a prioritised action plan with estimated ROI
- * Execute:  Runs actions in priority order with canary validation between steps
+ * Architecture: Split into 4 files for maintainability (core/*.js 400-line rule):
+ *   - mape-constants.js    - Shared enums (MAPE_PHASE, ACTION_PRIORITY, ACTION_TYPE)
+ *   - mape-hypothesis.js   - HypothesisGenerator class + micro-loop utilities
+ *   - mape-executors.js    - 11 action executors + rollback handler
+ *   - mape-engine.js       - THIS FILE: MAPEEngine class (orchestration skeleton)
  *
  * Design: Stateless per-invocation. All state comes from disk (metrics-history,
  * reflections, audit reports). Reuses existing module APIs without modification.
@@ -25,35 +16,13 @@
 const fs   = require('fs');
 const path = require('path');
 
-// ─── MAPE Phase Constants ───────────────────────────────────────────────────
+// Shared constants
+const { MAPE_PHASE, ACTION_PRIORITY, ACTION_TYPE } = require('./mape-constants');
 
-const MAPE_PHASE = {
-  MONITOR:  'monitor',
-  ANALYZE:  'analyze',
-  PLAN:     'plan',
-  EXECUTE:  'execute',
-};
-
-// ─── Action Priority Levels ─────────────────────────────────────────────────
-
-const ACTION_PRIORITY = {
-  CRITICAL: 0,  // Must fix now (quality gates failing, regressions detected)
-  HIGH:     1,  // Should fix soon (stale skills, recurring patterns)
-  MEDIUM:   2,  // Nice to fix (hollow skills, enrichment opportunities)
-  LOW:      3,  // Optional (cleanup, optimisation)
-};
-
-// ─── Action Types ───────────────────────────────────────────────────────────
-
-const ACTION_TYPE = {
-  SKILL_REFRESH:       'skill-refresh',
-  SKILL_ROLLBACK:      'skill-rollback',
-  CONFIG_ADJUSTMENT:   'config-adjustment',
-  ARTICLE_SCOUT:       'article-scout',
-  COMPLAINT_RESOLUTION:'complaint-resolution',
-  ARCHITECTURE_FIX:    'architecture-fix',
-  EXPERIENCE_CLEANUP:  'experience-cleanup',
-};
+// Extracted modules (mixed into MAPEEngine.prototype below)
+const executors    = require('./mape-executors');
+const hypothesisMod = require('./mape-hypothesis');
+const { HypothesisGenerator } = hypothesisMod;
 
 // ─── MAPE Engine Class ──────────────────────────────────────────────────────
 
@@ -67,6 +36,8 @@ class MAPEEngine {
     this._orch = opts.orchestrator;
     this._verbose = opts.verbose ?? false;
     this._outputDir = this._orch?._outputDir || path.join(process.cwd(), 'workflow', 'output');
+    this._microLoopMaxIter = opts.microLoopMaxIter ?? 3;
+    this._experimentHistoryPath = path.join(this._outputDir, 'experiment-history.jsonl');
   }
 
   // ─── Full MAPE Cycle ──────────────────────────────────────────────────
@@ -100,7 +71,7 @@ class MAPEEngine {
 
     const elapsed = Date.now() - startTime;
 
-    return {
+    const report = {
       phases: {
         monitor:  { signalCount: signals.length, signals },
         analyze:  { rootCauses: analysis.rootCauses.length, correlations: analysis.correlations.length, analysis },
@@ -111,6 +82,87 @@ class MAPEEngine {
       dryRun,
       timestamp: new Date().toISOString(),
     };
+
+    // P2 fix: Persist analysis to mape-analysis.jsonl for cross-session tracking
+    this._persistAnalysis(analysis, report);
+
+    return report;
+  }
+
+  /**
+   * P2 fix: Persists MAPE analysis results to mape-analysis.jsonl for cross-session tracking.
+   * Enables long-term trend analysis and evolution tracking.
+   *
+   * @param {object} analysis - The analysis result from analyze()
+   * @param {object} report - The full MAPE cycle report
+   */
+  _persistAnalysis(analysis, report) {
+    try {
+      const outputPath = path.join(this._outputDir || path.join(process.cwd(), 'output'), 'mape-analysis.jsonl');
+
+      // Ensure output directory exists
+      const dir = path.dirname(outputPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+
+      const entry = {
+        timestamp: report.timestamp,
+        elapsed: report.elapsed,
+        dryRun: report.dryRun,
+        signals: {
+          count: report.phases.monitor.signalCount,
+          topTypes: this._summarizeSignalTypes(report.phases.monitor.signals),
+        },
+        analysis: {
+          rootCauses: (analysis.rootCauses || []).slice(0, 5).map(rc => ({
+            type: rc.type,
+            severity: rc.severity,
+            source: rc.source,
+          })),
+          correlations: (analysis.correlations || []).slice(0, 3).map(c => ({
+            pattern: c.pattern,
+            confidence: c.confidence,
+          })),
+        },
+        plan: {
+          actionCount: report.phases.plan.actionCount,
+          estimatedROI: report.phases.plan.estimatedROI,
+          topActions: (report.phases.plan.plan.actions || []).slice(0, 3).map(a => ({
+            type: a.type,
+            priority: a.priority,
+            target: a.target,
+          })),
+        },
+        execution: {
+          executed: report.phases.execute.executed,
+          skipped: report.phases.execute.skipped,
+        },
+      };
+
+      fs.appendFileSync(outputPath, JSON.stringify(entry) + '\n', 'utf-8');
+      console.log(`[MAPE] 📊 Analysis persisted to mape-analysis.jsonl`);
+    } catch (err) {
+      console.warn(`[MAPE] ⚠️  Could not persist analysis: ${err.message}`);
+    }
+  }
+
+  /**
+   * Summarizes signal types for compact logging.
+   *
+   * @param {Array} signals
+   * @returns {Array<{type: string, count: number}>}
+   */
+  _summarizeSignalTypes(signals) {
+    const counts = {};
+    for (const s of (signals || [])) {
+      const type = s.type || 'unknown';
+      counts[type] = (counts[type] || 0) + 1;
+    }
+    return Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([type, count]) => ({ type, count }));
   }
 
   // ─── Phase 1: MONITOR ─────────────────────────────────────────────────
@@ -226,6 +278,58 @@ class MAPEEngine {
       }
     } catch (_) { /* non-fatal */ }
 
+    // Source 5: Metric calibration — unreachable targets (dead-end signal)
+    try {
+      const { RegressionGuard } = require('./regression-guard');
+      const guard = new RegressionGuard({ outputDir: this._outputDir });
+      const snapshot = guard.snapshotMetrics();
+      const gaps = guard._computeTargetGaps(snapshot.metrics);
+
+      // Check for metrics stuck far from target (>100% gap = likely unreachable)
+      for (const gap of gaps.filter(g => g.gapPct > 100).slice(0, 3)) {
+        signals.push({
+          source: 'metric-calibration', type: 'unreachable-target', severity: 'medium',
+          title: `Metric "${gap.metric}" far from target (${gap.gapPct}% gap)`,
+          data: { metric: gap.metric, current: gap.current, target: gap.target, gapPct: gap.gapPct },
+        });
+      }
+    } catch (_) { /* non-fatal */ }
+
+    // Source 6: Prompt performance — low gate-pass rate on prompt slots
+    try {
+      if (this._orch?.promptSlotManager) {
+        const stats = this._orch.promptSlotManager.getStats();
+        for (const [slotKey, slotInfo] of Object.entries(stats)) {
+          const active = slotInfo.variants[slotInfo.activeVariant];
+          if (!active || active.totalTrials < 3) continue;
+          const passRate = parseFloat(active.gatePassRate);
+          if (!isNaN(passRate) && passRate < 0.7) {
+            signals.push({
+              source: 'prompt-performance', type: 'low-pass-rate', severity: 'medium',
+              title: `Prompt slot "${slotKey}" has low pass rate (${(passRate * 100).toFixed(0)}%)`,
+              data: { slotKey, passRate, trials: active.totalTrials, activeVariant: slotInfo.activeVariant },
+            });
+          }
+        }
+      }
+    } catch (_) { /* non-fatal */ }
+
+    // Source 7: Experience store bloat — high count + low hit-rate
+    try {
+      if (this._orch?.experienceStore) {
+        const count = this._orch.experienceStore.experiences.length;
+        // Cross-reference with hit-rate signal
+        const hasLowHitRateSignal = signals.some(s => s.title?.includes('hit-rate'));
+        if (count > 100 || (count > 50 && hasLowHitRateSignal)) {
+          signals.push({
+            source: 'experience-store', type: 'bloat', severity: 'low',
+            title: `Experience store bloated (${count} entries)${hasLowHitRateSignal ? ' with low hit-rate' : ''}`,
+            data: { experienceCount: count, hasLowHitRate: hasLowHitRateSignal },
+          });
+        }
+      }
+    } catch (_) { /* non-fatal */ }
+
     // Sort by severity
     const severityOrder = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
     signals.sort((a, b) => (severityOrder[a.severity] ?? 5) - (severityOrder[b.severity] ?? 5));
@@ -297,6 +401,40 @@ class MAPEEngine {
         description: 'Both error rates and durations increasing indicates fundamental regression',
         signals: signals.filter(s => s.title?.includes('Error') || s.title?.includes('duration')),
         suggestedAction: ACTION_TYPE.ARCHITECTURE_FIX,
+      });
+    }
+
+    // Correlation 4: Unreachable targets = metric calibration needed
+    const hasUnreachableTarget = signals.some(s => s.source === 'metric-calibration');
+    if (hasUnreachableTarget) {
+      const unreachableSignals = signals.filter(s => s.source === 'metric-calibration');
+      correlations.push({
+        type: 'unreachable-targets',
+        description: `${unreachableSignals.length} metric(s) far from target — targets may need calibration`,
+        signals: unreachableSignals,
+        suggestedAction: ACTION_TYPE.METRIC_CALIBRATION,
+      });
+    }
+
+    // Correlation 5: Low prompt performance = prompt evolution needed
+    const hasLowPromptPerf = signals.some(s => s.source === 'prompt-performance');
+    if (hasLowPromptPerf) {
+      correlations.push({
+        type: 'prompt-degradation',
+        description: 'Prompt slots have low gate-pass rate — variant exploration may find better prompts',
+        signals: signals.filter(s => s.source === 'prompt-performance'),
+        suggestedAction: ACTION_TYPE.PROMPT_EVOLUTION,
+      });
+    }
+
+    // Correlation 6: Experience bloat + low hit-rate = distillation needed
+    const hasExpBloat = signals.some(s => s.source === 'experience-store');
+    if (hasExpBloat && hasLowHitRate) {
+      correlations.push({
+        type: 'experience-bloat',
+        description: 'Experience store is bloated with low hit-rate — distillation will consolidate and improve quality',
+        signals: signals.filter(s => s.source === 'experience-store' || s.title?.includes('hit-rate')),
+        suggestedAction: ACTION_TYPE.EXPERIENCE_DISTILL,
       });
     }
 
@@ -386,11 +524,47 @@ class MAPEEngine {
       console.log(`[MAPE:Plan] Generated ${trimmedActions.length} action(s), estimated ROI: ${estimatedROI}`);
     }
 
+    // Add target-optimization actions for metrics that haven't reached their targets
+    try {
+      const { RegressionGuard } = require('./regression-guard');
+      const guard = new RegressionGuard({ outputDir: this._outputDir });
+      const snapshot = guard.snapshotMetrics();
+      const gaps = guard._computeTargetGaps(snapshot.metrics);
+
+      for (const gap of gaps.slice(0, 3)) {
+        const existing = trimmedActions.find(a => a.targetMetric === gap.metric);
+        if (existing) continue;
+
+        // Map metric gaps to action types
+        let actionType = ACTION_TYPE.TARGET_OPTIMIZATION;
+        if (gap.gapPct > 100) {
+          // P1-ext: Extremely large gap = likely unreachable, calibrate target instead
+          actionType = ACTION_TYPE.METRIC_CALIBRATION;
+        } else if (gap.metric === 'tokenUsage')    actionType = ACTION_TYPE.CONFIG_ADJUSTMENT;
+        else if (gap.metric === 'errorRate')        actionType = ACTION_TYPE.ARCHITECTURE_FIX;
+        else if (gap.metric === 'expHitRate')       actionType = ACTION_TYPE.EXPERIENCE_CLEANUP;
+        else if (gap.metric === 'skillEffectiveRate') actionType = ACTION_TYPE.SKILL_REFRESH;
+
+        trimmedActions.push({
+          type: actionType,
+          priority: gap.gapPct > 50 ? ACTION_PRIORITY.HIGH : ACTION_PRIORITY.MEDIUM,
+          title: `Optimize ${gap.metric}: ${gap.current} → ${gap.target} (${gap.direction}, ${gap.gapPct}% gap)`,
+          source: `target-gap:${gap.metric}`,
+          targetMetric: gap.metric,
+          estimatedEffort: 'medium',
+          estimatedImpact: gap.gapPct > 50 ? 'high' : 'medium',
+        });
+      }
+    } catch (_) { /* non-fatal: RegressionGuard not available */ }
+
+    // Re-sort after adding target actions
+    trimmedActions.sort((a, b) => a.priority - b.priority);
+    trimmedActions.splice(maxActions); // Re-trim
+
     return { actions: trimmedActions, estimatedROI };
   }
 
-  // ─── Phase 4: EXECUTE ─────────────────────────────────────────────────
-
+  // ─── Phase 4: EXECUTE ─────────────────────────────────────────────
   /**
    * Executes planned actions in priority order.
    * After each action, validates that the system is still healthy (canary check).
@@ -432,6 +606,7 @@ class MAPEEngine {
 
   /**
    * Executes a single action based on its type.
+   * All 11 action types have executors (8 original + 3 extensions).
    * @param {object} action
    * @returns {object} Result details
    */
@@ -445,90 +620,202 @@ class MAPEEngine {
         return this._execArticleScout();
       case ACTION_TYPE.EXPERIENCE_CLEANUP:
         return this._execExperienceCleanup();
+      // P2a: 4 new executors
+      case ACTION_TYPE.SKILL_ROLLBACK:
+        return this._execSkillRollback();
+      case ACTION_TYPE.ARCHITECTURE_FIX:
+        return this._execArchitectureFix();
+      case ACTION_TYPE.COMPLAINT_RESOLUTION:
+        return this._execComplaintResolution();
+      case ACTION_TYPE.TARGET_OPTIMIZATION:
+        return this._execTargetOptimization(action);
+      // P1-ext / P2-ext / P3-ext: 3 new action executors
+      case ACTION_TYPE.METRIC_CALIBRATION:
+        return this._execMetricCalibration(action);
+      case ACTION_TYPE.PROMPT_EVOLUTION:
+        return this._execPromptEvolution(action);
+      case ACTION_TYPE.EXPERIENCE_DISTILL:
+        return this._execExperienceDistill();
       default:
         return { detail: `Action type "${action.type}" not yet implemented — logged for manual review` };
     }
   }
 
-  async _execConfigAdjustment() {
-    if (!this._orch?.autoDeployer) return { detail: 'AutoDeployer not available' };
-    const Obs = require('./observability');
-    const cfg = this._orch._config?.autoFixLoop || {};
-    const strategy = Obs.deriveStrategy(this._outputDir, {
-      maxFixRounds:    cfg.maxFixRounds    ?? 2,
-      maxReviewRounds: cfg.maxReviewRounds ?? 2,
-      maxExpInjected:  cfg.maxExpInjected  ?? 5,
-      projectId:       this._orch.projectId,
-    });
-    const result = this._orch.autoDeployer.applyYellow(strategy);
-    return { detail: `YELLOW auto-deploy: ${result.changes.length} change(s)`, applied: result.applied };
-  }
+  // --- Executor methods & rollback: mixed in from mape-executors.js ---
+  // --- Utility methods (convergence, persistence, canary, hash): mixed in from mape-hypothesis.js ---
 
-  async _execSkillRefresh() {
-    if (!this._orch?.skillEvolution) return { detail: 'SkillEvolution not available' };
-    // Refresh top-3 stale skills
-    let refreshed = 0;
-    for (const meta of this._orch.skillEvolution.registry.values()) {
-      if (refreshed >= 3) break;
-      const daysSince = (Date.now() - new Date(meta.lastUpdated || meta.createdAt).getTime()) / 86400000;
-      if (daysSince > 90) {
-        try {
-          await this._orch.skillEvolution.enrichSkillFromExternalKnowledge(meta.name);
-          refreshed++;
-        } catch (_) { /* non-fatal */ }
-      }
-    }
-    return { detail: `Refreshed ${refreshed} stale skill(s)` };
-  }
-
-  async _execArticleScout() {
-    try {
-      const { ArticleScout } = require('./article-scout');
-      const scout = new ArticleScout({ orchestrator: this._orch, verbose: this._verbose });
-      const results = await scout.run();
-      return { detail: `Scouted ${results.evaluated} article(s), ${results.injected} injected` };
-    } catch (_) {
-      return { detail: 'ArticleScout not available' };
-    }
-  }
-
-  _execExperienceCleanup() {
-    if (!this._orch?.experienceStore) return { detail: 'ExperienceStore not available' };
-    // Remove expired experiences
-    const before = this._orch.experienceStore.experiences.length;
-    this._orch.experienceStore.experiences = this._orch.experienceStore.experiences.filter(e => {
-      if (e.expiresAt && new Date(e.expiresAt).getTime() < Date.now()) return false;
-      return true;
-    });
-    const removed = before - this._orch.experienceStore.experiences.length;
-    if (removed > 0) this._orch.experienceStore._save();
-    return { detail: `Cleaned up ${removed} expired experience(s)` };
-  }
+  // ─── MAPE Micro-Loop V2 ───────────────────────────────────────────────
+  // Replaces the original runMicroLoop with hypothesis-driven iteration,
+  // real rollback, convergence detection, history persistence, and failure feedback.
 
   /**
-   * Canary health check: verifies the system is still operational.
-   * @returns {boolean}
+   * Runs a micro-loop V2: Hypothesize → Execute → Measure → Keep/Rollback.
+   *
+   * Enhancements over V1:
+   *   - P1: HypothesisGenerator filters and ranks actions
+   *   - P2b: Real rollback (semantic, per action type)
+   *   - P2c: Convergence detection (target-reached / plateau / dead-end)
+   *   - P3a: Each iteration persisted to experiment-history.jsonl
+   *   - P3b: Rolled-back actions recorded as negative experiences
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.maxIterations=3]
+   * @param {number} [opts.degradationThreshold=0.1]
+   * @returns {{ iterations: object[], kept: number, rolledBack: number, stopped: boolean, convergence: object|null, excluded: object[] }}
    */
-  _canaryCheck() {
+  async runMicroLoop(opts = {}) {
+    const {
+      maxIterations = this._microLoopMaxIter,
+      degradationThreshold = 0.1,
+    } = opts;
+
+    let RegressionGuard;
     try {
-      // Check 1: Can we still load config?
-      const configPath = path.join(this._orch?.projectRoot || process.cwd(), 'workflow.config.js');
-      if (fs.existsSync(configPath)) {
-        delete require.cache[require.resolve(configPath)];
-        require(configPath);
+      ({ RegressionGuard } = require('./regression-guard'));
+    } catch (_) {
+      return { iterations: [], kept: 0, rolledBack: 0, stopped: true, convergence: null, excluded: [], error: 'RegressionGuard not available' };
+    }
+
+    const guard = new RegressionGuard({ outputDir: this._outputDir, verbose: this._verbose });
+
+    // First, run a standard MAPE cycle to get the action plan
+    const cycleResult = await this.runCycle({ dryRun: true, maxActions: maxIterations });
+    const actions = cycleResult.phases?.plan?.plan?.actions || [];
+
+    if (actions.length === 0) {
+      if (this._verbose) console.log('[MAPE:MicroLoop] No actions to execute — system is healthy');
+      return { iterations: [], kept: 0, rolledBack: 0, stopped: false, convergence: null, excluded: [] };
+    }
+
+    // P1: Generate hypotheses — filter and rank actions
+    const hypothesisGen = new HypothesisGenerator({ outputDir: this._outputDir, verbose: this._verbose });
+    const currentSnapshot = guard.snapshotMetrics();
+    const { hypotheses, excluded } = hypothesisGen.generate({ actions, guard, snapshot: currentSnapshot });
+
+    if (hypotheses.length === 0) {
+      if (this._verbose) console.log('[MAPE:MicroLoop] All actions excluded by HypothesisGenerator — nothing to try');
+      return { iterations: [], kept: 0, rolledBack: 0, stopped: false, convergence: null, excluded };
+    }
+
+    const iterations = [];
+    let kept = 0;
+    let rolledBack = 0;
+    let stopped = false;
+    let convergence = null;
+
+    if (this._verbose) {
+      console.log(`[MAPE:MicroLoop] Starting V2 micro-loop: ${Math.min(hypotheses.length, maxIterations)} hypothesis(es), ${excluded.length} excluded`);
+    }
+
+    for (let i = 0; i < Math.min(hypotheses.length, maxIterations); i++) {
+      const action = hypotheses[i];
+      const iterStart = Date.now();
+
+      // Step 1: Snapshot BEFORE
+      const beforeSnapshot = guard.snapshotMetrics();
+
+      // Step 2: Execute action
+      let execResult;
+      try {
+        execResult = await this._executeAction(action);
+      } catch (err) {
+        const errIter = {
+          iteration: i + 1,
+          action: action.title,
+          type: action.type,
+          status: 'error',
+          error: err.message,
+          confidence: action.confidence,
+          durationMs: Date.now() - iterStart,
+        };
+        iterations.push(errIter);
+        this._persistExperimentHistory(errIter, { confidence: action.confidence }); // P3a
+        continue;
       }
-      // Check 2: Is ExperienceStore intact?
-      if (this._orch?.experienceStore) {
-        const count = this._orch.experienceStore.experiences.length;
-        if (count === 0 && this._orch.experienceStore._titleIndex?.size > 0) {
-          return false; // Data corruption
+
+      // Step 3: Snapshot AFTER
+      const afterSnapshot = guard.snapshotMetrics();
+
+      // Step 4: Evaluate delta
+      const delta = guard.evaluateMicroDelta(beforeSnapshot, afterSnapshot, { degradationThreshold });
+
+      let status;
+      if (delta.shouldRollback) {
+        // P2b: Real rollback
+        const rollbackResult = await this._rollbackAction(action, execResult);
+        status = 'rolled-back';
+        rolledBack++;
+        if (this._verbose) {
+          console.log(`[MAPE:MicroLoop] ↩️  Iteration ${i + 1}: ROLLBACK — ${delta.reason} (actual: ${rollbackResult.detail})`);
+        }
+      } else {
+        status = 'kept';
+        kept++;
+        if (this._verbose) {
+          const improvedStr = delta.improved.length > 0 ? delta.improved.join(', ') : 'none';
+          console.log(`[MAPE:MicroLoop] ✅ Iteration ${i + 1}: KEPT — improved: ${improvedStr}`);
         }
       }
-      return true;
-    } catch (_) {
-      return false;
+
+      const iterResult = {
+        iteration: i + 1,
+        action: action.title,
+        type: action.type,
+        status,
+        delta: {
+          improved: delta.improved,
+          degraded: delta.degraded,
+        },
+        confidence: action.confidence,
+        hypothesis: action.hypothesis,
+        execResult,
+        durationMs: Date.now() - iterStart,
+      };
+
+      iterations.push(iterResult);
+
+      // P3a: Persist iteration to experiment history
+      this._persistExperimentHistory(iterResult, { confidence: action.confidence });
+
+      // P3b: Record failure experience for rolled-back actions
+      if (status === 'rolled-back') {
+        this._recordFailureExperience(iterResult);
+      }
+
+      // Step 5: Canary check
+      const healthy = this._canaryCheck();
+      if (!healthy) {
+        if (this._verbose) console.warn('[MAPE:MicroLoop] ⚠️  Canary failed — stopping micro-loop');
+        stopped = true;
+        break;
+      }
+
+      // P2c: Convergence detection
+      convergence = this._checkConvergence({ iterations, guard });
+      if (convergence.converged) {
+        if (this._verbose) {
+          console.log(`[MAPE:MicroLoop] 🎯 Converged: ${convergence.reason}`);
+        }
+        break;
+      }
     }
+
+    if (this._verbose) {
+      console.log(`[MAPE:MicroLoop] Complete: ${kept} kept, ${rolledBack} rolled back, stopped=${stopped}, converged=${convergence?.converged || false}`);
+    }
+
+    return { iterations, kept, rolledBack, stopped, convergence, excluded };
   }
 }
 
-module.exports = { MAPEEngine, MAPE_PHASE, ACTION_PRIORITY, ACTION_TYPE };
+
+// Mix executor methods into MAPEEngine.prototype
+for (const key of Object.keys(executors)) {
+  MAPEEngine.prototype[key] = executors[key];
+}
+
+// Mix hypothesis utility methods into MAPEEngine.prototype
+const { _checkConvergence, _persistExperimentHistory, _recordFailureExperience, _canaryCheck, _quickHash } = hypothesisMod;
+Object.assign(MAPEEngine.prototype, { _checkConvergence, _persistExperimentHistory, _recordFailureExperience, _canaryCheck, _quickHash });
+
+module.exports = { MAPEEngine, HypothesisGenerator, MAPE_PHASE, ACTION_PRIORITY, ACTION_TYPE };

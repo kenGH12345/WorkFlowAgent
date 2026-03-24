@@ -17,6 +17,7 @@ const { getProjectStructure, selectToolStrategy, scanCodeSymbols } = require('..
 const { getConfig } = require('../core/config-loader');
 const { buildSessionStartChecklist } = require('../core/prompt-builder');
 const { renderCompactProfileSummary } = require('../core/project-profiler');
+const { rebuildCache, getDistilledSummary } = require('../core/arch-knowledge-cache');
 
 class MemoryManager {
   /**
@@ -65,6 +66,14 @@ class MemoryManager {
 
     fs.writeFileSync(this.agentsMdPath, content, 'utf-8');
     console.log(`[MemoryManager] AGENTS.md written: ${this.agentsMdPath}`);
+
+    // Trigger arch-knowledge-cache rebuild (incremental, dirty-flag based)
+    try {
+      rebuildCache(this.projectRoot, { projectProfile: this._config.projectProfile || null });
+    } catch (err) {
+      console.warn(`[MemoryManager] Could not rebuild arch-knowledge-cache: ${err.message}`);
+    }
+
     return this.agentsMdPath;
   }
 
@@ -278,6 +287,9 @@ class MemoryManager {
         return summary || '';
       })(),
       symbolsSummary ? `## Code Symbols\n\n${symbolsSummary}` : '',
+      // P0: Inject distilled architecture knowledge cache (structure + techStack + codeGraph + taskHistory)
+      // This is the single source of truth for session cold-start context
+      getDistilledSummary(this.projectRoot),
     ].filter(Boolean).join('\n');
   }
 

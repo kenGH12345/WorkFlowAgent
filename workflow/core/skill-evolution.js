@@ -27,6 +27,8 @@ class SkillEvolutionEngine {
     this.registryPath = registryPath || path.join(PATHS.OUTPUT_DIR, 'skill-registry.json');
     /** @type {Map<string, SkillMeta>} */
     this.registry = new Map();
+    /** @type {Map<string, string>} P1-5 fix: in-memory skill content cache for batch operations */
+    this._skillContentCache = new Map();
     this._loadRegistry();
   }
 
@@ -177,9 +179,11 @@ class SkillEvolutionEngine {
       return false;
     }
 
-    // Read current skill file
+    // Read current skill file (P1-5 fix: use in-memory cache for batch operations)
     let skillContent = '';
-    if (fs.existsSync(meta.filePath)) {
+    if (this._skillContentCache.has(meta.filePath)) {
+      skillContent = this._skillContentCache.get(meta.filePath);
+    } else if (fs.existsSync(meta.filePath)) {
       skillContent = fs.readFileSync(meta.filePath, 'utf-8');
     }
 
@@ -234,6 +238,8 @@ class SkillEvolutionEngine {
       const dedupTmpPath = meta.filePath + '.tmp';
       fs.writeFileSync(dedupTmpPath, updatedContent, 'utf-8');
       fs.renameSync(dedupTmpPath, meta.filePath);
+      // P1-5 fix: update content cache
+      this._skillContentCache.set(meta.filePath, updatedContent);
       meta.version = dedupVersion;
       meta.evolutionCount += 1;
       meta.lastEvolvedAt = new Date().toISOString();
@@ -322,6 +328,8 @@ class SkillEvolutionEngine {
     const skillTmpPath = meta.filePath + '.tmp';
     fs.writeFileSync(skillTmpPath, skillContent, 'utf-8');
     fs.renameSync(skillTmpPath, meta.filePath);
+    // P1-5 fix: update content cache after successful write
+    this._skillContentCache.set(meta.filePath, skillContent);
     meta.version = newVersion;
     meta.evolutionCount += 1;
     meta.lastEvolvedAt = new Date().toISOString();
@@ -659,6 +667,11 @@ class SkillEvolutionEngine {
         `<!-- PURPOSE: Background knowledge that helps an agent make better decisions. Not rules or practices — just useful context (e.g. "This project uses X library which has a known limitation Y", "The team prefers Z approach for historical reasons"). -->`,
         ``,
         `_No context hints defined yet._`,
+        ``,
+        `## Code Snippets`,
+        `<!-- PURPOSE: Reusable code patterns, utility function signatures, and common implementation templates for this skill's domain. Each snippet should be copy-paste ready and include a brief description of WHEN to use it. Populated automatically from high-frequency utility_class and code_snippet experiences. -->`,
+        ``,
+        `_No code snippets collected yet. Snippets will be added from utility class scanning and experience evolution._`,
       ];
     }
 
@@ -680,6 +693,25 @@ class SkillEvolutionEngine {
       `| Version | Date | Change |`,
       `|---------|------|--------|`,
       `| v1.0.0 | ${new Date().toISOString().slice(0, 10)} | Initial creation |`,
+      ``,
+      `---`,
+      ``,
+      `<!-- KNOWLEDGE_SOURCES -->
+<!-- 
+  This skill can be auto-enriched with knowledge from:
+  
+  1. AgentHub Knowledge Base (UUID: 86d363ab81634904b1cbc1b46acc66bc)
+     - Use MCP tool: knowledge.knowledgebase_search
+     - Query: "${meta.description} best practices patterns"
+     - Domains: ${(meta.domains || []).join(', ') || 'software development'}
+  
+  2. Web Search + LLM Analysis
+     - Automatically triggered via enrichSkillFromExternalKnowledge()
+     - When WebSearch MCP adapter is available
+  
+  To manually enrich this skill, run:
+  > /wf enrich-skill ${meta.name}
+-->`,
     ].join('\n');
 
     if (!fs.existsSync(this.skillsDir)) {

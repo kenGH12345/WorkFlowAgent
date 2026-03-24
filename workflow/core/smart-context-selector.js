@@ -30,6 +30,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { ideHasSemanticSearch } = require('./ide-detection');
 
 // ─── Project Type Detection ──────────────────────────────────────────────────
 
@@ -222,6 +223,19 @@ const ADAPTER_RELEVANCE = {
     // (only fires when local experience is empty)
   },
 
+  // ── Code Graph (symbol index & search) ────────────────────────────────────
+  // IDE-First principle (ADR-37): When running inside an IDE, the AI Agent
+  // should prefer IDE-native tools (codebase_search, grep_search, view_code_item)
+  // over CodeGraph search. CodeGraph remains valuable for unique capabilities
+  // (hotspot analysis, module summary, reusable symbols) that the IDE doesn't provide.
+  // Priority is automatically reduced when IDE is detected (see ContextProfile).
+  CODE_GRAPH: {
+    _default: 'essential',     // Essential when no IDE is available
+    _taskOverrides: {
+      docs: 'useful',          // Docs tasks don't need heavy code context
+    },
+  },
+
   // ── Test Best Practices (TESTER stage only) ───────────────────────────────
   TEST_BEST_PRACTICES: {
     _default: 'useful',
@@ -360,6 +374,11 @@ class SmartContextSelector {
    * Detects the task type from the requirement text via keyword matching.
    * Uses a scoring system — the category with the most keyword hits wins.
    *
+   * P1-4 fix: pre-compiled regex patterns are used directly instead of creating
+   * new RegExp objects with 'g' flag on each call. The previous approach of
+   * `new RegExp(pattern.source, pattern.flags + 'g')` caused unbounded regex
+   * compilation and potential performance issues on large requirement texts.
+   *
    * @param {string} text - Requirement / task description text
    * @returns {'feature' | 'bugfix' | 'performance' | 'security' | 'ui' | 'refactor' | 'docs' | 'general'}
    */
@@ -370,9 +389,15 @@ class SmartContextSelector {
     for (const [type, patterns] of Object.entries(TASK_TYPE_KEYWORDS)) {
       scores[type] = 0;
       for (const pattern of patterns) {
-        const matches = text.match(new RegExp(pattern.source, pattern.flags + 'g'));
-        if (matches) {
-          scores[type] += matches.length;
+        // P1-4 fix: use test() for simple match check instead of creating new
+        // global RegExp and calling match(). test() is faster and avoids creating
+        // match result arrays. For counting multiple hits, use a while loop
+        // with exec() on a fresh global regex only when test() succeeds.
+        if (pattern.test(text)) {
+          // Count occurrences with a global regex only after confirming a match
+          const globalRe = new RegExp(pattern.source, pattern.flags.replace('g', '') + 'g');
+          const matches = text.match(globalRe);
+          scores[type] += matches ? matches.length : 1;
         }
       }
     }
@@ -419,6 +444,23 @@ class ContextProfile {
     for (const [blockName, rules] of Object.entries(ADAPTER_RELEVANCE)) {
       this._relevanceMap.set(blockName, _resolveRelevance(rules, projectType, taskType));
     }
+
+    // ── IDE-First adjustment (ADR-37) ──────────────────────────────────────
+    // When running inside an IDE with semantic search, CodeGraph's search
+    // results are less important (Agent should use codebase_search instead).
+    // However, CodeGraph's unique capabilities (hotspot, module summary,
+    // reusable symbols digest) are still valuable and always injected.
+    // We reduce CODE_GRAPH priority from 'essential' to 'useful' so that
+    // if token budget is tight, IDE-provided search results take precedence.
+    try {
+      if (ideHasSemanticSearch()) {
+        const currentRelevance = this._relevanceMap.get('CODE_GRAPH');
+        if (currentRelevance === 'essential') {
+          this._relevanceMap.set('CODE_GRAPH', 'useful');
+          console.log(`[SmartContext] 🏠 IDE semantic search detected — CodeGraph priority reduced to 'useful' (fallback role)`);
+        }
+      }
+    } catch (_) { /* IDE detection failure is non-fatal */ }
   }
 
   /**
@@ -547,6 +589,12 @@ function _resolveRelevance(rules, projectType, taskType) {
 
 /**
  * Maps a human-readable block label to its BLOCK_PRIORITY key.
+ *
+ * P1-7 fix: previously this was a hardcoded MAP object that silently failed
+ * for any new adapter block label not explicitly listed. Now it also attempts
+ * automatic derivation: uppercase, replace spaces with underscores.
+ * This makes the mapping self-extending for new adapters.
+ *
  * @param {string} label
  * @returns {string|null}
  */
@@ -565,8 +613,14 @@ function _labelToBlockKey(label) {
     'Industry Research':   'INDUSTRY_RESEARCH',
     'External Experience': 'EXTERNAL_EXPERIENCE',
     'Test Best Practices': 'TEST_BEST_PRACTICES',
+    'Real Execution':      'REAL_EXECUTION',
+    'Code Graph':          'CODE_GRAPH',
+    'Upstream Context':    'UPSTREAM_CTX',
+    'Experience':          'EXPERIENCE',
+    'Complaints':          'COMPLAINTS',
   };
-  return MAP[label] || null;
+  // P1-7 fix: fallback to automatic derivation for unknown labels
+  return MAP[label] || label.toUpperCase().replace(/\s+/g, '_') || null;
 }
 
 /**

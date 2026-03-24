@@ -33,7 +33,7 @@ const { ArchitectAgent } = require('./agents/architect-agent');
 const { DeveloperAgent } = require('./agents/developer-agent');
 const { TesterAgent } = require('./agents/tester-agent');
 const { PlannerAgent } = require('./agents/planner-agent');
-const { buildAgentPrompt, setPromptSlotManager, getPromptSlotManager, setSelfReflectionEngine, setSkillEvolutionEngine } = require('./core/prompt-builder');
+const { buildAgentPrompt, setPromptSlotManager, getPromptSlotManager, setSelfReflectionEngine, setSkillEvolutionEngine, setOrchestrator } = require('./core/prompt-builder');
 const { PromptSlotManager } = require('./core/prompt-slot-manager');
 const { WorkflowState, AgentRole, STATE_ORDER } = require('./core/types');
 const { PATHS, HOOK_EVENTS } = require('./core/constants');
@@ -43,6 +43,7 @@ const { ExperienceStore, ExperienceType, ExperienceCategory } = require('./core/
 const { ComplaintWall, ComplaintSeverity, ComplaintTarget, ComplaintStatus, RootCause } = require('./core/complaint-wall');
 const { SkillEvolutionEngine } = require('./core/skill-evolution');
 const { SelfReflectionEngine } = require('./core/self-reflection-engine');
+const { SessionSignalDetector } = require('./core/session-signal-detector');
 const { getConfig } = require('./core/config-loader');
 const { SelfCorrectionEngine, formatClarificationReport } = require('./core/clarification-engine');
 const { RequirementClarifier } = require('./core/requirement-clarifier');
@@ -84,6 +85,10 @@ const { Logger, logger: structuredLogger } = require('./core/logger');
 const { ExperienceRouter } = require('./core/experience-router');
 // P2-3: Long-running service mode + health check
 const { WorkflowServer } = require('./core/workflow-server');
+// P3-1: MCP Server (Model Context Protocol) for IDE plugin integration
+const { MCPServer } = require('./core/mcp-server');
+// P3-2: RequestTriage (auto-detect complexity + enforce best practices)
+const { RequestTriage } = require('./core/request-triage');
 // P2-4: Core module contracts (explicit interface validation)
 const { validateContract, assertContract, listContracts, ALL_CONTRACTS } = require('./core/contracts');
 // Smart Context Selection: dynamic adapter block priority adjustment based on project/task type
@@ -238,6 +243,15 @@ class Orchestrator {
     this.experienceStore.purgeExpired();
     this.complaintWall = new ComplaintWall();
 
+    // ── ADR-43: Session Signal Detector ─────────────────────────────────────
+    // Automatic capture of "pitfall moments" from workflow sessions.
+    // Tracks file edits, tool calls, and complaints to detect signal-worthy sessions.
+    this._sessionSignalDetector = new SessionSignalDetector({
+      orchestrator: this,
+      verbose: this._verbose,
+    });
+    console.log(`[Orchestrator] 🎯 SessionSignalDetector initialised (ADR-43: signal-driven experience capture).`);
+
     // ── Defect F fix: Bidirectional sync between ExperienceStore and ComplaintWall ──
     // Previously these two systems were isolated information silos:
     //   - Resolving a complaint didn't create a positive experience (knowledge lost)
@@ -253,18 +267,26 @@ class Orchestrator {
 
     // ADR-29: Register callback for auto-enriching newly created placeholder skills.
     // When a new skill file is created (e.g. via auto-create from experience), this
-    // fires enrichSkillFromExternalKnowledge() in fire-and-forget mode to pre-populate
-    // the skill with knowledge from web sources, solving the cold-start problem.
+    // ADR-45 (Revised): Lazy enrichment on first use, not eager on creation.
+    //
+    // OLD BEHAVIOR: Immediately called enrichSkillFromExternalKnowledge() when a
+    // skill file was created, which added latency to initialization and could
+    // fetch irrelevant knowledge before the skill's context was known.
+    //
+    // NEW BEHAVIOR: Mark the skill as "needs enrichment" and trigger the actual
+    // enrichment when ContextLoader first attempts to load the skill. This:
+    //   1. Reduces initialization time (no blocking web searches)
+    //   2. Ensures enrichment happens only for skills that are actually used
+    //   3. Allows the task context to inform the enrichment queries
+    //
+    // The enrichment is triggered by ContextLoader._loadSkill() when it detects
+    // a placeholder skill. MAPE Engine continues to monitor and refresh stale skills.
     this.skillEvolution.onSkillFileCreated = (meta) => {
-      const { enrichSkillFromExternalKnowledge } = require('./core/context-budget-manager');
-      // Only enrich if WebSearch is available (non-blocking, non-fatal)
-      enrichSkillFromExternalKnowledge(this, meta.name, { maxSearchResults: 3, maxFetchPages: 2 })
-        .then(r => {
-          if (r.success) {
-            console.log(`[Orchestrator] 🌐→📝 Auto-enriched new skill "${meta.name}": ${r.sectionsAdded} entries from ${r.sources.length} source(s)`);
-          }
-        })
-        .catch(() => { /* non-fatal: enrichment failure should never block workflow */ });
+      // Mark as needing enrichment (will be triggered on first use)
+      meta.needsEnrichment = true;
+      meta.enrichmentTriggeredAt = null;
+      meta.enrichmentCompletedAt = null;
+      console.log(`[Orchestrator] 📝 New skill "${meta.name}" registered (enrichment deferred until first use)`);
     };
 
     // ── P1 Self-Reflection Engine: quality gating + proactive audit ──────────
@@ -425,10 +447,19 @@ class Orchestrator {
     // auto-injects known-issues summary into every agent prompt.
     setSelfReflectionEngine(this._selfReflection);
 
+    // A-1 fix: Inject SkillEvolutionEngine into SelfReflectionEngine so HealthAuditor
+    // uses the runtime instance instead of creating orphan SkillEvolutionEngine instances.
+    this._selfReflection.setSkillEvolution(this.skillEvolution);
+
     // Gap 1 fix: Inject SkillEvolutionEngine into prompt-builder so buildAgentPrompt()
     // can query retired skill names and exclude them from ContextLoader injection.
     // This closes the loop: retireStaleSkills() → retiredAt → ContextLoader exclusion.
     setSkillEvolutionEngine(this.skillEvolution);
+
+    // ADR-45: Inject Orchestrator reference into prompt-builder for lazy skill enrichment.
+    // ContextLoader uses this to trigger enrichSkillFromExternalKnowledge() when it
+    // detects a placeholder skill during loading (first-use trigger pattern).
+    setOrchestrator(this);
 
     // ── EntropyGC: architectural drift scanner ──────────────────────────────
     const cfg = this._config || {};
@@ -1111,6 +1142,10 @@ module.exports = {
   ExperienceRouter,
   // P2-3: Workflow Server (long-running service mode)
   WorkflowServer,
+  // P3-1: MCP Server (Model Context Protocol for IDE plugin integration)
+  MCPServer,
+  // P3-2: RequestTriage (auto-detect complexity + enforce best practices)
+  RequestTriage,
   // P2-4: Contracts (explicit interface validation)
   assertContract, validateContract, listContracts,
 };

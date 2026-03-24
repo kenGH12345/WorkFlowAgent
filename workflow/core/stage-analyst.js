@@ -16,6 +16,7 @@ const { DECISION_QUESTIONS } = require('./socratic-engine');
 const { Observability } = require('./observability');
 const { translateMdFile } = require('./i18n-translator');
 const { getPromptSlotManager } = require('./prompt-builder');
+const { runEvoMapFeedback } = require('./stage-runner-utils');
 const {
   storeAnalyseContext,
   webSearchHelper,
@@ -44,6 +45,18 @@ function _recordPromptABOutcome(agentRole, gatePassed, correctionRounds, tokensU
   });
 }
 
+/**
+ * Runs the ANALYSE stage: requirement clarification, enrichment, and analysis.
+ *
+ * P1-2 fix: Explicit @this annotation documents the implicit dependency on
+ * Orchestrator properties. This enables IDE IntelliSense, makes refactoring
+ * safer (renaming Orchestrator properties will surface as JSDoc warnings),
+ * and serves as living documentation of the function's runtime contract.
+ *
+ * @this {import('./orchestrator').Orchestrator}
+ * @param {string} rawRequirement - The raw user requirement text
+ * @returns {Promise<string>} Path to the generated requirements.md
+ */
 async function _runAnalyst(rawRequirement) {
   console.log(`\n[Orchestrator] Stage: ANALYSE (AnalystAgent)`);
 
@@ -175,10 +188,54 @@ async function _runAnalyst(rawRequirement) {
     console.warn(`[Orchestrator] ⚠️  Code Graph seed injection failed (non-fatal): ${seedErr.message}`);
   }
 
+  // ── P1 fix: Inject Experience for ANALYSE stage (was completely missing) ───
+  // The ANALYSE stage now learns from past requirement analysis experiences,
+  // enabling better clarification questions and risk identification over time.
+  let analystInjectedExpIds = [];
+  try {
+    if (this.experienceStore && typeof this.experienceStore.query === 'function') {
+      const analystExp = this.experienceStore.query({
+        skill: 'requirement-analysis',
+        limit: this._adaptiveStrategy?.maxExpInjected ?? 5,
+        currentRequirement: rawRequirement || '',
+      });
+      if (analystExp.length > 0) {
+        let expBlock = '\n\n## Requirement Analysis Experience (from ExperienceStore)\n';
+        expBlock += '> The following experiences are from past successful requirement analyses. Use them to improve clarification questions and risk identification.\n\n';
+        for (const exp of analystExp) {
+          expBlock += `- [${exp.type || 'general'}] **${exp.title || 'Untitled'}**: ${(exp.content || '').slice(0, 200)}\n`;
+          if (exp.id) analystInjectedExpIds.push(exp.id);
+        }
+        clarResult.enrichedRequirement = `${clarResult.enrichedRequirement}${expBlock}`;
+        this.obs.recordExpUsage({ injected: analystInjectedExpIds.length });
+        console.log(`[Orchestrator] 📚 ANALYSE experience injection: ${analystInjectedExpIds.length} experience(s) from ExperienceStore`);
+      }
+    }
+  } catch (expErr) {
+    console.warn(`[Orchestrator] ⚠️  ANALYSE experience injection failed (non-fatal): ${expErr.message}`);
+  }
+
   const outputPath = await this.agents[AgentRole.ANALYST].run(null, clarResult.enrichedRequirement);
 
   // ── Store ANALYSE stage context for downstream stages ─────────────────────
   const analyseCtx = storeAnalyseContext(this, outputPath, clarResult);
+
+  // ── P1 fix: EvoMap feedback loop for ANALYSE stage (was completely missing) ───
+  // When the requirement analysis completes successfully, we close the learning loop.
+  // This enables the ANALYSE stage to learn from successful requirement analyses.
+  try {
+    let analyseContent = '';
+    if (outputPath && fs.existsSync(outputPath)) {
+      analyseContent = fs.readFileSync(outputPath, 'utf-8');
+    }
+    await runEvoMapFeedback(this, {
+      injectedExpIds: analystInjectedExpIds,
+      errorContext: analyseContent,
+      stageLabel: 'ANALYSE',
+    });
+  } catch (evoErr) {
+    console.warn(`[Orchestrator] ⚠️  EvoMap feedback failed for ANALYSE stage (non-fatal): ${evoErr.message}`);
+  }
 
   // ── Prompt A/B: record analyst outcome ──────────────────────────────────
   _recordPromptABOutcome('analyst', true, clarResult.rounds ?? 0);

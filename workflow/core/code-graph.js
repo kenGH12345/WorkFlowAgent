@@ -54,17 +54,8 @@ const NON_CODE_DIRS = new Set([
   'locales', 'locale', 'i18n', 'l10n', 'translations',
 ]);
 
-// ─── Symbol Types ─────────────────────────────────────────────────────────────
-
-const SymbolKind = {
-  CLASS:     'class',
-  FUNCTION:  'function',
-  METHOD:    'method',
-  MODULE:    'module',
-  INTERFACE: 'interface',
-  ENUM:      'enum',
-  PROPERTY:  'property',
-};
+// ─── Symbol Types (single source of truth: code-graph-types.js) ───────────────
+const { SymbolKind } = require('./code-graph-types');
 
 // ─── Process-level singleton cache (P1 optimisation) ─────────────────────────
 // Prevents redundant disk I/O + JSON.parse when multiple CodeGraph instances
@@ -123,6 +114,9 @@ class CodeGraph {
    * @param {string[]} [options.extensions] - File extensions to scan
    * @param {string[]} [options.ignoreDirs] - Directories to skip
    * @param {string[]} [options.scopeDirs]  - Only scan these sub-directories (for large monorepos)
+   * @param {object}   [options.techProfile] - P2-1: Tech profile from ProjectProfiler. When provided,
+   *   enables intelligent optimisations: skip irrelevant language parsers, boost
+   *   framework-specific symbol detection, and enrich module descriptions.
    *
    * Three-layer automatic filtering (always active, no config needed):
    *   Layer 1: .gitignore patterns → skips node_modules/, dist/, build/, etc.
@@ -140,6 +134,7 @@ class CodeGraph {
     ignoreDirs = ['node_modules', '.git', 'build', 'dist', 'output', 'Library', 'Temp', 'obj', 'Packages', '.dart_tool'],
     llmCall        = null,
     scopeDirs      = [],
+    techProfile    = null,
     // ── Deprecated options (kept for backward-compat, silently ignored) ──
     // maxFiles, useGitignore, skipNonCodeDirs are no longer needed.
     // The three-layer filter (gitignore + NON_CODE_DIRS + extension check)
@@ -155,6 +150,37 @@ class CodeGraph {
     this._ignoreDirs = new Set(ignoreDirs);
     this._llmCall    = llmCall;
     this._scopeDirs  = Array.isArray(scopeDirs) ? scopeDirs : [];
+
+    // P2-1: Tech profile fusion – when available, enables cross-engine optimisations
+    this._techProfile = techProfile;
+
+    // ── IDE-First Architecture (ADR-37) ──────────────────────────────────────
+    // When running inside an IDE (Cursor, VS Code, etc.), CodeGraph serves as a
+    // FALLBACK for code search. The AI Agent should prefer IDE-native tools:
+    //   - codebase_search (semantic) over CodeGraph.search() (TF-IDF)
+    //   - grep_search (ripgrep) over CodeGraph substring search
+    //   - view_code_item (compiler-accurate) over CodeGraph.querySymbol() (regex)
+    //
+    // CodeGraph remains ESSENTIAL for unique capabilities no IDE provides:
+    //   - Hotspot analysis (which files/symbols change most frequently)
+    //   - Module summary (high-level codebase overview for prompt injection)
+    //   - Reusable symbols digest (exported functions/classes for dev context)
+    //   - Call graph / dependency graph (inter-module relationships)
+    //
+    // This flag is informational — it doesn't change CodeGraph behavior, but is
+    // exposed for logging and diagnostics. The actual routing happens via:
+    //   - SmartContextSelector (reduces CODE_GRAPH priority when IDE detected)
+    //   - PromptBuilder (injects IDE Tool Guidance telling Agent to prefer IDE tools)
+    try {
+      const { ideHasSemanticSearch } = require('./ide-detection');
+      this._ideSearchAvailable = ideHasSemanticSearch();
+      if (this._ideSearchAvailable) {
+        console.log(`[CodeGraph] 🏠 IDE semantic search available — CodeGraph operates in fallback mode for search`);
+        console.log(`[CodeGraph]    Unique capabilities still active: hotspot, module summary, reusable symbols, call graph`);
+      }
+    } catch (_) {
+      this._ideSearchAvailable = false;
+    }
 
     // Warn threshold: if collected files exceed this, log a warning (but never truncate).
     // This replaces the old maxFiles hard-truncation which randomly discarded valid code files.
@@ -180,6 +206,8 @@ class CodeGraph {
     /** @type {Map<string, number>} relPath → mtimeMs. P1-5: Populated during build
      *  to avoid re-statting all files in _saveCache(). */
     this._fileMtimes = new Map();
+    this._calledByIndex = null;      // P1-2: Cached reverse-index (symbolId → callers)
+    this._importanceWeights = null;   // P1-2: Cached importance weights
 
     // ── P0 Symbol Importance Weights ─────────────────────────────────────────
     // Maps symbolId → importance weight (0-1).  Computed from cross-file
@@ -408,9 +436,11 @@ class CodeGraph {
           const relPath = path.relative(this._root, filePath).replace(/\\/g, '/');
           const ext     = path.extname(filePath);
           this._extractSymbols(content, relPath, ext);
-          this._extractImports(content, relPath, ext);
-          // P1: Cache only word tokens (Set<string>) – much lighter than full content
-          tokenCache.set(relPath, new Set(content.match(/\b\w+\b/g) || []));
+          // P1: Strip comments/strings before import extraction to avoid false imports
+          const strippedContent = stripCommentsAndStrings(content, ext);
+          this._extractImports(strippedContent, relPath, ext);
+          // P1: Cache only word tokens (Set<string>) from stripped content – much lighter than full content
+          tokenCache.set(relPath, new Set(strippedContent.match(/\b\w+\b/g) || []));
           // P1-5: Record mtime for new/changed files (avoid re-statting in _saveCache)
           try { this._fileMtimes.set(relPath, fs.statSync(filePath).mtimeMs); } catch (_) {}
         }
@@ -484,9 +514,11 @@ class CodeGraph {
             const relPath  = path.relative(this._root, filePath).replace(/\\/g, '/');
             const ext      = path.extname(filePath);
             this._extractSymbols(content, relPath, ext);
-            this._extractImports(content, relPath, ext);
-            // P1: Cache lightweight word tokens for Pass 2
-            tokenCache.set(relPath, new Set(content.match(/\b\w+\b/g) || []));
+            // P1: Strip comments/strings before import extraction to avoid false imports
+            const strippedContent = stripCommentsAndStrings(content, ext);
+            this._extractImports(strippedContent, relPath, ext);
+            // P1: Cache lightweight word tokens from stripped content for Pass 2
+            tokenCache.set(relPath, new Set(strippedContent.match(/\b\w+\b/g) || []));
             // P1-5: Record mtime during read (avoid re-statting in _saveCache)
             try { this._fileMtimes.set(relPath, fs.statSync(filePath).mtimeMs); } catch (_) {}
           }
@@ -507,8 +539,15 @@ class CodeGraph {
     const modeLabel = isIncremental ? `incremental – ${changedFiles.length} changed` : 'full rebuild';
     console.log(`[CodeGraph] ✅ Built (${modeLabel}): ${this._symbols.size} symbols, ${edgeCount} call edges, ${this._importEdges.size} modules`);
 
+    // P2-1: Tech Profile Fusion – log enrichment when profile is available
+    if (this._techProfile) {
+      console.log(`[CodeGraph] 🔗 P2-1 Fusion: tech profile "${this._techProfile.name || this._techProfile.id}" active`);
+    }
+
     // P1: Build inverted token index for semantic search
     this._buildTokenIndex();
+    // P1-1 fix: invalidate sorted token key cache after index rebuild
+    this._sortedTokenKeys = null;
 
     // Save cache for next incremental build
     this._saveCache(cachePath, files);
@@ -597,10 +636,33 @@ class CodeGraph {
             tokenHits.set(symId, (tokenHits.get(symId) || 0) + 2); // exact = weight 2
           }
         }
-        // Prefix match (for partial tokens like "analys" matching "analyst")
+        // P1-1 fix: Prefix match using sorted token array for O(log N) binary search
+        // instead of O(N) full scan of all tokens in the index.
+        // For short queries (< 3 chars), skip prefix matching entirely to avoid noise.
         if (qt.length >= 3) {
-          for (const [token, symIds] of this._tokenIndex) {
-            if (token !== qt && (token.startsWith(qt) || qt.startsWith(token))) {
+          // Build sorted token list lazily (cached on the index)
+          if (!this._sortedTokenKeys) {
+            this._sortedTokenKeys = [...this._tokenIndex.keys()].sort();
+          }
+          const sortedKeys = this._sortedTokenKeys;
+          // Binary search for the first token starting with qt
+          let lo = 0, hi = sortedKeys.length - 1;
+          while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (sortedKeys[mid] < qt) lo = mid + 1;
+            else hi = mid - 1;
+          }
+          // Scan forward from the insertion point, collecting prefix matches
+          for (let k = lo; k < sortedKeys.length; k++) {
+            const token = sortedKeys[k];
+            if (!token.startsWith(qt) && !qt.startsWith(token)) {
+              // Since tokens are sorted, once we pass the prefix range, stop
+              if (token > qt + '\uffff') break;
+              continue;
+            }
+            if (token === qt) continue; // already handled as exact match
+            const symIds = this._tokenIndex.get(token);
+            if (symIds) {
               for (const symId of symIds) {
                 tokenHits.set(symId, (tokenHits.get(symId) || 0) + 1); // prefix = weight 1
               }
@@ -727,133 +789,11 @@ class CodeGraph {
     return { calls, calledBy };
   }
 
-  // ─── Hotspot Analysis ─────────────────────────────────────────────────────
 
-  /**
-   * Build a reverse-index: symbolId → calledBy count + caller list.
-   * This is the foundation for all hotspot/reuse analysis.
-   * @returns {Map<string, { count: number, callers: string[] }>}
-   * @private
-   */
-  _buildCalledByIndex() {
-    /** @type {Map<string, { count: number, callers: string[] }>} */
-    const calledByIndex = new Map();
-    for (const [callerId, callees] of this._callEdges) {
-      for (const calleeId of callees) {
-        if (!calledByIndex.has(calleeId)) {
-          calledByIndex.set(calleeId, { count: 0, callers: [] });
-        }
-        const entry = calledByIndex.get(calleeId);
-        entry.count++;
-        entry.callers.push(callerId);
-      }
-    }
-    return calledByIndex;
-  }
-
-  // ── P0 Symbol Importance Weights ────────────────────────────────────────
-
-  /**
-   * Compute normalised importance weights for all symbols.
-   * Weight combines two signals:
-   *   1. Cross-file calledBy count (primary, 70%)
-   *   2. Imported-by count for the symbol's file (secondary, 30%)
-   *
-   * Results are cached in this._importanceWeights (Map<symbolId, number>).
-   * Invalidated on build() / _patchBuild().
-   *
-   * @returns {Map<string, number>} symbolId → normalised weight [0, 1]
-   * @private
-   */
-  _computeImportanceWeights() {
-    if (this._importanceWeights) return this._importanceWeights;
-
-    const calledByIndex = this._buildCalledByIndex();
-
-    // Build importedBy index: filePath → number of files that import it
-    const importedByCount = new Map();
-    for (const [, imports] of this._importEdges) {
-      for (const imp of imports) {
-        importedByCount.set(imp, (importedByCount.get(imp) || 0) + 1);
-      }
-    }
-
-    // Compute raw scores (excluding noisy/generic short names that
-    // produce artificially inflated cross-file calledBy from regex matching)
-    const rawScores = new Map();
-    let maxRaw = 0;
-    for (const sym of this._symbols.values()) {
-      // Skip noisy names – they pollute the weight distribution
-      if (CodeGraph.isNoisyName(sym.name)) {
-        rawScores.set(sym.id, 0);
-        continue;
-      }
-      const cb = (calledByIndex.get(sym.id) || { count: 0 }).count;
-      const ib = importedByCount.get(sym.file) || 0;
-      // Cross-file calledBy: count callers from different files
-      const crossFileCB = (calledByIndex.get(sym.id) || { callers: [] }).callers
-        .filter(callerId => callerId.split('::')[0] !== sym.file).length;
-      // Weighted combination: cross-file calledBy (70%) + importedBy (30%)
-      const raw = crossFileCB * 0.7 + ib * 0.3;
-      rawScores.set(sym.id, raw);
-      if (raw > maxRaw) maxRaw = raw;
-    }
-
-    // Normalise to [0, 1]
-    this._importanceWeights = new Map();
-    if (maxRaw === 0) {
-      for (const id of rawScores.keys()) {
-        this._importanceWeights.set(id, 0);
-      }
-    } else {
-      for (const [id, raw] of rawScores) {
-        this._importanceWeights.set(id, raw / maxRaw);
-      }
-    }
-
-    return this._importanceWeights;
-  }
-
-  /**
-   * Get the importance weight for a symbol (0-1 normalised).
-   * @param {string} symbolId
-   * @returns {number}
-   */
-  getImportanceWeight(symbolId) {
-    const weights = this._computeImportanceWeights();
-    return weights.get(symbolId) || 0;
-  }
-
-  /**
-   * Classify a symbol into a category based on its call patterns.
-   *
-   * Categories:
-   *  - 'utility'    – High calledBy, low calls-out (pure helper / tool function)
-   *  - 'foundation' – High calledBy, moderate calls-out (base class / core service)
-   *  - 'hub'        – High both calledBy AND calls-out (central coordinator / manager)
-   *  - 'entry'      – Low calledBy, high calls-out (top-level entry point / controller)
-   *  - 'leaf'       – Low calledBy, low calls-out (isolated / leaf function)
-   *  - 'orphan'     – Zero calledBy AND zero calls-out (potentially dead code)
-   *
-   * @param {object} sym - Symbol entry
-   * @param {number} calledByCount - Number of callers
-   * @param {number} callsOutCount - Number of callees
-   * @param {object} thresholds
-   * @returns {string} Category label
-   */
-  classifySymbol(sym, calledByCount, callsOutCount, thresholds = {}) {
-    const { highCalledBy = 5, highCallsOut = 5 } = thresholds;
-    const isHighCalledBy = calledByCount >= highCalledBy;
-    const isHighCallsOut = callsOutCount >= highCallsOut;
-
-    if (calledByCount === 0 && callsOutCount === 0) return 'orphan';
-    if (isHighCalledBy && !isHighCallsOut) return 'utility';
-    if (isHighCalledBy && isHighCallsOut)  return 'hub';
-    if (!isHighCalledBy && isHighCallsOut) return 'entry';
-    // Moderate calledBy with low calls-out → foundation
-    if (calledByCount >= Math.ceil(highCalledBy * 0.6) && !isHighCallsOut) return 'foundation';
-    return 'leaf';
-  }
+  // ─── P1-1: Analysis extracted to code-graph-analysis.js ──────────────────
+  // _buildCalledByIndex, _computeImportanceWeights, getImportanceWeight,
+  // classifySymbol, getHotspots, getCategoryStats, getReusableSymbolsDigest,
+  // hotspotsAsMarkdown → CodeGraphAnalysisMixin.
 
   // ─── Common name filter (for hotspot noise reduction) ────────────────────────
   // Names that are too short or too common in any language are likely noise
@@ -923,154 +863,6 @@ class CodeGraph {
     // Names shorter than 4 chars are almost always noise
     if (baseName.length <= 3) return true;
     return CodeGraph.NOISY_SYMBOL_NAMES.has(baseName);
-  }
-
-  /**
-   * Get hotspot analysis: symbols sorted by calledBy count (descending).
-   * Filters out noisy/generic names to provide meaningful results.
-   *
-   * @param {object} [options]
-   * @param {number}  [options.topN=20]           - Max results
-   * @param {string}  [options.kind]              - Filter by SymbolKind
-   * @param {string}  [options.category]          - Filter by category (utility|foundation|hub|entry|orphan)
-   * @param {boolean} [options.includeOrphans=false] - Include orphan symbols (0 refs)
-   * @param {boolean} [options.includeNoisy=false]   - Include noisy/generic names
-   * @returns {Array<{ symbol: object, calledByCount: number, callsOutCount: number, category: string, callers: string[] }>}
-   */
-  getHotspots({ topN = 20, kind = null, category = null, includeOrphans = false, includeNoisy = false } = {}) {
-    if (this._symbols.size === 0) this._loadFromDisk();
-    if (this._symbols.size === 0) return [];
-
-    const calledByIndex = this._buildCalledByIndex();
-
-    // Compute dynamic thresholds based on project-wide distribution
-    const allCounts = [];
-    for (const sym of this._symbols.values()) {
-      const cb = calledByIndex.get(sym.id) || { count: 0, callers: [] };
-      const co = (this._callEdges.get(sym.id) || []).length;
-      if (!CodeGraph.isNoisyName(sym.name)) {
-        allCounts.push({ calledBy: cb.count, callsOut: co });
-      }
-    }
-    // Use percentile-based thresholds: "high" = top 15%
-    const sortedCB = allCounts.map(c => c.calledBy).sort((a, b) => a - b);
-    const sortedCO = allCounts.map(c => c.callsOut).sort((a, b) => a - b);
-    const p85CB = sortedCB[Math.floor(sortedCB.length * 0.85)] || 5;
-    const p85CO = sortedCO[Math.floor(sortedCO.length * 0.85)] || 5;
-    const thresholds = {
-      highCalledBy: Math.max(3, p85CB),
-      highCallsOut: Math.max(3, p85CO),
-    };
-
-    const results = [];
-    for (const sym of this._symbols.values()) {
-      if (kind && sym.kind !== kind) continue;
-      if (!includeNoisy && CodeGraph.isNoisyName(sym.name)) continue;
-
-      const calledByEntry = calledByIndex.get(sym.id) || { count: 0, callers: [] };
-      const callsOut = (this._callEdges.get(sym.id) || []).length;
-      const cat = this.classifySymbol(sym, calledByEntry.count, callsOut, thresholds);
-
-      if (category && cat !== category) continue;
-      if (!includeOrphans && cat === 'orphan') continue;
-
-      results.push({
-        symbol: sym,
-        calledByCount: calledByEntry.count,
-        callsOutCount: callsOut,
-        category: cat,
-        callers: calledByEntry.callers,
-      });
-    }
-
-    // Sort by calledBy count descending, then by callsOut descending
-    results.sort((a, b) => b.calledByCount - a.calledByCount || b.callsOutCount - a.callsOutCount);
-    return results.slice(0, topN);
-  }
-
-  /**
-   * Get statistics summary of symbol categories.
-   * Filters out noisy names for accurate statistics.
-   * @returns {{ total: number, utility: number, foundation: number, hub: number, entry: number, leaf: number, orphan: number }}
-   */
-  getCategoryStats() {
-    if (this._symbols.size === 0) this._loadFromDisk();
-    const calledByIndex = this._buildCalledByIndex();
-
-    // Compute dynamic thresholds (same logic as getHotspots)
-    const allCounts = [];
-    for (const sym of this._symbols.values()) {
-      if (CodeGraph.isNoisyName(sym.name)) continue;
-      const cb = calledByIndex.get(sym.id) || { count: 0, callers: [] };
-      const co = (this._callEdges.get(sym.id) || []).length;
-      allCounts.push({ calledBy: cb.count, callsOut: co });
-    }
-    const sortedCB = allCounts.map(c => c.calledBy).sort((a, b) => a - b);
-    const sortedCO = allCounts.map(c => c.callsOut).sort((a, b) => a - b);
-    const thresholds = {
-      highCalledBy: Math.max(3, sortedCB[Math.floor(sortedCB.length * 0.85)] || 5),
-      highCallsOut: Math.max(3, sortedCO[Math.floor(sortedCO.length * 0.85)] || 5),
-    };
-
-    const stats = { total: this._symbols.size, utility: 0, foundation: 0, hub: 0, entry: 0, leaf: 0, orphan: 0 };
-
-    for (const sym of this._symbols.values()) {
-      if (CodeGraph.isNoisyName(sym.name)) continue;
-      const calledByEntry = calledByIndex.get(sym.id) || { count: 0, callers: [] };
-      const callsOut = (this._callEdges.get(sym.id) || []).length;
-      const cat = this.classifySymbol(sym, calledByEntry.count, callsOut, thresholds);
-      stats[cat] = (stats[cat] || 0) + 1;
-    }
-    return stats;
-  }
-
-  /**
-   * Generate a compact Markdown digest of reusable symbols (utilities, foundations, hubs)
-   * suitable for injection into Developer/Coding Agent prompts.
-   *
-   * This is the KEY feature: when the Agent writes new code, it should reuse
-   * these high-frequency functions/classes to ensure code consistency and quality.
-   *
-   * @param {object} [options]
-   * @param {number}  [options.maxItems=15] - Max symbols to include
-   * @param {number}  [options.minCalledBy=3] - Min calledBy count to be considered reusable
-   * @returns {string} Compact Markdown block
-   */
-  getReusableSymbolsDigest({ maxItems = 15, minCalledBy = 3 } = {}) {
-    if (this._symbols.size === 0) this._loadFromDisk();
-    if (this._symbols.size === 0) return '';
-
-    const hotspots = this.getHotspots({ topN: 50 });
-    const reusable = hotspots.filter(h =>
-      h.calledByCount >= minCalledBy &&
-      ['utility', 'foundation', 'hub'].includes(h.category)
-    ).slice(0, maxItems);
-
-    if (reusable.length === 0) return '';
-
-    const categoryEmoji = { utility: '🔧', foundation: '🏗️', hub: '🔀' };
-    const categoryLabel = { utility: 'Utility', foundation: 'Foundation', hub: 'Hub' };
-
-    const lines = [
-      '## ♻️ Reusable Symbols (prefer reuse over reinvention)',
-      '',
-      'These high-frequency symbols are widely used across the codebase.',
-      '**When implementing new code, ALWAYS check if these existing functions/classes can be reused before writing new ones.**',
-      '',
-    ];
-
-    for (const h of reusable) {
-      const s = h.symbol;
-      const emoji = categoryEmoji[h.category] || '📦';
-      const label = categoryLabel[h.category] || h.category;
-      const sig = s.signature ? `(${s.signature})` : '';
-      const summary = s.summary ? ` – ${s.summary.slice(0, 50)}` : '';
-      lines.push(`- ${emoji} **${s.name}**${sig} \`[${label}, ${h.calledByCount} refs]\` in \`${s.file}\`:${s.line}${summary}`);
-    }
-
-    lines.push('');
-    lines.push('> ⚠️ Modifying these symbols has wide impact. Test thoroughly after changes.');
-    return lines.join('\n');
   }
 
   /**
@@ -1198,167 +990,7 @@ class CodeGraph {
     if (found === 0) return '_No matching symbols found in code graph._';
     return lines.join('\n');
   }
-
-  /**
-   * Loads the code graph index from the persisted JSON file (disk → memory).
-   * Called automatically when querySymbol() is invoked on an empty in-memory index.
-   */
-  _loadFromDisk() {
-    const jsonPath = path.join(this._outputDir, 'code-graph.json');
-    if (!fs.existsSync(jsonPath)) return;
-    try {
-      // P1 optimisation: check process-level cache first.
-      // If another CodeGraph instance (or previous call) already parsed this file,
-      // reuse the parsed data structures directly – avoids re-reading and re-parsing
-      // a potentially 100MB+ JSON file.
-      let stat;
-      try { stat = fs.statSync(jsonPath); } catch (_) { return; }
-      const cached = _processCache.get(jsonPath);
-      if (cached && cached.mtime === stat.mtimeMs) {
-        // Cache hit: clone Maps from cached parsed data
-        this._symbols.clear();
-        this._callEdges.clear();
-        this._importEdges.clear();
-        for (const [k, v] of cached.symbols)    this._symbols.set(k, v);
-        for (const [k, v] of cached.callEdges)  this._callEdges.set(k, v);
-        for (const [k, v] of cached.importEdges) this._importEdges.set(k, v);
-        console.log(`[CodeGraph] ⚡ Loaded from process cache: ${this._symbols.size} symbols (skipped disk I/O)`);
-        return;
-      }
-
-      // Cache miss: read from disk, parse, populate, then store in process cache
-      const data = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
-      this._symbols.clear();
-      this._callEdges.clear();
-      this._importEdges.clear();
-
-      if (data.version === 2 && Array.isArray(data.filePaths)) {
-        // ── v2 Path Dictionary format: expand indices back to full paths ─────
-        const filePaths = data.filePaths;
-
-        // Expand compact symbols: { f, k, n, l, s?, m? } → full SymbolEntry
-        for (const cs of (data.symbols || [])) {
-          const file = filePaths[cs.f] || `unknown_${cs.f}`;
-          const id   = `${file}::${cs.n}`;
-          this._symbols.set(id, {
-            id,
-            kind:      cs.k,
-            name:      cs.n,
-            file,
-            line:      cs.l,
-            signature: cs.s || '',
-            summary:   cs.m || '',
-            _weight:   cs.w || 0,   // P0: restore persisted importance weight
-          });
-        }
-
-        // Expand compact callEdges: "idx::name" → "path::name"
-        const expandId = (compactId) => {
-          const sepIdx = compactId.indexOf('::');
-          if (sepIdx === -1) return compactId;
-          const idxStr = compactId.substring(0, sepIdx);
-          const idx = parseInt(idxStr, 10);
-          if (isNaN(idx) || idx < 0 || idx >= filePaths.length) return compactId;
-          return `${filePaths[idx]}::${compactId.substring(sepIdx + 2)}`;
-        };
-
-        for (const [compactKey, compactCallees] of Object.entries(data.callEdges || {})) {
-          const fullKey = expandId(compactKey);
-          this._callEdges.set(fullKey, compactCallees.map(expandId));
-        }
-
-        // Expand compact importEdges: numeric key → file path
-        for (const [compactKey, imports] of Object.entries(data.importEdges || {})) {
-          const idx = parseInt(compactKey, 10);
-          const fullKey = (!isNaN(idx) && idx >= 0 && idx < filePaths.length)
-            ? filePaths[idx]
-            : compactKey;
-          this._importEdges.set(fullKey, imports);
-        }
-      } else {
-        // ── v1 Legacy format: direct full paths (backward compatible) ────────
-        for (const sym of (data.symbols || [])) {
-          this._symbols.set(sym.id, sym);
-        }
-        for (const [k, v] of Object.entries(data.callEdges || {})) {
-          this._callEdges.set(k, v);
-        }
-        for (const [k, v] of Object.entries(data.importEdges || {})) {
-          this._importEdges.set(k, v);
-        }
-      }
-
-      // Store parsed result in process-level cache (always in expanded format)
-      _processCache.set(jsonPath, {
-        mtime:      stat.mtimeMs,
-        symbols:    new Map(this._symbols),
-        callEdges:  new Map(this._callEdges),
-        importEdges: new Map(this._importEdges),
-      });
-
-      const isV1 = data.version !== 2;
-      const formatLabel = isV1 ? 'v1 legacy' : 'v2 path-dictionary';
-      console.log(`[CodeGraph] 📂 Loaded from disk: ${this._symbols.size} symbols (${formatLabel}, cached for reuse)`);
-
-      // P1: Build inverted token index for semantic search
-      this._buildTokenIndex();
-
-      // ── Auto-upgrade: if v1 format detected, schedule async re-write as v2 ──
-      // This upgrades the on-disk file without triggering a full build().
-      // The in-memory data is already in expanded (canonical) format, so we just
-      // need to call _writeOutput() which always writes v2 path-dictionary format.
-      if (isV1 && this._symbols.size > 0) {
-        this._needsFormatUpgrade = true;
-        this._scheduleFormatUpgrade(jsonPath);
-      }
-    } catch (err) {
-      console.warn(`[CodeGraph] Failed to load from disk: ${err.message}`);
-    }
-  }
-
-  /**
-   * Schedule a non-blocking async re-write of code-graph.json in v2 format.
-   * Called by _loadFromDisk() when it detects a v1 legacy file on disk.
-   *
-   * The in-memory data is already expanded (identical to post-build state),
-   * so we only need _writeOutput() – no build() or source scanning required.
-   *
-   * The upgrade is fire-and-forget: it won't block any query API call.
-   * Duplicate invocations are de-duplicated via _upgradePromise.
-   * @private
-   */
-  _scheduleFormatUpgrade(jsonPath) {
-    // Prevent duplicate upgrade writes (guard against concurrent calls)
-    if (this._upgradePromise) return;
-
-    console.log(`[CodeGraph] 🔄 Auto-upgrade: scheduling v1 → v2 format re-write for ${path.basename(jsonPath)}`);
-
-    // Use setImmediate (or setTimeout 0) so the upgrade runs after the
-    // current synchronous _loadFromDisk() call stack returns, keeping the
-    // calling query API responsive.
-    this._upgradePromise = new Promise((resolve) => {
-      const run = () => {
-        try {
-          const result = this._writeOutput();
-          this._needsFormatUpgrade = false;
-          this._upgradePromise = null;
-          if (result) {
-            console.log(`[CodeGraph] ✅ Auto-upgrade: v1 → v2 re-write complete`);
-          }
-        } catch (err) {
-          console.warn(`[CodeGraph] ⚠️  Auto-upgrade failed (non-fatal): ${err.message}`);
-          this._upgradePromise = null;
-        }
-        resolve();
-      };
-      // setImmediate is available in Node.js; fallback to setTimeout(0) for safety
-      if (typeof setImmediate === 'function') {
-        setImmediate(run);
-      } else {
-        setTimeout(run, 0);
-      }
-    });
-  }
+  // ─── P1-1: _loadFromDisk / _scheduleFormatUpgrade → code-graph-cache.js ──
 
   /**
    * Builds the query result object for a found symbol.
@@ -1428,6 +1060,107 @@ class CodeGraph {
       // P0: Symbol importance weight (normalised 0-1)
       importanceWeight: this.getImportanceWeight(sym.id),
     };
+  }
+
+  // ─── P2-1: Code Graph ↔ Project Profiler Fusion ───────────────────────────
+
+  /**
+   * Inject or update the tech profile at runtime (after construction).
+   * Useful when the profiler runs AFTER the code graph is instantiated.
+   *
+   * @param {object} profile - Tech profile object from ProjectProfiler or detectTechStack()
+   */
+  setTechProfile(profile) {
+    this._techProfile = profile || null;
+  }
+
+  /**
+   * Returns structured statistics from the code graph for consumption by
+   * ProjectProfiler, providing evidence-based signals for architecture inference.
+   *
+   * This is the "graph → profiler" fusion direction:
+   *   - Language distribution (actual file/symbol counts, not just extension detection)
+   *   - Symbol kind breakdown (classes vs functions vs interfaces)
+   *   - Module coupling metrics (import density, fan-in/fan-out)
+   *   - Framework indicators (symbols with names matching common framework patterns)
+   *
+   * @returns {object} Structured stats for profiler consumption
+   */
+  getCodeGraphStats() {
+    if (this._symbols.size === 0) this._loadFromDisk();
+    if (this._symbols.size === 0) return null;
+
+    // Language distribution (by extension)
+    const langDist = {};
+    const fileLangs = {};
+    for (const sym of this._symbols.values()) {
+      const ext = path.extname(sym.file) || 'unknown';
+      langDist[ext] = (langDist[ext] || 0) + 1;
+      fileLangs[sym.file] = ext;
+    }
+
+    // Symbol kind breakdown
+    const kindBreakdown = {};
+    for (const sym of this._symbols.values()) {
+      kindBreakdown[sym.kind] = (kindBreakdown[sym.kind] || 0) + 1;
+    }
+
+    // Module metrics (import density)
+    const fileCount = new Set([...this._symbols.values()].map(s => s.file)).size;
+    const importCount = [...this._importEdges.values()].reduce((n, v) => n + v.length, 0);
+    const avgImportsPerFile = fileCount > 0 ? (importCount / fileCount).toFixed(1) : 0;
+
+    // Framework indicators: detect common patterns in symbol names
+    const frameworkIndicators = [];
+    const patterns = {
+      'express/koa':     /^(app|router|middleware)\./i,
+      'react':           /^(use[A-Z]|render|Component|Provider)/,
+      'angular':         /(Component|Service|Module|Directive|Pipe)$/,
+      'spring':          /(Controller|Service|Repository|Entity|Config)$/,
+      'django':          /^(views?|models?|serializers?|urls?)\./,
+      'flutter':         /(Widget|State|Provider|Bloc|Cubit)$/,
+      'unity':           /(MonoBehaviour|ScriptableObject|Component)$/,
+    };
+    for (const [framework, pattern] of Object.entries(patterns)) {
+      let matchCount = 0;
+      for (const sym of this._symbols.values()) {
+        if (pattern.test(sym.name)) matchCount++;
+      }
+      if (matchCount >= 3) {
+        frameworkIndicators.push({ framework, matchCount });
+      }
+    }
+    frameworkIndicators.sort((a, b) => b.matchCount - a.matchCount);
+
+    return {
+      symbolCount: this._symbols.size,
+      fileCount,
+      edgeCount: [...this._callEdges.values()].reduce((n, v) => n + v.length, 0),
+      importCount,
+      avgImportsPerFile: Number(avgImportsPerFile),
+      languageDistribution: langDist,
+      kindBreakdown,
+      frameworkIndicators,
+      // Top 5 most-connected modules (highest import fan-in)
+      topModules: this._getTopModulesByFanIn(5),
+    };
+  }
+
+  /**
+   * @private
+   * @param {number} topN
+   */
+  _getTopModulesByFanIn(topN) {
+    const fanIn = {};
+    for (const imports of this._importEdges.values()) {
+      for (const imp of imports) {
+        fanIn[imp] = (fanIn[imp] || 0) + 1;
+      }
+    }
+    return Object.entries(fanIn)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, topN)
+      .map(([file, count]) => ({ file, importedBy: count }));
   }
 
   /**
@@ -1692,74 +1425,6 @@ class CodeGraph {
     return lines.join('\n');
   }
 
-  /**
-   * Format hotspot analysis results as Markdown (for /graph hotspot command).
-   * @param {number} [topN=20]
-   * @returns {string}
-   */
-  hotspotsAsMarkdown(topN = 20) {
-    if (this._symbols.size === 0) this._loadFromDisk();
-    if (this._symbols.size === 0) return '_Code graph not available._';
-
-    const hotspots = this.getHotspots({ topN });
-    if (hotspots.length === 0) return '_No hotspot data available. Run `/graph build` first._';
-
-    const stats = this.getCategoryStats();
-    const categoryEmoji = { utility: '🔧', foundation: '🏗️', hub: '🔀', entry: '🚪', leaf: '🍃', orphan: '👻' };
-    const categoryLabel = { utility: 'Utility', foundation: 'Foundation', hub: 'Hub', entry: 'Entry', leaf: 'Leaf', orphan: 'Orphan' };
-
-    const lines = [
-      `## 🔥 Hotspot Analysis (Top ${topN})`,
-      '',
-      `**Category distribution** (${stats.total} total symbols):`,
-      `| Category | Count | Description |`,
-      `|----------|-------|-------------|`,
-      `| 🔧 Utility    | ${stats.utility} | High calledBy, low calls-out (helper/tool functions) |`,
-      `| 🏗️ Foundation | ${stats.foundation} | Moderate+ calledBy, low calls-out (base class/core service) |`,
-      `| 🔀 Hub        | ${stats.hub} | High calledBy AND calls-out (central coordinator/manager) |`,
-      `| 🚪 Entry      | ${stats.entry} | Low calledBy, high calls-out (top-level entry/controller) |`,
-      `| 🍃 Leaf       | ${stats.leaf} | Low calledBy, low calls-out (isolated/leaf function) |`,
-      `| 👻 Orphan     | ${stats.orphan} | Zero refs in AND out (potentially dead code) |`,
-      '',
-      '### Top Referenced Symbols',
-      '',
-      '| # | Symbol | Category | ← Refs | → Calls | File |',
-      '|---|--------|----------|--------|---------|------|',
-    ];
-
-    for (let i = 0; i < hotspots.length; i++) {
-      const h = hotspots[i];
-      const s = h.symbol;
-      const emoji = categoryEmoji[h.category] || '📦';
-      const label = categoryLabel[h.category] || h.category;
-      lines.push(`| ${i + 1} | **${s.name}** | ${emoji} ${label} | ${h.calledByCount} | ${h.callsOutCount} | \`${s.file}\`:${s.line} |`);
-    }
-
-    lines.push('');
-    lines.push('### 💡 Insights');
-    lines.push('');
-
-    // Auto-generate insights
-    const utilities = hotspots.filter(h => h.category === 'utility');
-    const hubs = hotspots.filter(h => h.category === 'hub');
-    const entries = hotspots.filter(h => h.category === 'entry');
-
-    if (utilities.length > 0) {
-      lines.push(`- **🔧 ${utilities.length} utility symbols** are widely reused. Modifying them impacts many callers – always check reverse dependencies.`);
-    }
-    if (hubs.length > 0) {
-      lines.push(`- **🔀 ${hubs.length} hub symbols** are central coordinators with both high fan-in and fan-out. These are architecture bottlenecks – consider if they have too many responsibilities.`);
-    }
-    if (entries.length > 0) {
-      lines.push(`- **🚪 ${entries.length} entry points** call many functions but are rarely called themselves. These are good starting points for understanding business flows.`);
-    }
-    if (stats.orphan > 0) {
-      lines.push(`- **👻 ${stats.orphan} orphan symbols** have zero connections. Review if they are genuinely unused or just not yet connected.`);
-    }
-
-    return lines.join('\n');
-  }
-
   // ─── Symbol Extraction ────────────────────────────────────────────────────
   // P2-A: These methods have been extracted to code-graph-parsers.js
   // and are mixed in via Object.assign at the bottom of this file.
@@ -1774,583 +1439,8 @@ class CodeGraph {
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
 
-  // ─── P0 Lazy Enrichment ─────────────────────────────────────────────────────
-  // "Scan shallow, query deep" – during scan we only store skeleton info (name,
-  // file, line). At query time we lazily read ~30 source lines around the symbol
-  // to fill in missing signature, summary, and structural relationships.
-  // Results are cached in-memory (never written back to JSON) so each symbol
-  // is enriched at most once per process lifetime.
-
-  /**
-   * Read a small window of source lines from disk.
-   * Returns an array of raw line strings (0-indexed).
-   *
-   * @param {string} relPath - Relative file path (as stored in symbol.file)
-   * @param {number} startLine - 1-based start line
-   * @param {number} count - Number of lines to read
-   * @returns {string[]}
-   * @private
-   */
-  _readSourceLines(relPath, startLine, count) {
-    try {
-      const absPath = path.join(this._root, relPath);
-      if (!fs.existsSync(absPath)) return [];
-      const content = fs.readFileSync(absPath, 'utf-8');
-      const lines = content.split('\n');
-      const start = Math.max(0, startLine - 1); // convert 1-based → 0-based
-      return lines.slice(start, start + count);
-    } catch (_) {
-      return [];
-    }
-  }
-
-  /**
-   * Infer a human-readable summary from a CamelCase / snake_case symbol name.
-   * e.g. "CSResReportTrackDownload" → "CS Res Report Track Download"
-   *      "get_user_profile"         → "get user profile"
-   *
-   * @param {string} name
-   * @returns {string}
-   * @private
-   */
-  _inferSummaryFromName(name) {
-    if (!name || name.length < 4) return '';
-    // Strip common prefixes that don't add meaning
-    let clean = name;
-    // CamelCase split
-    const words = clean
-      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')  // camelCase → camel Case
-      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2') // ABCDef → ABC Def
-      .replace(/_/g, ' ')                        // snake_case → snake case
-      .replace(/:/g, ' ')                         // Lua Foo:Bar → Foo Bar
-      .split(/\s+/)
-      .filter(w => w.length > 0);
-    if (words.length <= 1) return '';
-    return words.join(' ');
-  }
-
-  /**
-   * Extract inheritance/extends info from a source line.
-   * Supports: JS/TS (extends), C# (: Base, IFoo), Go (embedding), Python (class Foo(Bar)).
-   *
-   * @param {string} declLine - The declaration line
-   * @param {string} ext - File extension
-   * @returns {string[]} List of parent/interface names
-   * @private
-   */
-  _extractInheritance(declLine, ext) {
-    if (!declLine) return [];
-    const trimmed = declLine.trim();
-    const parents = [];
-
-    if (ext === '.js' || ext === '.ts' || ext === '.dart') {
-      // class Foo extends Bar implements IBaz, IQux
-      const extendsMatch = trimmed.match(/extends\s+([\w.]+)/);
-      if (extendsMatch) parents.push(extendsMatch[1]);
-      const implMatch = trimmed.match(/implements\s+([\w.,\s]+)/);
-      if (implMatch) {
-        parents.push(...implMatch[1].split(',').map(s => s.trim()).filter(Boolean));
-      }
-    } else if (ext === '.cs') {
-      // class Foo : Bar, IFoo, IBaz
-      const colonMatch = trimmed.match(/(?:class|struct|interface)\s+\w+\s*(?:<[^>]+>)?\s*:\s*([^{]+)/);
-      if (colonMatch) {
-        parents.push(...colonMatch[1].split(',').map(s => s.trim().replace(/<.*>/, '')).filter(Boolean));
-      }
-    } else if (ext === '.py') {
-      // class Foo(Bar, Baz):
-      const pyMatch = trimmed.match(/class\s+\w+\s*\(([^)]+)\)/);
-      if (pyMatch) {
-        parents.push(...pyMatch[1].split(',').map(s => s.trim()).filter(s => s && s !== 'object'));
-      }
-    } else if (ext === '.go') {
-      // Go uses struct embedding – look for embedded type names in subsequent lines
-      // (handled separately in enrichSymbol since we need multi-line context)
-    }
-
-    return parents;
-  }
-
-  /**
-   * Extract key members (fields + methods) from class body lines.
-   * Returns a compact summary like: "fields: x, y, z | methods: foo, bar"
-   *
-   * @param {string[]} lines - Source lines of the class body
-   * @param {string} ext - File extension
-   * @returns {{ fields: string[], methods: string[] }}
-   * @private
-   */
-  _extractClassMembers(lines, ext) {
-    const fields = [];
-    const methods = [];
-    const maxScan = Math.min(lines.length, 50); // Don't scan more than 50 lines
-
-    for (let i = 0; i < maxScan; i++) {
-      const line = lines[i].trim();
-      if (!line || line.startsWith('//') || line.startsWith('/*') || line.startsWith('*')) continue;
-
-      if (ext === '.cs') {
-        // public int Foo { get; set; } or public string Bar;
-        const fieldMatch = line.match(/^public\s+(?:static\s+)?([\w<>\[\]?,]+)\s+(\w+)\s*[{;=]/);
-        if (fieldMatch && !line.includes('(')) {
-          fields.push(fieldMatch[2]);
-          continue;
-        }
-        // public void DoSomething(...)
-        const methodMatch = line.match(/^(?:public|protected|internal)\s+(?:static\s+|override\s+|virtual\s+|async\s+)*[\w<>\[\]?,\s]+?\s+(\w+)\s*\(/);
-        if (methodMatch && !['if', 'while', 'for', 'foreach', 'switch', 'using', 'return'].includes(methodMatch[1])) {
-          methods.push(methodMatch[1]);
-          continue;
-        }
-      } else if (ext === '.js' || ext === '.ts') {
-        // method(...) { or async method(...) {
-        const mMatch = line.match(/^(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{/);
-        if (mMatch && !['if', 'for', 'while', 'switch', 'catch', 'constructor'].includes(mMatch[1])) {
-          methods.push(mMatch[1]);
-          continue;
-        }
-        // this.foo = ... or readonly foo: ...
-        const fMatch = line.match(/^(?:this\.)?(\w+)\s*[:=]/) || line.match(/^(?:readonly|private|public|protected)\s+(?:\w+\s+)?(\w+)/);
-        if (fMatch && !line.includes('(')) {
-          fields.push(fMatch[1]);
-        }
-      } else if (ext === '.py') {
-        const defMatch = line.match(/^def\s+(\w+)\s*\(/);
-        if (defMatch && defMatch[1] !== '__init__') {
-          methods.push(defMatch[1]);
-          continue;
-        }
-        const selfMatch = line.match(/^self\.(\w+)\s*=/);
-        if (selfMatch) fields.push(selfMatch[1]);
-      }
-    }
-
-    return {
-      fields: [...new Set(fields)].slice(0, 10),
-      methods: [...new Set(methods)].slice(0, 10),
-    };
-  }
-
-  /**
-   * Extract the full function signature from source lines (return type + full params).
-   * The scan-time extraction truncates params at 40 chars; this recovers the full signature.
-   *
-   * @param {string[]} lines - Source lines starting from the function declaration
-   * @param {string} ext - File extension
-   * @returns {string} Full signature like "async (req: Request, res: Response): Promise<void>"
-   * @private
-   */
-  _extractFullSignature(lines, ext) {
-    if (!lines || lines.length === 0) return '';
-    // Join first few lines to handle multi-line signatures
-    const joined = lines.slice(0, 5).join(' ').replace(/\s+/g, ' ');
-    // Also keep just the first line for priority matching (avoids matching body code)
-    const firstLine = (lines[0] || '').replace(/\s+/g, ' ');
-
-    if (ext === '.cs') {
-      // public static async Task<Result> MethodName(Type1 arg1, Type2 arg2)
-      const m = joined.match(/(?:public|private|protected|internal)\s+(?:static\s+|override\s+|virtual\s+|async\s+)*([\w<>\[\]?,\s]+?)\s+\w+\s*\(([^)]*)\)/);
-      if (m) return `${m[1].trim()} (${m[2].trim()})`.slice(0, 120);
-    } else if (ext === '.js' || ext === '.ts') {
-      // function foo(a, b, c) or method(a: Type, b: Type): ReturnType
-      // Priority: match the FIRST LINE only to avoid picking up body code patterns
-      // like (ext === '.py') being confused for a parameter list.
-      const jsRe = /(?:function\s+\w+|\w+)\s*\(([^)]*)\)(?:\s*:\s*([\w<>\[\]|&,\s]+))?/;
-      const m = firstLine.match(jsRe) || joined.match(jsRe);
-      if (m) {
-        const params = m[1].trim();
-        const ret = m[2] ? `: ${m[2].trim()}` : '';
-        return `(${params})${ret}`.slice(0, 120);
-      }
-    } else if (ext === '.go') {
-      // func (r *Recv) Name(args) (returns)
-      const m = joined.match(/func\s+(?:\([^)]+\)\s+)?\w+\s*\(([^)]*)\)\s*(\([^)]*\)|[\w*]+)?/);
-      if (m) {
-        const params = m[1].trim();
-        const ret = m[2] ? ` ${m[2].trim()}` : '';
-        return `(${params})${ret}`.slice(0, 120);
-      }
-    } else if (ext === '.py') {
-      // def foo(self, a: int, b: str) -> RetType:
-      const m = joined.match(/def\s+\w+\s*\(([^)]*)\)(?:\s*->\s*([\w\[\],\s]+))?/);
-      if (m) {
-        const params = m[1].trim();
-        const ret = m[2] ? ` -> ${m[2].trim()}` : '';
-        return `(${params})${ret}`.slice(0, 120);
-      }
-    } else if (ext === '.lua') {
-      const m = joined.match(/function\s+[\w.:]+\s*\(([^)]*)\)/);
-      if (m) return `(${m[1].trim()})`.slice(0, 120);
-    } else if (ext === '.dart') {
-      const m = joined.match(/(?:[\w<>?]+\s+)+\w+\s*\(([^)]*)\)/);
-      if (m) return `(${m[1].trim()})`.slice(0, 120);
-    }
-
-    return '';
-  }
-
-  /**
-   * Extract the constructor signature from a class body.
-   * Looks for constructor/init/__init__/New methods within the first ~30 lines.
-   *
-   * @param {string[]} lines - Lines starting from class declaration
-   * @param {string} ext - File extension
-   * @returns {string} Constructor parameter list, or ''
-   * @private
-   */
-  _extractConstructorSignature(lines, ext) {
-    if (!lines || lines.length === 0) return '';
-    const bodyLines = lines.slice(1, 30).join(' ').replace(/\s+/g, ' ');
-
-    if (ext === '.js' || ext === '.ts') {
-      const m = bodyLines.match(/constructor\s*\(([^)]*)\)/);
-      if (m) return `constructor(${m[1].trim()})`.slice(0, 120);
-    } else if (ext === '.cs') {
-      // C# constructor: ClassName(params)
-      const className = (lines[0] || '').match(/(?:class|struct)\s+(\w+)/);
-      if (className) {
-        const re = new RegExp(className[1] + '\\s*\\(([^)]*)\\)');
-        const m = bodyLines.match(re);
-        if (m) return `${className[1]}(${m[1].trim()})`.slice(0, 120);
-      }
-    } else if (ext === '.py') {
-      const m = bodyLines.match(/def\s+__init__\s*\(([^)]*)\)/);
-      if (m) {
-        const params = m[1].replace(/\s*self\s*,?\s*/, '').trim();
-        return `__init__(${params})`.slice(0, 120);
-      }
-    } else if (ext === '.go') {
-      // Go: func NewTypeName(params) *TypeName
-      const className = (lines[0] || '').match(/type\s+(\w+)/);
-      if (className) {
-        // Look for func New<TypeName> in nearby lines
-        const allLines = lines.join(' ');
-        const re = new RegExp('func\\s+New' + className[1] + '\\s*\\(([^)]*)\\)');
-        const m = allLines.match(re);
-        if (m) return `New${className[1]}(${m[1].trim()})`.slice(0, 120);
-      }
-    } else if (ext === '.dart') {
-      const className = (lines[0] || '').match(/class\s+(\w+)/);
-      if (className) {
-        const re = new RegExp(className[1] + '\\s*\\(([^)]*)\\)');
-        const m = bodyLines.match(re);
-        if (m) return `${className[1]}(${m[1].trim()})`.slice(0, 120);
-      }
-    }
-
-    return '';
-  }
-
-  /**
-   * Extract a class-level declaration signature.
-   * Returns the class declaration without the body (e.g. "class Foo extends Bar implements IBaz").
-   *
-   * @param {string} declLine - The class declaration line
-   * @param {string} ext - File extension
-   * @returns {string} Class declaration signature, or ''
-   * @private
-   */
-  _extractClassDeclSignature(declLine, ext) {
-    if (!declLine) return '';
-    const trimmed = declLine.trim()
-      .replace(/\s*\{?\s*$/, '') // remove trailing {
-      .replace(/\s+/g, ' ');
-
-    if (ext === '.js' || ext === '.ts' || ext === '.dart') {
-      const m = trimmed.match(/((?:export\s+)?(?:abstract\s+)?class\s+\w+(?:\s+extends\s+[\w.]+)?(?:\s+implements\s+[\w.,\s]+)?)/);
-      if (m) return m[1].slice(0, 120);
-    } else if (ext === '.cs') {
-      const m = trimmed.match(/((?:public|internal|abstract|sealed|partial|static)\s+)*(?:class|struct|interface)\s+\w+(?:\s*<[^>]+>)?(?:\s*:\s*[^{]+)?/);
-      if (m) return m[0].trim().slice(0, 120);
-    } else if (ext === '.py') {
-      const m = trimmed.match(/(class\s+\w+(?:\s*\([^)]*\))?)/);
-      if (m) return m[1].slice(0, 120);
-    } else if (ext === '.go') {
-      const m = trimmed.match(/(type\s+\w+\s+(?:struct|interface))/);
-      if (m) return m[1].slice(0, 120);
-    }
-
-    return '';
-  }
-
-  /**
-   * Infer a summary from a symbol's name, kind, and structural context.
-   * Much richer than a simple CamelCase split – uses kind-specific templates
-   * and parameter information to generate meaningful descriptions.
-   *
-   * Examples:
-   *   - class ExperienceStore → "Storage/management class for experiences"
-   *   - function buildAgentPrompt(role, input) → "Builds agent prompt from role and input"
-   *   - method _extractCallEdges → "Extracts call edges (internal)"
-   *
-   * @param {object} sym - Symbol entry (with kind, name, signature, _constructorSignature)
-   * @returns {string} Human-readable inferred summary, or ''
-   * @private
-   */
-  _inferSummaryFromContext(sym) {
-    if (!sym.name || sym.name.length < 4) return '';
-
-    // CamelCase/snake_case split into words
-    const words = sym.name
-      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
-      .replace(/_/g, ' ')
-      .replace(/:/g, ' ')
-      .split(/\s+/)
-      .filter(w => w.length > 0)
-      .map(w => w.toLowerCase());
-
-    if (words.length <= 1) return '';
-
-    const isPrivate = sym.name.startsWith('_');
-    const privateSuffix = isPrivate ? ' (internal)' : '';
-
-    // ── Kind-specific templates ──
-
-    if (sym.kind === 'class' || sym.kind === 'interface') {
-      // Identify common naming patterns
-      const nameLower = words.join(' ');
-
-      // Pattern: *Store, *Cache, *Repository, *Manager → storage/management
-      if (/store|cache|repository|registry/.test(nameLower)) {
-        const subject = words.filter(w => !/store|cache|repository|registry/.test(w)).join(' ');
-        return `Storage/management class for ${subject || 'data'}`;
-      }
-      // Pattern: *Engine, *Processor, *Handler → processing
-      if (/engine|processor|handler|worker/.test(nameLower)) {
-        const subject = words.filter(w => !/engine|processor|handler|worker/.test(w)).join(' ');
-        return `Processing engine for ${subject || 'tasks'}`;
-      }
-      // Pattern: *Builder, *Factory, *Creator → construction
-      if (/builder|factory|creator/.test(nameLower)) {
-        const subject = words.filter(w => !/builder|factory|creator/.test(w)).join(' ');
-        return `Constructs ${subject || 'objects'}`;
-      }
-      // Pattern: *Adapter, *Bridge, *Wrapper → adaptation
-      if (/adapter|bridge|wrapper|proxy/.test(nameLower)) {
-        const subject = words.filter(w => !/adapter|bridge|wrapper|proxy/.test(w)).join(' ');
-        return `Adapter/wrapper for ${subject || 'external interface'}`;
-      }
-      // Pattern: *Loader, *Reader, *Parser → data loading
-      if (/loader|reader|parser|scanner/.test(nameLower)) {
-        const subject = words.filter(w => !/loader|reader|parser|scanner/.test(w)).join(' ');
-        return `Loads/parses ${subject || 'data'}`;
-      }
-      // Pattern: I* (interface)
-      if (sym.kind === 'interface' || sym.name.startsWith('I') && /^I[A-Z]/.test(sym.name)) {
-        return `Interface for ${words.filter(w => w !== 'i').join(' ')}`;
-      }
-      // Generic class
-      return `${words.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')} class`;
-    }
-
-    if (sym.kind === 'function' || sym.kind === 'method') {
-      const verb = words[0];
-      const rest = words.slice(1).join(' ');
-
-      // Extract parameter names for richer context
-      let paramHint = '';
-      const sig = sym.signature || sym._constructorSignature || '';
-      if (sig) {
-        const paramMatch = sig.match(/\(([^)]*)\)/);
-        if (paramMatch && paramMatch[1].trim()) {
-          const params = paramMatch[1].split(',')
-            .map(p => p.trim().split(/[\s:=]/)[0].replace(/^\.\.\./, ''))
-            .filter(p => p && p !== 'self' && p !== 'this' && p.length > 1)
-            .slice(0, 3);
-          if (params.length > 0) {
-            paramHint = ` from ${params.join(' and ')}`;
-          }
-        }
-      }
-
-      // Common verb templates
-      const verbTemplates = {
-        'get': `Gets ${rest}${paramHint}`,
-        'set': `Sets ${rest}${paramHint}`,
-        'build': `Builds ${rest}${paramHint}`,
-        'create': `Creates ${rest}${paramHint}`,
-        'init': `Initializes ${rest}${paramHint}`,
-        'load': `Loads ${rest}${paramHint}`,
-        'save': `Saves ${rest}${paramHint}`,
-        'parse': `Parses ${rest}${paramHint}`,
-        'extract': `Extracts ${rest}${paramHint}`,
-        'find': `Finds ${rest}${paramHint}`,
-        'search': `Searches for ${rest}${paramHint}`,
-        'check': `Checks ${rest}${paramHint}`,
-        'validate': `Validates ${rest}${paramHint}`,
-        'is': `Checks if ${rest}`,
-        'has': `Checks if has ${rest}`,
-        'should': `Determines if should ${rest}`,
-        'can': `Checks ability to ${rest}`,
-        'handle': `Handles ${rest}${paramHint}`,
-        'on': `Event handler for ${rest}`,
-        'emit': `Emits ${rest} event`,
-        'render': `Renders ${rest}${paramHint}`,
-        'update': `Updates ${rest}${paramHint}`,
-        'delete': `Deletes ${rest}${paramHint}`,
-        'remove': `Removes ${rest}${paramHint}`,
-        'add': `Adds ${rest}${paramHint}`,
-        'apply': `Applies ${rest}${paramHint}`,
-        'process': `Processes ${rest}${paramHint}`,
-        'run': `Runs ${rest}${paramHint}`,
-        'execute': `Executes ${rest}${paramHint}`,
-        'format': `Formats ${rest}${paramHint}`,
-        'convert': `Converts ${rest}${paramHint}`,
-        'transform': `Transforms ${rest}${paramHint}`,
-        'calculate': `Calculates ${rest}${paramHint}`,
-        'compute': `Computes ${rest}${paramHint}`,
-        'generate': `Generates ${rest}${paramHint}`,
-        'resolve': `Resolves ${rest}${paramHint}`,
-        'register': `Registers ${rest}${paramHint}`,
-        'setup': `Sets up ${rest}${paramHint}`,
-        'reset': `Resets ${rest}`,
-        'clear': `Clears ${rest}`,
-        'dispose': `Disposes/cleans up ${rest}`,
-        'destroy': `Destroys ${rest}`,
-        'start': `Starts ${rest}`,
-        'stop': `Stops ${rest}`,
-        'open': `Opens ${rest}`,
-        'close': `Closes ${rest}`,
-        'send': `Sends ${rest}${paramHint}`,
-        'receive': `Receives ${rest}`,
-        'read': `Reads ${rest}${paramHint}`,
-        'write': `Writes ${rest}${paramHint}`,
-        'fetch': `Fetches ${rest}${paramHint}`,
-        'notify': `Notifies ${rest}`,
-        'subscribe': `Subscribes to ${rest}`,
-        'unsubscribe': `Unsubscribes from ${rest}`,
-        'merge': `Merges ${rest}${paramHint}`,
-        'sort': `Sorts ${rest}`,
-        'filter': `Filters ${rest}${paramHint}`,
-        'map': `Maps ${rest}`,
-        'reduce': `Reduces ${rest}`,
-      };
-
-      const template = verbTemplates[verb];
-      if (template) return `${template}${privateSuffix}`;
-
-      // No template match → generic: "Verb noun noun"
-      return `${words.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}${paramHint}${privateSuffix}`;
-    }
-
-    if (sym.kind === 'enum') {
-      return `Enumeration of ${words.join(' ')} values`;
-    }
-
-    // Fallback: CamelCase split (same as old _inferSummaryFromName)
-    return words.join(' ');
-  }
-
-  /**
-   * Lazily enrich a symbol with detailed information from source code.
-   * Called at query time (not scan time) to fill missing signature, summary,
-   * inheritance, and class members. Results are cached in-memory.
-   *
-   * Cost: ~1-5ms per symbol (single disk read of ~30 lines).
-   *
-   * @param {object} sym - Symbol entry from the index
-   * @returns {object} Enriched symbol (same object, mutated with _enriched fields)
-   * @private
-   */
-  _enrichSymbol(sym) {
-    if (sym._enriched) return sym;
-    sym._enriched = true;
-
-    // Preserve original scan-time signature so _writeOutput() serializes the
-    // stable scan value, not the enriched (potentially overwritten) version.
-    sym._originalSignature = sym.signature || '';
-
-    const ext = path.extname(sym.file);
-    // Read a window of source lines: 5 lines before (for comments) + 30 lines after
-    const lines = this._readSourceLines(sym.file, Math.max(1, sym.line - 5), 40);
-    if (lines.length === 0) return sym;
-
-    // The declaration line is approximately at index 5 (since we started 5 lines before)
-    const declOffset = Math.min(5, sym.line - 1);
-    const declLine = lines[declOffset] || '';
-
-    // ── 1. Full Signature (replace truncated 40-char version) ──
-    // For classes: extract constructor parameters (not the class declaration itself)
-    // to distinguish from function signatures.
-    if (!sym.signature || sym.signature.length >= 39) {
-      if (sym.kind === 'class' || sym.kind === 'interface') {
-        // For class-like symbols, look for constructor signature in the body
-        const ctorSig = this._extractConstructorSignature(lines.slice(declOffset), ext);
-        if (ctorSig) {
-          sym._constructorSignature = ctorSig; // separate field for class constructor
-        }
-        // Class-level signature: the declaration line itself (e.g. "class Foo extends Bar")
-        const classDeclSig = this._extractClassDeclSignature(declLine, ext);
-        if (classDeclSig) sym.signature = classDeclSig;
-      } else {
-        const fullSig = this._extractFullSignature(lines.slice(declOffset), ext);
-        if (fullSig) sym.signature = fullSig;
-      }
-    }
-
-    // ── 2. Inheritance / Extends ──
-    if (sym.kind === 'class' || sym.kind === 'interface' || sym.kind === 'enum') {
-      sym._extends = this._extractInheritance(declLine, ext);
-
-      // Go struct embedding: look for indented type names in body
-      if (ext === '.go' && sym._extends.length === 0) {
-        for (let i = declOffset + 1; i < Math.min(lines.length, declOffset + 15); i++) {
-          const bodyLine = (lines[i] || '').trim();
-          if (bodyLine === '}') break;
-          // Embedded type: just a type name on its own line (e.g. "  BaseStruct")
-          const embedMatch = bodyLine.match(/^(\*?[A-Z]\w+)$/);
-          if (embedMatch) sym._extends.push(embedMatch[1]);
-        }
-      }
-
-      // ── 3. Class Members Summary ──
-      const members = this._extractClassMembers(lines.slice(declOffset + 1), ext);
-      sym._fields = members.fields;
-      sym._methods = members.methods;
-    }
-
-    // ── 4. Inferred Summary (when no doc comment was found) ──
-    if (!sym.summary) {
-      // First try: look for inline comment on declaration line
-      const inlineComment = declLine.match(/\/\/\s*(.+)$/) || declLine.match(/--\s*(.+)$/);
-      if (inlineComment) {
-        sym.summary = inlineComment[1].trim().slice(0, 80);
-      } else {
-        // Second try: look for comment block in the 5 lines before declaration
-        for (let i = declOffset - 1; i >= 0; i--) {
-          const prev = (lines[i] || '').trim();
-          if (prev.startsWith('//') || prev.startsWith('--') || prev.startsWith('#')) {
-            const cleaned = prev.replace(/^[\/\/#-]+\s*/, '').trim();
-            // Skip decorative separator lines (e.g. "// ─────────", "// === Foo ===", "// --- Bar ---")
-            const decorChars = (cleaned.match(/[─━═\-=~*#_]/g) || []).length;
-            if (decorChars > cleaned.length * 0.4) continue;
-            if (cleaned && !cleaned.startsWith('<') && !cleaned.startsWith('@') && cleaned.length > 5) {
-              sym.summary = cleaned.slice(0, 80);
-              break;
-            }
-          } else if (prev.startsWith('* ') && !prev.startsWith('*/')) {
-            const cleaned = prev.replace(/^\*\s*/, '').trim();
-            if (cleaned && !cleaned.startsWith('@') && !cleaned.startsWith('<') && cleaned.length > 5) {
-              sym.summary = cleaned.slice(0, 80);
-              break;
-            }
-          } else if (prev === '' || prev === '{' || prev === '}') {
-            continue; // skip blank lines
-          } else {
-            break; // non-comment, non-blank line → stop
-          }
-        }
-        // Third try: infer from name + structural context
-        if (!sym.summary) {
-          const inferred = this._inferSummaryFromContext(sym);
-          if (inferred) sym._inferredSummary = inferred; // mark as inferred (not authoritative)
-        }
-      }
-    }
-
-    return sym;
-  }
+  // ─── P1-1: Enrichment extracted to code-graph-enrichment.js ──────────────
+  // _readSourceLines through _enrichSymbol → CodeGraphEnrichmentMixin.
 
   _findByName(name) {
     for (const sym of this._symbols.values()) {
@@ -2369,6 +1459,9 @@ class CodeGraph {
    * @private
    */
   _buildTokenIndex() {
+    // P1-2: Invalidate analysis caches when token index is rebuilt
+    this._calledByIndex = null;
+    this._importanceWeights = null;
     const t0 = Date.now();
     this._tokenIndex = new Map();
 
@@ -2609,127 +1702,7 @@ class CodeGraph {
     return results;
   }
 
-  // ─── Incremental Cache ────────────────────────────────────────────────────
-
-  /**
-   * Load the incremental build cache from disk.
-   * Returns null if no valid cache exists or format is incompatible.
-   * @param {string} cachePath
-   * @returns {object|null}
-   */
-  _loadCache(cachePath) {
-    try {
-      if (!fs.existsSync(cachePath)) return null;
-      const raw = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
-      // Validate cache version and project root
-      if (raw.version !== 1 || raw.projectRoot !== this._root) {
-        console.log(`[CodeGraph] ♻️  Cache invalidated (version or root mismatch)`);
-        return null;
-      }
-      console.log(`[CodeGraph] 📦 Cache loaded: ${Object.keys(raw.fileMtimes || {}).length} files cached`);
-      return raw;
-    } catch (err) {
-      console.warn(`[CodeGraph] ⚠️  Cache load failed: ${err.message}`);
-      return null;
-    }
-  }
-
-  /**
-   * Save the incremental build cache to disk.
-   * Stores: version, projectRoot, fileMtimes, symbols, callEdges, importEdges.
-   * @param {string} cachePath
-   * @param {string[]} files - All file absolute paths that were scanned
-   */
-  _saveCache(cachePath, files) {
-    try {
-      if (!fs.existsSync(this._outputDir)) {
-        fs.mkdirSync(this._outputDir, { recursive: true });
-      }
-
-      // P1-5: Use pre-collected _fileMtimes instead of re-statting all files.
-      // The build pass already stats each file during reading (incremental mtime
-      // comparison, or explicit stat after read). This eliminates N extra stat
-      // syscalls for large projects.
-      const fileMtimes = {};
-      for (const filePath of files) {
-        const relPath = path.relative(this._root, filePath).replace(/\\/g, '/');
-        const cached = this._fileMtimes.get(relPath);
-        if (cached != null) {
-          fileMtimes[relPath] = cached;
-        } else {
-          // Fallback: stat if somehow not recorded (shouldn't happen in normal flow)
-          try {
-            fileMtimes[relPath] = fs.statSync(filePath).mtimeMs;
-          } catch (_) { /* skip */ }
-        }
-      }
-
-      const cacheData = {
-        version:     1,
-        projectRoot: this._root,
-        savedAt:     new Date().toISOString(),
-        fileMtimes,
-        symbols:     [...this._symbols.values()],
-        callEdges:   Object.fromEntries(this._callEdges),
-        importEdges: Object.fromEntries(this._importEdges),
-      };
-
-      fs.writeFileSync(cachePath, JSON.stringify(cacheData), 'utf-8');
-      console.log(`[CodeGraph] 💾 Cache saved: ${Object.keys(fileMtimes).length} files`);
-    } catch (err) {
-      // If it's a string length error, try streaming write
-      if (err.message && err.message.includes('Invalid string length')) {
-        try {
-          console.log(`[CodeGraph] ⚠️  Cache too large for single stringify, using streaming write...`);
-          this._writeJsonStreaming(cachePath, cacheData);
-          console.log(`[CodeGraph] 💾 Cache saved (streamed): ${Object.keys(fileMtimes).length} files`);
-          return;
-        } catch (streamErr) {
-          console.warn(`[CodeGraph] ⚠️  Cache streaming write also failed: ${streamErr.message}`);
-        }
-      }
-      console.warn(`[CodeGraph] ⚠️  Cache save failed: ${err.message}`);
-    }
-  }
-
-  /**
-   * Restore symbols, call edges and import edges from cache, excluding
-   * files that have been removed or changed (those will be re-processed).
-   *
-   * @param {object} cache - The loaded cache object
-   * @param {string[]} removedFiles - Relative paths of files that no longer exist
-   * @param {string[]} changedFilesFull - Absolute paths of files that changed
-   */
-  _restoreFromCache(cache, removedFiles, changedFilesFull) {
-    const excludeSet = new Set([
-      ...removedFiles,
-      ...changedFilesFull.map(f => path.relative(this._root, f).replace(/\\/g, '/')),
-    ]);
-
-    // Restore symbols for unchanged files
-    for (const sym of (cache.symbols || [])) {
-      if (!excludeSet.has(sym.file)) {
-        this._symbols.set(sym.id, sym);
-      }
-    }
-
-    // Restore call edges for unchanged files
-    for (const [symId, callees] of Object.entries(cache.callEdges || {})) {
-      const file = symId.split('::')[0];
-      if (!excludeSet.has(file)) {
-        this._callEdges.set(symId, callees);
-      }
-    }
-
-    // Restore import edges for unchanged files
-    for (const [relPath, imports] of Object.entries(cache.importEdges || {})) {
-      if (!excludeSet.has(relPath)) {
-        this._importEdges.set(relPath, imports);
-      }
-    }
-
-    console.log(`[CodeGraph] ♻️  Restored from cache: ${this._symbols.size} symbols, ${this._callEdges.size} call edges`);
-  }
+  // ─── P1-1: Incremental Cache → code-graph-cache.js ──
 
   // ─── Worker Thread Pool (P3) ────────────────────────────────────────────
 
@@ -2883,9 +1856,11 @@ class CodeGraph {
         const content = fs.readFileSync(absPath, 'utf-8');
         const ext = path.extname(absPath);
         this._extractSymbols(content, relPath, ext);
-        this._extractImports(content, relPath, ext);
-        // P1: Cache word tokens (Set<string>) – much lighter than full content
-        tokenCache.set(relPath, new Set(content.match(/\b\w+\b/g) || []));
+        // P1: Strip comments/strings before import extraction to avoid false imports
+        const strippedContent = stripCommentsAndStrings(content, ext);
+        this._extractImports(strippedContent, relPath, ext);
+        // P1: Cache word tokens from stripped content (Set<string>) – much lighter than full content
+        tokenCache.set(relPath, new Set(strippedContent.match(/\b\w+\b/g) || []));
         processedCount++;
       } catch (err) {
         console.warn(`[CodeGraph]    Patch: skipped unreadable file ${relPath}: ${err.message}`);
@@ -2981,50 +1956,7 @@ class CodeGraph {
       return null;
     }
   }
-
-  /**
-   * Update the .code-graph-cache.json file's fileMtimes entries for a set of
-   * patched files. This ensures subsequent quickScan calls do not re-detect
-   * the same files as changed.
-   *
-   * This is a lightweight partial update – reads the cache, patches only the
-   * affected mtime entries, and writes back. Much cheaper than _saveCache()
-   * which rebuilds the entire cache including all symbols/callEdges/importEdges.
-   *
-   * @param {Set<string>} patchedRelPaths - Set of relative paths that were patched
-   * @private
-   */
-  _patchCacheMtimes(patchedRelPaths) {
-    const cachePath = path.join(this._outputDir, '.code-graph-cache.json');
-    try {
-      if (!fs.existsSync(cachePath)) return;
-      const raw = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
-      if (raw.version !== 1 || !raw.fileMtimes) return;
-
-      let updated = 0;
-      for (const relPath of patchedRelPaths) {
-        const absPath = path.join(this._root, relPath);
-        try {
-          const stat = fs.statSync(absPath);
-          raw.fileMtimes[relPath] = stat.mtimeMs;
-          updated++;
-        } catch (_) {
-          // File was deleted – remove from cache
-          delete raw.fileMtimes[relPath];
-          updated++;
-        }
-      }
-
-      if (updated > 0) {
-        raw.savedAt = new Date().toISOString();
-        fs.writeFileSync(cachePath, JSON.stringify(raw), 'utf-8');
-      }
-    } catch (err) {
-      // Non-fatal: cache mtime patch failure just means next quickScan
-      // may re-detect the same files, which is safe (just slightly slower).
-      console.warn(`[CodeGraph] ⚠️  Cache mtime patch failed (non-fatal): ${err.message}`);
-    }
-  }
+  // ─── P1-1: _patchCacheMtimes → code-graph-cache.js ──
 
   // ─── .gitignore Parser ──────────────────────────────────────────────────
 
@@ -3073,225 +2005,23 @@ class CodeGraph {
     }
   }
 
-  // ─── Output Writers ───────────────────────────────────────────────────────
-
-  /**
-   * Write a large JSON object to disk in chunks, avoiding the Node.js
-   * "Invalid string length" error that occurs when JSON.stringify() produces
-   * a string > ~512MB.
-   *
-   * Strategy: serialize each top-level key separately and write them one by one
-   * into a file stream. Arrays (symbols, filePaths, hotspots) are written
-   * element-by-element to keep each stringify call small.
-   *
-   * @param {string} filePath - Absolute path to write
-   * @param {object} data     - The JSON object to serialize
-   * @private
-   */
-  _writeJsonStreaming(filePath, data) {
-    const fd = fs.openSync(filePath, 'w');
-    try {
-      fs.writeSync(fd, '{');
-      const keys = Object.keys(data);
-      for (let ki = 0; ki < keys.length; ki++) {
-        const key = keys[ki];
-        const val = data[key];
-        // Write the key
-        fs.writeSync(fd, `${ki > 0 ? ',' : ''}${JSON.stringify(key)}:`);
-
-        if (Array.isArray(val)) {
-          // Stream array elements one by one
-          fs.writeSync(fd, '[');
-          for (let i = 0; i < val.length; i++) {
-            if (i > 0) fs.writeSync(fd, ',');
-            fs.writeSync(fd, JSON.stringify(val[i]));
-          }
-          fs.writeSync(fd, ']');
-        } else if (val && typeof val === 'object' && !Array.isArray(val)) {
-          // For objects (callEdges, importEdges, fileMtimes, etc.), stream entries
-          const entries = Object.entries(val);
-          if (entries.length > 1000) {
-            // Large object: stream entries
-            fs.writeSync(fd, '{');
-            for (let i = 0; i < entries.length; i++) {
-              if (i > 0) fs.writeSync(fd, ',');
-              fs.writeSync(fd, `${JSON.stringify(entries[i][0])}:${JSON.stringify(entries[i][1])}`);
-            }
-            fs.writeSync(fd, '}');
-          } else {
-            // Small object: single stringify is fine
-            fs.writeSync(fd, JSON.stringify(val));
-          }
-        } else {
-          // Primitives (version, generatedAt, projectRoot, symbolCount, etc.)
-          fs.writeSync(fd, JSON.stringify(val));
-        }
-      }
-      fs.writeSync(fd, '}');
-    } finally {
-      fs.closeSync(fd);
-    }
-  }
-
-  _writeOutput() {
-    try {
-      if (!fs.existsSync(this._outputDir)) {
-        fs.mkdirSync(this._outputDir, { recursive: true });
-      }
-
-      // Write JSON index (with hotspot data)
-      const jsonPath = path.join(this._outputDir, 'code-graph.json');
-      const hotspots = this.getHotspots({ topN: 30 });
-      const stats = this.getCategoryStats();
-
-      // ── Path Dictionary Compression (v2 format) ────────────────────────────
-      // Extracts all unique file paths into a dictionary array. Symbols, call
-      // edges, import edges and hotspots reference paths by numeric index.
-      // This eliminates massive path string duplication in the JSON output,
-      // reducing file size by ~70% for large projects (e.g. 120MB → ~35MB).
-      //
-      // Memory format is unchanged – compression only affects the disk format.
-      // _loadFromDisk() detects version:2 and expands indices back to full paths.
-
-      // Step 1: Collect all unique file paths and build path→index mapping
-      const pathSet = new Set();
-      for (const sym of this._symbols.values()) {
-        pathSet.add(sym.file);
-      }
-      for (const filePath of this._importEdges.keys()) {
-        pathSet.add(filePath);
-      }
-      const filePaths = [...pathSet];
-      const pathToIdx = new Map();
-      for (let i = 0; i < filePaths.length; i++) {
-        pathToIdx.set(filePaths[i], i);
-      }
-
-      // Step 2: Compress symbols – replace file path with index, drop redundant id field
-      // Original: { id: "path::name", kind, name, file: "path", line, signature, summary }
-      // Compact:  { f: <pathIdx>, k: kind, n: name, l: line, s?: signature, m?: summary }
-      const compactSymbols = [];
-      for (const sym of this._symbols.values()) {
-        const entry = {
-          f: pathToIdx.get(sym.file),
-          k: sym.kind,
-          n: sym.name,
-          l: sym.line,
-        };
-        // Only include non-empty optional fields to save space
-        // Use _originalSignature if available (preserves scan-time value, not
-        // enrichment-modified value) to keep the persisted data stable.
-        const sig = sym._enriched ? (sym._originalSignature || '') : (sym.signature || '');
-        if (sig) entry.s = sig;
-        if (sym.summary)   entry.m = sym.summary;
-        // P0: Persist importance weight (only for non-zero to save space)
-        const w = this._computeImportanceWeights().get(sym.id) || 0;
-        if (w > 0.01) entry.w = Math.round(w * 1000) / 1000; // 3 decimal precision
-        compactSymbols.push(entry);
-      }
-
-      // Step 3: Compress callEdges – replace full symbolId with "pathIdx::name"
-      // Original key:   "Assets/Scripts/Foo.cs::Bar"  →  "42::Bar"
-      // Original value:  ["Assets/Scripts/Baz.cs::Qux"]  →  ["17::Qux"]
-      const compressId = (symbolId) => {
-        const sepIdx = symbolId.indexOf('::');
-        if (sepIdx === -1) return symbolId; // fallback: no :: separator
-        const filePath = symbolId.substring(0, sepIdx);
-        const symName  = symbolId.substring(sepIdx + 2);
-        const idx = pathToIdx.get(filePath);
-        return idx !== undefined ? `${idx}::${symName}` : symbolId;
-      };
-
-      const compactCallEdges = {};
-      for (const [callerId, callees] of this._callEdges) {
-        compactCallEdges[compressId(callerId)] = callees.map(compressId);
-      }
-
-      // Step 4: Compress importEdges – keys are file paths (use index directly)
-      const compactImportEdges = {};
-      for (const [filePath, imports] of this._importEdges) {
-        const idx = pathToIdx.get(filePath);
-        const key = idx !== undefined ? String(idx) : filePath;
-        compactImportEdges[key] = imports;
-      }
-
-      // Step 5: Compress hotspots
-      const compactHotspots = hotspots.map(h => ({
-        f:  pathToIdx.get(h.symbol.file),
-        n:  h.symbol.name,
-        k:  h.symbol.kind,
-        l:  h.symbol.line,
-        cb: h.calledByCount,
-        co: h.callsOutCount,
-        c:  h.category,
-      }));
-
-      const graphData = {
-        version:       2,                     // v2 = path dictionary format
-        generatedAt:   new Date().toISOString(),
-        projectRoot:   this._root,
-        symbolCount:   this._symbols.size,
-        filePaths,                            // path dictionary: index → full path
-        symbols:       compactSymbols,
-        callEdges:     compactCallEdges,
-        importEdges:   compactImportEdges,
-        hotspots:      compactHotspots,
-        categoryStats: stats,
-      };
-
-      // P0 optimisation: write compact JSON (no pretty-print).
-      // P0 fix: Use streaming write for large projects to avoid "Invalid string length"
-      // error when JSON.stringify exceeds Node.js ~512MB string limit.
-      // For small projects (< 50K symbols), use fast single-pass stringify.
-      // For large projects, write JSON in chunks via a write stream.
-      if (this._symbols.size < 50000) {
-        fs.writeFileSync(jsonPath, JSON.stringify(graphData), 'utf-8');
-      } else {
-        this._writeJsonStreaming(jsonPath, graphData);
-      }
-
-      // P1: invalidate process-level cache so next _loadFromDisk() re-reads the new data
-      _processCache.delete(jsonPath);
-
-      // Write Markdown summary
-      const mdPath = path.join(this._outputDir, 'code-graph.md');
-      fs.writeFileSync(mdPath, this.toMarkdown(), 'utf-8');
-
-      // Auto-generate Chinese translation (non-blocking)
-      translateMdFile(mdPath, this._llmCall).catch(() => {});
-
-      console.log(`[CodeGraph] 📄 Written: ${jsonPath} (v2 path-dictionary format, ${filePaths.length} unique paths)`);
-      return jsonPath;
-    } catch (err) {
-      // If the error is "Invalid string length" (Node.js ~512MB limit),
-      // fall back to streaming write which bypasses the limit entirely.
-      if (err.message && err.message.includes('Invalid string length')) {
-        try {
-          console.log(`[CodeGraph] ⚠️  JSON too large for single stringify (${this._symbols.size} symbols), falling back to streaming write...`);
-          const jsonPath = path.join(this._outputDir, 'code-graph.json');
-          this._writeJsonStreaming(jsonPath, graphData);
-          _processCache.delete(jsonPath);
-          // Still write markdown (usually much smaller)
-          const mdPath = path.join(this._outputDir, 'code-graph.md');
-          fs.writeFileSync(mdPath, this.toMarkdown(), 'utf-8');
-          translateMdFile(mdPath, this._llmCall).catch(() => {});
-          console.log(`[CodeGraph] 📄 Written (streamed): ${jsonPath}`);
-          return jsonPath;
-        } catch (streamErr) {
-          console.warn(`[CodeGraph] ❌ Streaming write also failed: ${streamErr.message}`);
-          return null;
-        }
-      }
-      console.warn(`[CodeGraph] Failed to write output: ${err.message}`);
-      return null;
-    }
-  }
+  // ─── P1-1: Output Writers → code-graph-cache.js ──
 }
 
 // ─── P2-A: Apply Parser Mixin ─────────────────────────────────────────────────
-// Language-specific parsers extracted to code-graph-parsers.js for maintainability.
-// The mixin methods access this._symbols, this._callEdges, etc. on the instance.
-const { CodeGraphParsersMixin } = require('./code-graph-parsers');
+const { CodeGraphParsersMixin, stripCommentsAndStrings } = require('./code-graph-parsers');
 Object.assign(CodeGraph.prototype, CodeGraphParsersMixin);
 
+// ─── P1-1: Apply Analysis Mixin ──────────────────────────────────────────────
+const { CodeGraphAnalysisMixin } = require('./code-graph-analysis');
+Object.assign(CodeGraph.prototype, CodeGraphAnalysisMixin);
+
+// ─── P1-1: Apply Enrichment Mixin ───────────────────────────────────────────
+const { CodeGraphEnrichmentMixin } = require('./code-graph-enrichment');
+Object.assign(CodeGraph.prototype, CodeGraphEnrichmentMixin);
+
+// ─── P1-1: Apply Cache Mixin ────────────────────────────────────────────────
+const { CodeGraphCacheMixin, setProcessCache } = require('./code-graph-cache');
+setProcessCache(_processCache);
+Object.assign(CodeGraph.prototype, CodeGraphCacheMixin);
 module.exports = { CodeGraph, SymbolKind };

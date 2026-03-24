@@ -24,6 +24,7 @@ const { translateMdFile } = require('./i18n-translator');
 const {
   storePlannerContext,
 } = require('./orchestrator-stage-helpers');
+const { runEvoMapFeedback } = require('./stage-runner-utils');
 
 /**
  * Builds upstream context for the Planner from previous stages.
@@ -129,11 +130,20 @@ async function buildPlannerContextBlock(orch, upstreamCtx) {
     } catch (_) { /* non-fatal */ }
   }
 
-  const result = expContext || null;
-  if (result) result._injectedExpIds = _injectedExpIds;
-  return result;
+  // A-3 Architecture Fix: Return proper struct instead of setting expando on string.
+  // Previously `result._injectedExpIds = _injectedExpIds` was set on a primitive string,
+  // which silently fails (primitive strings cannot hold expando properties).
+  return { content: expContext || '', injectedExpIds: _injectedExpIds };
 }
 
+/**
+ * Runs the PLAN stage: execution planning, task decomposition, and dependency ordering.
+ *
+ * P1-2 fix: @this annotation for IDE IntelliSense and safe refactoring.
+ *
+ * @this {import('./orchestrator').Orchestrator}
+ * @returns {Promise<string>} Path to the generated execution-plan.md
+ */
 async function _runPlanner() {
   const planStageStartTime = Date.now();
   console.log(`\n[Orchestrator] Stage: PLAN (PlannerAgent — Kent Beck XP Planning)`);
@@ -150,13 +160,16 @@ async function _runPlanner() {
   }
 
   // ── Build experience + context block ────────────────────────────────────
-  const planExpContext = await buildPlannerContextBlock(this, upstreamCtx);
-  if (planExpContext) {
-    const injectedExpCount = (planExpContext._injectedExpIds || []).length;
+  // A-3 fix: buildPlannerContextBlock now returns { content, injectedExpIds } struct
+  const planContextResult = await buildPlannerContextBlock(this, upstreamCtx);
+  const planExpContent = planContextResult.content;
+  const planInjectedExpIds = planContextResult.injectedExpIds || [];
+  if (planExpContent) {
+    const injectedExpCount = planInjectedExpIds.length;
     this.obs.recordExpUsage({ injected: injectedExpCount });
     console.log(`[Orchestrator] 📚 PLAN experience injection: ${injectedExpCount} experience(s) from ExperienceStore`);
     if (injectedExpCount > 0) {
-      console.log(`[Orchestrator]    Experience IDs: [${planExpContext._injectedExpIds.slice(0, 5).join(', ')}${injectedExpCount > 5 ? '...' : ''}]`);
+      console.log(`[Orchestrator]    Experience IDs: [${planInjectedExpIds.slice(0, 5).join(', ')}${injectedExpCount > 5 ? '...' : ''}]`);
     }
   } else {
     console.log(`[Orchestrator] 📚 PLAN experience injection: none (ExperienceStore empty or no matches)`);
@@ -165,7 +178,7 @@ async function _runPlanner() {
   // ── Execute PlannerAgent ───────────────────────────────────────────────
   console.log(`[Orchestrator] 🚀 Executing PlannerAgent (generating execution-plan.md)...`);
   const plannerStartTime = Date.now();
-  const outputPath = await this.agents[AgentRole.PLANNER].run(inputPath, null, planExpContext);
+  const outputPath = await this.agents[AgentRole.PLANNER].run(inputPath, null, planExpContent);
   const plannerDuration = ((Date.now() - plannerStartTime) / 1000).toFixed(1);
   console.log(`[Orchestrator] ✅ PlannerAgent completed in ${plannerDuration}s → ${outputPath ? path.basename(outputPath) : '(no output)'}`);
 
@@ -199,6 +212,27 @@ async function _runPlanner() {
     if (err.message.includes('User rejected execution plan')) throw err;
     this.stateMachine.recordRisk('low', `[SocraticEngine] Plan approval skipped (engine unavailable): ${err.message}`);
     console.warn(`[Orchestrator] ⚠️  SocraticEngine plan approval skipped – proceeding automatically. Reason: ${err.message}`);
+  }
+
+  // ── EvoMap feedback loop (P1 fix: PLAN stage was missing this) ─────────
+  // When the execution plan is approved, we close the learning loop by:
+  // 1. Computing which injected experiences matched the plan content
+  // 2. Marking matched experiences as effective (incrementing hitCount)
+  // 3. Triggering skill evolution for high-usage experiences
+  // This enables the PLAN stage to learn from successful execution plans.
+  try {
+    // Read plan content for experience matching
+    let planContent = '';
+    if (outputPath && fs.existsSync(outputPath)) {
+      planContent = fs.readFileSync(outputPath, 'utf-8');
+    }
+    await runEvoMapFeedback(this, {
+      injectedExpIds: planInjectedExpIds,
+      errorContext: planContent, // Use plan content as context for matching
+      stageLabel: 'PLAN',
+    });
+  } catch (evoErr) {
+    console.warn(`[Orchestrator] ⚠️  EvoMap feedback failed for PLAN stage (non-fatal): ${evoErr.message}`);
   }
 
   // ── Store PLAN stage context ──────────────────────────────────────────

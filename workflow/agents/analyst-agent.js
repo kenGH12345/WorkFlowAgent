@@ -16,7 +16,7 @@
 const path = require('path');
 const { BaseAgent } = require('./base-agent');
 const { AgentRole } = require('../core/types');
-const { buildJsonBlockInstruction } = require('../core/agent-output-schema');
+const { buildJsonBlockInstruction, extractJsonBlock, validateJsonBlock } = require('../core/agent-output-schema');
 
 // ─── Anchor File Extraction ──────────────────────────────────────────────────
 
@@ -37,6 +37,13 @@ const { buildJsonBlockInstruction } = require('../core/agent-output-schema');
 function extractAnchorFiles(text) {
   const anchorFiles = [];
   const seen = new Set();
+
+  // P1-3 fix: Cap input length to prevent ReDoS on pathological inputs.
+  // 50 KB is generous enough for any real requirement text.
+  const MAX_INPUT_LENGTH = 50000;
+  if (text.length > MAX_INPUT_LENGTH) {
+    text = text.slice(0, MAX_INPUT_LENGTH);
+  }
 
   // Pattern 1: @file:path or @path/to/file.ext (IDE @ reference)
   const atFilePattern = /@(?:file:)?([\w\\/.\-]+\.\w{1,10})/g;
@@ -229,8 +236,7 @@ Remember: NO technical details, NO code, NO architecture.
    * @returns {string}
    */
   parseResponse(llmResponse) {
-    // P0-NEW-1: validate JSON block presence
-    const { extractJsonBlock, validateJsonBlock } = require('../core/agent-output-schema');
+    // P0-NEW-1: validate JSON block presence (imports hoisted to file top – P1-1 fix)
     const jsonBlock = extractJsonBlock(llmResponse);
     if (!jsonBlock) {
       console.warn(`[AnalystAgent] ⚠️  No structured JSON block found in output. Downstream agents will use regex-based extraction (degraded mode).`);
@@ -252,13 +258,16 @@ Remember: NO technical details, NO code, NO architecture.
       }
     }
 
-    // ── Mandatory section compliance check ──────────────────────────────────
-    // Verify that the mandatory "Architecture Design", "Execution Plan", and
-    // "Functional Module Map" sections are present in the output.
-    const mandatorySections = ['Architecture Design', 'Execution Plan', 'Functional Module Map'];
-    const missingSections = mandatorySections.filter(s => !llmResponse.includes(s));
+    // ── Mandatory section compliance check (P1-4: bilingual support) ────────
+    // Verify that the mandatory sections are present (English or Chinese).
+    const mandatorySections = [
+      { en: 'Architecture Design', zh: '架构设计' },
+      { en: 'Execution Plan', zh: '执行计划' },
+      { en: 'Functional Module Map', zh: '功能模块' },
+    ];
+    const missingSections = mandatorySections.filter(s => !llmResponse.includes(s.en) && !llmResponse.includes(s.zh));
     if (missingSections.length > 0) {
-      console.warn(`[AnalystAgent] ⚠️  COMPLIANCE: Missing mandatory section(s): ${missingSections.join(', ')}. The agent output specification requires these sections.`);
+      console.warn(`[AnalystAgent] ⚠️  COMPLIANCE: Missing mandatory section(s): ${missingSections.map(s => s.en).join(', ')}. The agent output specification requires these sections.`);
     } else {
       console.log(`[AnalystAgent] ✅ Mandatory sections present: Architecture Design, Execution Plan, Functional Module Map.`);
     }

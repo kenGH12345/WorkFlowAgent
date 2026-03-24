@@ -1,0 +1,172 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-03-23T11:22:13.631Z",
+  "dirtyFlags": {
+    "structure": false,
+    "techStack": false,
+    "codeGraph": false,
+    "taskHistory": false
+  },
+  "structure": {
+    "packages": [
+      {
+        "name": "codebuddy-multi-agent-workflow",
+        "dir": "workflow/"
+      }
+    ],
+    "topDirs": [
+      "AGENTS.md",
+      "CHANGELOG.md",
+      "docs/",
+      "init.sh",
+      "LICENSE",
+      "output/",
+      "README.md",
+      "synonym-table.json",
+      "workflow/"
+    ]
+  },
+  "techStack": {
+    "frameworks": [],
+    "architecture": null,
+    "dataLayer": null,
+    "testing": [],
+    "languages": [
+      {
+        "ext": ".js",
+        "count": 178
+      },
+      {
+        "ext": ".ts",
+        "count": 1
+      }
+    ]
+  },
+  "codeGraph": {
+    "symbolCount": 1774,
+    "modules": [
+      {
+        "dir": "workflow/core",
+        "files": 89,
+        "classes": 56,
+        "functions": 1234
+      },
+      {
+        "dir": "workflow/hooks/adapters",
+        "files": 15,
+        "classes": 17,
+        "functions": 232
+      },
+      {
+        "dir": "workflow/tests",
+        "files": 4,
+        "classes": 1,
+        "functions": 65
+      },
+      {
+        "dir": "workflow/commands",
+        "files": 8,
+        "classes": 0,
+        "functions": 43
+      },
+      {
+        "dir": "workflow",
+        "files": 5,
+        "classes": 1,
+        "functions": 41
+      },
+      {
+        "dir": "workflow/agents",
+        "files": 6,
+        "classes": 6,
+        "functions": 30
+      },
+      {
+        "dir": "workflow/tools",
+        "files": 2,
+        "classes": 0,
+        "functions": 18
+      },
+      {
+        "dir": "workflow/core/stages",
+        "files": 5,
+        "classes": 5,
+        "functions": 10
+      }
+    ],
+    "hotspots": [
+      {
+        "name": "block",
+        "refs": 860,
+        "calls": 43,
+        "category": "utility",
+        "file": "workflow/core/token-budget.js"
+      },
+      {
+        "name": "high",
+        "refs": 826,
+        "calls": 96,
+        "category": "utility",
+        "file": "workflow/core/self-reflection-engine.js"
+      },
+      {
+        "name": "existing",
+        "refs": 810,
+        "calls": 34,
+        "category": "utility",
+        "file": "workflow/core/experience-router.js"
+      },
+      {
+        "name": "entry",
+        "refs": 765,
+        "calls": 96,
+        "category": "utility",
+        "file": "workflow/core/self-reflection-engine.js"
+      },
+      {
+        "name": "Orchestrator",
+        "refs": 718,
+        "calls": 184,
+        "category": "hub",
+        "file": "workflow/index.js"
+      },
+      {
+        "name": "issues",
+        "refs": 628,
+        "calls": 62,
+        "category": "utility",
+        "file": "workflow/core/mcp-adapter-helpers.js"
+      },
+      {
+        "name": "search",
+        "refs": 600,
+        "calls": 178,
+        "category": "hub",
+        "file": "workflow/core/code-graph.js"
+      },
+      {
+        "name": "missing",
+        "refs": 546,
+        "calls": 24,
+        "category": "utility",
+        "file": "workflow/commands/commands-doctor.js"
+      },
+      {
+        "name": "blocks",
+        "refs": 520,
+        "calls": 60,
+        "category": "utility",
+        "file": "workflow/core/adapter-plugin-registry.js"
+      },
+      {
+        "name": "ExperienceStore",
+        "refs": 476,
+        "calls": 36,
+        "category": "utility",
+        "file": "workflow/core/experience-store.js"
+      }
+    ]
+  },
+  "recentTasks": [],
+  "distilledSummary": "## Architecture Knowledge Cache\n\n> Auto-distilled. Last updated: 2026-03-23T11:22:13.631Z\n\n### Module Map\n\n| Module | Files | Classes | Functions |\n|--------|-------|---------|-----------|\n| `workflow/core` | 89 | 56 | 1234 |\n| `workflow/hooks/adapters` | 15 | 17 | 232 |\n| `workflow/tests` | 4 | 1 | 65 |\n| `workflow/commands` | 8 | 0 | 43 |\n| `workflow` | 5 | 1 | 41 |\n| `workflow/agents` | 6 | 6 | 30 |\n| `workflow/tools` | 2 | 0 | 18 |\n| `workflow/core/stages` | 5 | 5 | 10 |\n> 1774 symbols total\n\n### 🔥 Hotspots\n\n- **block** ← 860 refs, 43 calls [utility]\n- **high** ← 826 refs, 96 calls [utility]\n- **existing** ← 810 refs, 34 calls [utility]\n- **entry** ← 765 refs, 96 calls [utility]\n- **Orchestrator** ← 718 refs, 184 calls [hub]\n- **issues** ← 628 refs, 62 calls [utility]\n- **search** ← 600 refs, 178 calls [hub]\n- **missing** ← 546 refs, 24 calls [utility]\n- **blocks** ← 520 refs, 60 calls [utility]\n- **ExperienceStore** ← 476 refs, 36 calls [utility]\n\n### Tech Stack\n\n- Languages: .js(178), .ts(1)\n\n"
+}

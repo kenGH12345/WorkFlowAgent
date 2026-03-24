@@ -266,15 +266,15 @@ class SkillMarketplace {
     // Update skill registry if available
     if (this._skillEvolution && typeof this._skillEvolution.registerSkill === 'function') {
       try {
-        this._skillEvolution.registerSkill(pkg.skill.name, {
+        // P1-6 fix: registerSkill() accepts a single options object, not (name, options).
+        // Previously passed two arguments: (pkg.skill.name, {...}) which caused the
+        // first arg to be treated as the options object, resulting in undefined name.
+        this._skillEvolution.registerSkill({
           name: pkg.skill.name,
-          version: pkg.skill.version,
-          type: pkg.skill.type,
-          domains: pkg.skill.domains,
-          dependencies: pkg.skill.dependencies,
-          description: pkg.skill.description,
-          _importedFrom: sourcePath,
-          _importedAt: new Date().toISOString(),
+          description: pkg.skill.description || '',
+          type: pkg.skill.type || 'domain-skill',
+          domains: pkg.skill.domains || [],
+          dependencies: pkg.skill.dependencies || [],
         });
       } catch (_) { /* non-fatal: registry update optional */ }
     }

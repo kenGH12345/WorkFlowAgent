@@ -16,7 +16,7 @@
 
 const { BaseAgent } = require('./base-agent');
 const { AgentRole } = require('../core/types');
-const { buildJsonBlockInstruction } = require('../core/agent-output-schema');
+const { buildJsonBlockInstruction, extractJsonBlock, validateJsonBlock } = require('../core/agent-output-schema');
 
 class DeveloperAgent extends BaseAgent {
   constructor(llmCall, hookEmitter, opts = {}) {
@@ -106,8 +106,7 @@ First output the JSON metadata block (as instructed above), then write the "Arch
    * @returns {string}
    */
   parseResponse(llmResponse) {
-    // P0-NEW-1: validate JSON block presence
-    const { extractJsonBlock, validateJsonBlock } = require('../core/agent-output-schema');
+    // P0-NEW-1: validate JSON block presence (imports hoisted to file top – P1-1 fix)
     const jsonBlock = extractJsonBlock(llmResponse);
     if (!jsonBlock) {
       console.warn(`[DeveloperAgent] ⚠️  No structured JSON block found in output. Downstream agents will use regex-based extraction (degraded mode).`);
@@ -120,11 +119,14 @@ First output the JSON metadata block (as instructed above), then write the "Arch
       }
     }
 
-    // ── Mandatory section compliance check ────────────────────────────────────
-    const mandatorySections = ['Architecture Design', 'Execution Plan'];
-    const missingSections = mandatorySections.filter(s => !llmResponse.includes(s));
+    // ── Mandatory section compliance check (P1-4: bilingual support) ─────────
+    const mandatorySections = [
+      { en: 'Architecture Design', zh: '架构设计' },
+      { en: 'Execution Plan', zh: '执行计划' },
+    ];
+    const missingSections = mandatorySections.filter(s => !llmResponse.includes(s.en) && !llmResponse.includes(s.zh));
     if (missingSections.length > 0) {
-      console.warn(`[DeveloperAgent] ⚠️  COMPLIANCE: Missing mandatory section(s): ${missingSections.join(', ')}. The agent output specification requires these sections.`);
+      console.warn(`[DeveloperAgent] ⚠️  COMPLIANCE: Missing mandatory section(s): ${missingSections.map(s => s.en).join(', ')}. The agent output specification requires these sections.`);
     } else {
       console.log(`[DeveloperAgent] ✅ Mandatory sections present: Architecture Design, Execution Plan.`);
     }

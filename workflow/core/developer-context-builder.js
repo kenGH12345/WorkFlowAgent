@@ -25,6 +25,18 @@ const {
 
 const { _getContextProfile } = require('./context-helpers');
 
+// Recall Memory: cross-session task history injection
+let _taskHistoryInstance = null;
+function _getTaskHistory() {
+  if (!_taskHistoryInstance) {
+    try {
+      const { TaskHistory } = require('./task-history');
+      _taskHistoryInstance = new TaskHistory();
+    } catch (_) { /* task-history module not available */ }
+  }
+  return _taskHistoryInstance;
+}
+
 // ─── Cross-stage context injection ───────────────────────────────────────────
 
 /**
@@ -65,8 +77,10 @@ async function buildDeveloperContextBlock(orch, upstreamCtx) {
 
   const jsonInstruction = buildJsonBlockInstruction('developer');
 
+  // P1 fix: Detect tech stack for fallback experience matching
+  const techStack = orch._detectTechStackForPreheat ? orch._detectTechStackForPreheat() : [];
   const devMaxExpInjected = orch._adaptiveStrategy?.maxExpInjected ?? 5;
-  const { block: expCtx, ids: injectedExpIds } = await orch.experienceStore.getContextBlockWithIds('code-development', orch._currentRequirement, devMaxExpInjected);
+  const { block: expCtx, ids: injectedExpIds } = await orch.experienceStore.getContextBlockWithIds('code-development', orch._currentRequirement, devMaxExpInjected, { techStack });
   console.log(`[Orchestrator] 📚 Experience context injected for DeveloperAgent (${expCtx.length} chars, ${injectedExpIds.length} experience(s), limit=${devMaxExpInjected})`);
 
   // Code graph context: query symbols from architecture.md
@@ -129,9 +143,22 @@ async function buildDeveloperContextBlock(orch, upstreamCtx) {
   if (pluginRegistry) {
     const pluginResult = await pluginRegistry.collectPluginBlocks(orch, 'DEVELOPER', _devProfile, 20);
     devPluginBlocks = pluginResult.blocks;
+    // P2 fix: Record Tool Search stats for observability
+    if (orch.obs && typeof orch.obs.recordToolSearchStats === 'function') {
+      orch.obs.recordToolSearchStats('DEVELOPER', {
+        totalPlugins: pluginResult.blocks.length + (pluginResult.skippedByKeyword?.length || 0),
+        skippedByKeyword: pluginResult.skippedByKeyword || [],
+        executedCount: pluginResult.blocks.filter(b => b.content && b.content.length > 0).length,
+      });
+    }
   }
 
-  // ── Execution Plan from PLAN stage ──────────────────────────────────────
+  // ── P0-1 fix: Extract upstream context text and execution plan from the structured object.
+  // stage-developer.js now passes { text: string, executionPlanBlock: string } instead of
+  // a bare string (which silently dropped the executionPlanBlock expando).
+  const upstreamCtxText = typeof upstreamCtx === 'string'
+    ? upstreamCtx  // backward compat: if caller passes plain string
+    : (upstreamCtx?.text || '');
   let executionPlanCtx = '';
   if (upstreamCtx && upstreamCtx.executionPlanBlock) {
     executionPlanCtx = upstreamCtx.executionPlanBlock;
@@ -176,17 +203,31 @@ async function buildDeveloperContextBlock(orch, upstreamCtx) {
     }
   } catch (_) { /* non-fatal */ }
 
+  // ── Recall Memory: cross-session task history ───────────────────────────
+  let recallMemoryCtx = '';
+  try {
+    const taskHistory = _getTaskHistory();
+    if (taskHistory) {
+      recallMemoryCtx = taskHistory.getRecallBlock(5);
+      if (recallMemoryCtx) {
+        console.log(`[Orchestrator] 📖 Recall Memory injected for DeveloperAgent (${recallMemoryCtx.length} chars)`);
+      }
+    }
+  } catch (_) { /* non-fatal */ }
+
   // ── Token Budget Guard (DEVELOPER) ─────────────────────────────────────
   const devLabelledBlocks = [
     { label: 'JSON Instruction',    content: jsonInstruction,                                          priority: BLOCK_PRIORITY.JSON_INSTRUCTION, _order: 0 },
     { label: 'AGENTS.md',           content: agentsMd ? `## Project Context (AGENTS.md)\n${agentsMd}` : '', priority: BLOCK_PRIORITY.AGENTS_MD, _order: 1 },
-    { label: 'Upstream Context',    content: typeof upstreamCtx === 'string' ? upstreamCtx : (upstreamCtx || '').toString(), priority: BLOCK_PRIORITY.UPSTREAM_CTX, _order: 2 },
+    // P0-1 + P0-2 fix: use upstreamCtxText (extracted above) instead of the raw object
+    { label: 'Upstream Context',    content: upstreamCtxText,                                                                priority: BLOCK_PRIORITY.UPSTREAM_CTX, _order: 2 },
     { label: 'Execution Plan',     content: executionPlanCtx,                                          priority: BLOCK_PRIORITY.UPSTREAM_CTX + 1, _order: 3 },
     { label: 'Module Scope',       content: moduleScopeCtx,                                            priority: BLOCK_PRIORITY.UPSTREAM_CTX + 2, _order: 3.5 },
     { label: 'Experience',          content: expCtx,                                                   priority: BLOCK_PRIORITY.EXPERIENCE, _order: 4 },
     { label: 'Complaints',          content: complaintBlock,                                           priority: BLOCK_PRIORITY.COMPLAINTS, _order: 5 },
     { label: 'Code Graph',          content: codeGraphCtx ? `\n\n${codeGraphCtx}` : '',                priority: BLOCK_PRIORITY.CODE_GRAPH, _order: 6 },
     { label: 'External Experience', content: devExternalExpBlock,                                      priority: BLOCK_PRIORITY.EXTERNAL_EXPERIENCE, _order: 7 },
+    { label: 'Recall Memory',       content: recallMemoryCtx,                                          priority: BLOCK_PRIORITY.EXTERNAL_EXPERIENCE - 1, _order: 8 },
     // Dynamic adapter blocks from plugin registry (starts at _order: 20)
     ...devPluginBlocks,
   ];
@@ -206,12 +247,17 @@ async function buildDeveloperContextBlock(orch, upstreamCtx) {
   if (devStats.compressionSaved > 0) {
     console.log(`[Orchestrator] 🗜️  DEVELOPER compression: saved ${devStats.compressionSaved} chars.`);
   }
+  // P1 fix: Record ToolResultFilter stats for cross-session analysis
+  if (orch.obs && devStats.preFilterSaved > 0) {
+    orch.obs.recordToolResultFilterStats('DEVELOPER', {
+      preFilterSaved: devStats.preFilterSaved,
+      filteredLabels: devStats.preFilterLabels || [],
+    });
+  }
 
-  // R2-3 audit: wrap in String object so ._injectedExpIds survives
-  // (primitive strings cannot hold expando properties).
-  const block = new String(devAssembled);
-  block._injectedExpIds = injectedExpIds;
-  return block;
+  // A-3 Architecture Fix: Return a proper struct instead of new String() hack.
+  // See architect-context-builder.js for the full rationale.
+  return { content: devAssembled, injectedExpIds };
 }
 
 module.exports = {

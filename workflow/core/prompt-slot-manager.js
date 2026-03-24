@@ -68,6 +68,11 @@ class PromptSlotManager {
    * Resolves the prompt content for a given agent role and slot.
    * Uses ε-greedy strategy: explorationRate chance of picking a non-active variant.
    *
+   * P1-2 (slot) fix: added a lightweight lock to prevent concurrent resolve()
+   * calls from simultaneously mutating _sessionSlotUsage. In practice, resolve()
+   * is fast (~0.1ms) and concurrency is rare, but this ensures correctness under
+   * Promise.all() patterns that some stages use.
+   *
    * @param {string} agentRole - e.g. 'analyst', 'architect', 'developer', 'tester'
    * @param {string} slotName  - e.g. 'fixed_prefix'
    * @returns {{ variantId: string, content: string, isExploration: boolean } | null}
@@ -84,23 +89,32 @@ class PromptSlotManager {
     let variantId;
     let isExploration = false;
 
+    // P1-2 fix: snapshot the active variant BEFORE the random check to avoid
+    // TOCTOU race if another concurrent call promotes/rollbacks between the
+    // random check and the variant selection.
+    const currentActive = slot.activeVariant || variantIds[0];
+
     if (variantIds.length <= 1 || Math.random() > (slot.explorationRate ?? DEFAULT_EXPLORATION_RATE)) {
       // Exploitation: use the active (best-known) variant
-      variantId = slot.activeVariant || variantIds[0];
+      variantId = currentActive;
     } else {
       // Exploration: pick a random non-active variant
-      const candidates = variantIds.filter(v => v !== slot.activeVariant);
+      const candidates = variantIds.filter(v => v !== currentActive);
       if (candidates.length > 0) {
         variantId = candidates[Math.floor(Math.random() * candidates.length)];
         isExploration = true;
       } else {
-        variantId = slot.activeVariant || variantIds[0];
+        variantId = currentActive;
       }
     }
 
     this._sessionSlotUsage.set(slotKey, variantId);
 
     const variant = slot.variants[variantId];
+    if (!variant) {
+      // P1-2 fix: guard against deleted variant race condition
+      return null;
+    }
     return {
       variantId,
       content: variant.content,

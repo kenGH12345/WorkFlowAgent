@@ -195,6 +195,10 @@ function buildJsonBlockInstruction(role) {
     .map(([field, spec]) => `  "${field}": ${spec.type === 'array' ? '[]' : spec.type === 'object' ? '{}' : '""'}  // ${spec.description}${spec.required ? ' [REQUIRED]' : ''}`)
     .join(',\n');
 
+  // Arch-Fix-2: Use the schema-defined version instead of hardcoded "1.0".
+  // This ensures the prompt example stays in sync with the schema declaration.
+  const schemaVersion = schema.version || '1.0';
+
   return [
     `## MANDATORY: Structured Output Header`,
     ``,
@@ -204,7 +208,7 @@ function buildJsonBlockInstruction(role) {
     `\`\`\`json`,
     `{`,
     `  "role": "${role}",`,
-    `  "version": "1.0",`,
+    `  "version": "${schemaVersion}",`,
     fieldDescriptions,
     `}`,
     `\`\`\``,

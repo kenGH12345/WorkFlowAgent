@@ -14,7 +14,7 @@
  *   - Bus publish (ANALYST → ARCHITECT)
  *   - Chinese companion file generation
  *
- * Implementation: Delegates to the original _runAnalyst function (orchestrator-stages.js)
+ * Implementation: Delegates to the _runAnalyst function (stage-analyst.js)
  * bound to the Orchestrator instance context. The original function accesses orchestrator
  * properties via `this` (stateMachine, bus, agents, stageCtx, etc.).
  */
@@ -39,9 +39,10 @@ class AnalystStage extends StageRunner {
   async execute(ctx) {
     const orch = ctx.orchestrator;
     const rawRequirement = ctx.rawRequirement;
-    // Delegate to the original _runAnalyst function (preserved in orchestrator-stages.js)
-    // The function uses `this` to access orchestrator properties, so we bind it.
-    const { _runAnalyst } = require('../orchestrator-stages');
+    // P0-2 fix: Import directly from stage-analyst.js instead of the orchestrator-stages.js
+    // re-export facade. This removes an unnecessary indirection layer and ensures this
+    // bridge class does not break if the facade is removed in the future.
+    const { _runAnalyst } = require('../stage-analyst');
     return _runAnalyst.call(orch, rawRequirement);
   }
 }

@@ -38,6 +38,7 @@ const { MCPAdapter } = require('./base');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const { shouldSkipLSPAdapter } = require('../../core/ide-detection');
 
 // ─── LSP Message Codec ────────────────────────────────────────────────────────
 
@@ -192,6 +193,20 @@ class LSPAdapter extends MCPAdapter {
 
   async connect() {
     if (this._connected) return;
+
+    // ── IDE-First: Skip self-spawned LSP when IDE already provides one ────
+    // When running inside an IDE (Cursor, VS Code, etc.), the IDE already has
+    // a running language server with full project initialization. Spawning a
+    // second language server is wasteful and can cause conflicts.
+    // The AI Agent can use IDE's built-in LSP via view_code_item, codebase_search, etc.
+    if (shouldSkipLSPAdapter()) {
+      console.log(`[LSPAdapter] 🏠 IDE environment detected – skipping self-spawned LSP.`);
+      console.log(`[LSPAdapter]    IDE already provides LSP capabilities (definition, references, hover, symbols).`);
+      console.log(`[LSPAdapter]    Agent should use IDE tools: view_code_item, codebase_search, grep_search.`);
+      console.log(`[LSPAdapter]    CodeGraph regex-based indexing remains available as fallback.`);
+      this._skippedForIDE = true;
+      return; // Do NOT spawn – IDE's LSP is superior
+    }
 
     // Step 1: Resolve which LSP server to use
     const serverConfig = this._resolveServer();

@@ -50,6 +50,7 @@ const AnalysisTemplate = {
   ARTICLE:    'article',     // For web articles → value assessment + knowledge extraction
   CODE:       'code',        // For code-related content → rules, anti-patterns
   EXPERIENCE: 'experience',  // For experience extraction → structured experiences
+  TECHNIQUE:  'technique',   // For tech radar → upgrade evaluation + adoption assessment
 };
 
 // ─── Knowledge Pipeline Class ────────────────────────────────────────────────
@@ -524,6 +525,8 @@ class KnowledgePipeline {
         return this._buildCodeAnalysisPrompt(rawData, context);
       case AnalysisTemplate.EXPERIENCE:
         return this._buildExperienceAnalysisPrompt(rawData, context);
+      case AnalysisTemplate.TECHNIQUE:
+        return this._buildTechniqueAnalysisPrompt(rawData, context);
       default:
         return this._buildCodeAnalysisPrompt(rawData, context);
     }
@@ -627,6 +630,43 @@ class KnowledgePipeline {
       ``,
       `## Source Content`,
       rawData.slice(0, 15000),
+    ].join('\n');
+  }
+
+  _buildTechniqueAnalysisPrompt(rawData, context) {
+    return [
+      `You are a technology radar analyst evaluating new techniques for an AI coding agent system.`,
+      ``,
+      `## Task`,
+      `Analyse the following content and evaluate whether this technique should be adopted.`,
+      `${context.systemDescription ? `\nSystem context: ${context.systemDescription}` : ''}`,
+      `${context.category ? `\nCategory: ${context.category}` : ''}`,
+      ``,
+      `## Output Format`,
+      `Return ONLY a JSON object (no markdown fences, no explanation):`,
+      `{`,
+      `  "title": "<technique name>",`,
+      `  "summary": "<2-3 sentence summary of the technique>",`,
+      `  "relevanceScore": <0.0-1.0>,`,
+      `  "noveltyScore": <0.0-1.0>,`,
+      `  "actionabilityScore": <0.0-1.0>,`,
+      `  "upgradeUrgency": <0.0-1.0>,`,
+      `  "implementationEffort": "low|medium|high",`,
+      `  "riskLevel": "low|medium|high",`,
+      `  "recommendation": "<specific adoption recommendation>",`,
+      `  "relatedModules": ["<module1>", "<module2>"],`,
+      `  "prerequisites": ["<prerequisite1>", "<prerequisite2>"],`,
+      `  "migrationSteps": ["<step1>", "<step2>"]`,
+      `}`,
+      ``,
+      `## Scoring Guide`,
+      `- relevanceScore: How relevant is this to AI agent/workflow systems?`,
+      `- noveltyScore: How novel is this vs our current implementation?`,
+      `- actionabilityScore: Can we directly implement this?`,
+      `- upgradeUrgency: How urgent? (security fixes=1.0, performance=0.7, nice-to-have=0.3)`,
+      ``,
+      `## Source Content`,
+      rawData.slice(0, 12000),
     ].join('\n');
   }
 

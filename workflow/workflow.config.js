@@ -46,6 +46,25 @@ module.exports = {
     scopeDirs: [],             // Large monorepo only: ['packages/core', 'lua']. Empty = full scan
   },
 
+  // ─── IDE-First Architecture (ADR-37) ─────────────────────────────────────────
+  //
+  // Foundational principle: IDE capabilities first, self-built as fallback.
+  //
+  // When WorkFlowAgent runs inside an IDE (Cursor, VS Code, Claude Code, Windsurf),
+  // it auto-detects the IDE environment and:
+  //   1. Skips spawning a redundant language server (IDE already has one)
+  //   2. Injects "IDE Tool Guidance" into Agent prompts (prefer IDE tools)
+  //   3. Retains self-built modules as fallback (CodeGraph, ContextLoader, etc.)
+  //
+  // Detection is fully automatic via process.env inspection. No config needed.
+  // Override only if you need to force standalone mode (e.g., in CI/CD pipelines
+  // where VSCODE_PID is inherited but no IDE tools are actually available).
+  //
+  ide: {
+    forceStandalone: false,    // Set to true to disable IDE-first mode entirely
+    // forceIDE: 'cursor',     // Force a specific IDE identity (for testing)
+  },
+
   // ─── LLM Tuning ──────────────────────────────────────────────────────────────
   //
   // Fine-tune LLM prompt behaviour for your specific model and context window.
@@ -243,6 +262,37 @@ module.exports = {
   // Auto-detection uses built-in fallback rules for this tech stack.
   // Add custom rules here to override or extend them:
   classificationRules: [],
+
+  // ─── P2-3: Custom Detection Rules ────────────────────────────────────────────
+  //
+  // Extend the ProjectProfiler's built-in detection rules with your own.
+  // User rules are checked BEFORE built-in rules (higher priority).
+  //
+  // customDetectionRules: {
+  //   // Custom framework detection rules
+  //   frameworks: [
+  //     {
+  //       name: 'MyFramework',
+  //       category: 'backend',     // 'backend' | 'frontend' | 'fullstack' | 'mobile' | 'game'
+  //       lang: 'typescript',
+  //       detect: (root, deps) => !!deps['my-framework'],
+  //     },
+  //   ],
+  //   // Custom ORM/data layer detection rules
+  //   dataLayer: [
+  //     {
+  //       name: 'MyORM',
+  //       detect: (root, deps) => !!deps['my-orm-package'],
+  //     },
+  //   ],
+  //   // Custom test framework detection rules
+  //   testFrameworks: [
+  //     {
+  //       name: 'MyTestRunner',
+  //       detect: (root, deps) => !!deps['my-test-runner'],
+  //     },
+  //   ],
+  // },
 
   // ─── Git PR Workflow ──────────────────────────────────────────────────────────
   //

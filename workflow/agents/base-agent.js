@@ -58,7 +58,24 @@ class BaseAgent {
     // 1. Read input content
     const inputContent = this._readInput(inputFilePath, rawInput);
 
+    // 1b. Arch-Fix-1: Diagnostic when runtime inputPath diverges from canonical contract path.
+    //     contract.inputFilePath is ADVISORY — Stage layers legitimately pass enriched temp files.
+    //     Log at debug level so operators can trace data flow without false alarms.
+    if (inputFilePath && this.contract.inputFilePath) {
+      const canonical = this.contract.inputFilePath;
+      if (!inputFilePath.endsWith(canonical.replace(/^output\//, ''))) {
+        console.log(
+          `[${this.role}] ℹ️  Runtime input path diverges from canonical contract declaration.\n` +
+          `  Canonical : ${canonical}\n` +
+          `  Actual    : ${path.basename(inputFilePath)}\n` +
+          `  This is expected when the Stage layer injects enriched context.`
+        );
+      }
+    }
+
     // 2. Validate we are not violating our own contract
+    // Note: 'run' is now in all allowedActions lists (P0-2 fix).
+    // This call serves as a smoke-test that the contract system is functional.
     await this.assertAllowed('run');
 
     // 3. Build prompt and call LLM
@@ -100,18 +117,32 @@ class BaseAgent {
   // ─── Boundary Enforcement ─────────────────────────────────────────────────────
 
   /**
-   * Checks whether an action is in the forbidden list and throws if so.
+   * Checks whether an action is permitted by the contract.
+   * Two-layer enforcement (P0-2 fix):
+   *   1. Reject if action is in the forbiddenActions blacklist.
+   *   2. Reject if allowedActions is non-empty and action is NOT in the whitelist.
    * Emits AGENT_BOUNDARY_VIOLATION hook before throwing.
    *
    * @param {string} action
    */
   async assertAllowed(action) {
+    // Layer 1: Blacklist check
     if (this.contract.forbiddenActions.includes(action)) {
-      const payload = { role: this.role, action, contract: this.contract };
+      const payload = { role: this.role, action, contract: this.contract, reason: 'forbidden' };
       await this.hookEmitter(HOOK_EVENTS.AGENT_BOUNDARY_VIOLATION, payload);
       throw new Error(
         `[${this.role}] Boundary violation: action "${action}" is forbidden for this agent.\n` +
         `Forbidden actions: ${this.contract.forbiddenActions.join(', ')}`
+      );
+    }
+    // Layer 2: Whitelist check (P0-2 fix – allowedActions was previously ignored)
+    const { allowedActions } = this.contract;
+    if (Array.isArray(allowedActions) && allowedActions.length > 0 && !allowedActions.includes(action)) {
+      const payload = { role: this.role, action, contract: this.contract, reason: 'not_in_allowlist' };
+      await this.hookEmitter(HOOK_EVENTS.AGENT_BOUNDARY_VIOLATION, payload);
+      throw new Error(
+        `[${this.role}] Boundary violation: action "${action}" is not in the allowed actions list.\n` +
+        `Allowed actions: ${allowedActions.join(', ')}`
       );
     }
   }

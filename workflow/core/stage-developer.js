@@ -34,6 +34,14 @@ function _getRunArchitect() {
   return _runArchitect;
 }
 
+/**
+ * Runs the CODE stage: code generation, code review, quality gate, and rollback.
+ *
+ * P1-2 fix: @this annotation for IDE IntelliSense and safe refactoring.
+ *
+ * @this {import('./orchestrator').Orchestrator}
+ * @returns {Promise<string>} Path to the generated code.diff
+ */
 async function _runDeveloper() {
   console.log(`\n[Orchestrator] Stage: CODE (DeveloperAgent)`);
   const inputPath = this.bus.consume(AgentRole.DEVELOPER);
@@ -54,12 +62,14 @@ async function _runDeveloper() {
     }
   }
 
-  const upstreamCtxForDev = buildDeveloperUpstreamCtx(this);
+  const upstreamCtxForDevStr = buildDeveloperUpstreamCtx(this);
 
-  // Inject execution plan context into upstream context
+  // P0-1 fix: buildDeveloperUpstreamCtx returns a primitive string.
+  // Wrap in an object so we can attach executionPlanBlock without silent failure.
+  // (Previously: `upstreamCtxForDev.executionPlanBlock = ...` silently failed on primitive string.)
+  const upstreamCtxForDev = { text: upstreamCtxForDevStr, executionPlanBlock: '' };
   if (executionPlanContent) {
-    const planCtxBlock = `\n## Execution Plan (from PLAN stage)\n${executionPlanContent.slice(0, 8000)}${executionPlanContent.length > 8000 ? '\n... (truncated)' : ''}`;
-    upstreamCtxForDev.executionPlanBlock = planCtxBlock;
+    upstreamCtxForDev.executionPlanBlock = `\n## Execution Plan (from PLAN stage)\n${executionPlanContent.slice(0, 8000)}${executionPlanContent.length > 8000 ? '\n... (truncated)' : ''}`;
   }
 
   const archMeta = planMeta || this.bus.getMeta(AgentRole.DEVELOPER);
@@ -67,10 +77,13 @@ async function _runDeveloper() {
     console.log(`[Orchestrator] ℹ️  Architecture was self-corrected in ${archMeta.reviewRounds} round(s) (${archMeta.failedItems} issue(s) fixed). Developer should review architecture.md carefully.`);
   }
 
-  const devExpContextWithComplaints = await buildDeveloperContextBlock(this, upstreamCtxForDev);
-  this.obs.recordExpUsage({ injected: (devExpContextWithComplaints._injectedExpIds || []).length });
+  // A-3 fix: buildDeveloperContextBlock now returns { content, injectedExpIds } struct
+  const devContextResult = await buildDeveloperContextBlock(this, upstreamCtxForDev);
+  const devExpContext = devContextResult.content;
+  const devInjectedExpIds = devContextResult.injectedExpIds || [];
+  this.obs.recordExpUsage({ injected: devInjectedExpIds.length });
 
-  const outputPath = await this.agents[AgentRole.DEVELOPER].run(inputPath, null, devExpContextWithComplaints);
+  const outputPath = await this.agents[AgentRole.DEVELOPER].run(inputPath, null, devExpContext);
 
   // ── Adapter Telemetry ─────────────────────────────────────────────────────
   if (this._adapterTelemetry && outputPath && fs.existsSync(outputPath)) {
@@ -348,7 +361,7 @@ async function _runDeveloper() {
   // ── EvoMap feedback loop ────────────────────────────────────────────────
   if (codeDecision.pass) {
     await runEvoMapFeedback(this, {
-      injectedExpIds: devExpContextWithComplaints._injectedExpIds || [],
+      injectedExpIds: devInjectedExpIds,
       errorContext: (reviewResult.riskNotes || []).join(' '),
       stageLabel: 'CODE',
     });

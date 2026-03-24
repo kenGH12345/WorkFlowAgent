@@ -28,42 +28,9 @@
 
 const fs = require('fs');
 const path = require('path');
-
-// ─── Reflection Types ───────────────────────────────────────────────────────
-
-const ReflectionType = {
-  ISSUE_DETECTED:    'issue_detected',     // Problem found during audit/usage
-  PATTERN_RECURRING: 'pattern_recurring',  // Same issue appeared multiple times
-  QUALITY_GATE_FAIL: 'quality_gate_fail',  // Run failed a quality threshold
-  ANOMALY_DETECTED:  'anomaly_detected',   // Cross-session metric anomaly
-  OPTIMISATION_OPP:  'optimisation_opp',   // Identified optimisation opportunity
-};
-
-const ReflectionSeverity = {
-  CRITICAL: 'critical',  // Blocks correctness, must fix
-  HIGH:     'high',      // Significant impact on quality/efficiency
-  MEDIUM:   'medium',    // Noticeable but not blocking
-  LOW:      'low',       // Minor improvement opportunity
-};
-
-const ReflectionStatus = {
-  OPEN:     'open',      // Not yet addressed
-  ANALYSED: 'analysed',  // Root cause identified, plan generated
-  FIXED:    'fixed',     // Fix applied
-  DEFERRED: 'deferred',  // Acknowledged, deferred to later
-};
-
-// ─── Quality Gate Thresholds ────────────────────────────────────────────────
-
-const DEFAULT_QUALITY_GATES = {
-  maxErrorCount:       3,     // Max errors per run before flagging
-  maxTokenWasteRatio:  0.35,  // If >35% of tokens are in dropped/truncated blocks → waste
-  minTestPassRate:     0.70,  // Minimum test pass rate (passed / (passed + failed))
-  maxDurationMs:       600000, // 10 minutes max per run
-  maxLlmCalls:         15,    // More than 15 LLM calls suggests retry loops
-  maxPluginSkipRatio:  0.80,  // If >80% of plugins are skipped, keywords may be too narrow
-  minPluginSkipRatio:  0.10,  // If <10% of plugins are skipped, keywords may be too broad
-};
+const { ReflectionType, ReflectionSeverity, ReflectionStatus } = require('./self-reflection-types');
+const { HealthAuditor } = require('./health-auditor');
+const { QualityGate, DEFAULT_QUALITY_GATES } = require('./quality-gate');
 
 // ─── Self-Reflection Engine ─────────────────────────────────────────────────
 
@@ -79,7 +46,6 @@ class SelfReflectionEngine {
     this._outputDir = options.outputDir || path.join(process.cwd(), 'output');
     this._experienceStore = options.experienceStore || null;
     this._complaintWall = options.complaintWall || null;
-    this._qualityGates = { ...DEFAULT_QUALITY_GATES, ...options.qualityGates };
     this._reflectionPath = path.join(this._outputDir, 'reflections.json');
 
     /** @type {ReflectionEntry[]} */
@@ -88,7 +54,30 @@ class SelfReflectionEngine {
     /** @type {Map<string, number>} Pattern frequency counter for recurring detection */
     this._patternFrequency = new Map();
 
+    // A-1 architecture fix: delegate health audit and quality gating to focused classes.
+    // Both receive a bound recordIssue callback so findings flow back into reflections.
+    const boundRecordIssue = this.recordIssue.bind(this);
+    this._healthAuditor = new HealthAuditor({
+      outputDir: this._outputDir,
+      recordIssue: boundRecordIssue,
+      skillEvolution: options.skillEvolution || null,
+    });
+    this._qualityGate = new QualityGate({
+      qualityGates: options.qualityGates,
+      recordIssue: boundRecordIssue,
+    });
+
     this._load();
+  }
+
+  /**
+   * Injects or updates the SkillEvolutionEngine reference for health auditing.
+   * Called after Orchestrator initialisation when the engine becomes available.
+   * A-1 fix: avoids Check 8/9 creating orphan SkillEvolutionEngine instances.
+   * @param {object} skillEvolution
+   */
+  setSkillEvolution(skillEvolution) {
+    this._healthAuditor.setSkillEvolution(skillEvolution);
   }
 
   // ─── Core API: Record Issues ──────────────────────────────────────────────
@@ -201,405 +190,29 @@ class SelfReflectionEngine {
     return entry;
   }
 
-  // ─── Proactive Audit: Health Check ────────────────────────────────────────
+  // ─── Proactive Audit: Health Check (delegated to HealthAuditor – A-1 fix) ──
 
   /**
-   * Analyses cross-session metrics history to proactively identify anomalies
-   * and optimisation opportunities. This is the "self-driving" part —
-   * it doesn't wait for someone to say "go audit", it examines the data
-   * and surfaces problems automatically.
-   *
-   * Checks performed:
-   *   1. Token consumption trend (increasing = potential prompt bloat)
-   *   2. Error rate trend (increasing = quality regression)
-   *   3. Duration trend (increasing = performance regression)
-   *   4. Experience hit rate (low = experience store noise)
-   *   5. Clarification effectiveness (low = clarification wasting rounds)
-   *   6. Plugin skip ratio (too high or too low = keyword tuning needed)
+   * Analyses cross-session metrics history to proactively identify anomalies.
+   * Delegates to HealthAuditor which encapsulates all 9 health checks.
    *
    * @returns {{ findings: ReflectionEntry[], summary: string }}
    */
   auditHealth() {
-    const ObsStrategy = require('./observability-strategy');
-    const history = ObsStrategy.loadHistory(this._outputDir);
-
-    if (history.length < 3) {
-      return { findings: [], summary: 'Insufficient history data (need ≥3 sessions) for health audit.' };
-    }
-
-    const trends = ObsStrategy.computeTrends(history);
-    const recent = history.slice(0, Math.min(5, history.length));
-    const findings = [];
-
-    // Check 1: Token consumption trend
-    if (trends.tokenTrend === 'increasing') {
-      const avgTokens = trends.avgTokensEst;
-      findings.push(this.recordIssue({
-        type: ReflectionType.ANOMALY_DETECTED,
-        severity: avgTokens > 50000 ? ReflectionSeverity.HIGH : ReflectionSeverity.MEDIUM,
-        title: 'Token consumption trending upward',
-        description: `Average token usage is ~${avgTokens.toLocaleString()} and increasing across recent sessions. This may indicate prompt bloat, insufficient context pruning, or adapter results growing without bounds.`,
-        source: 'audit:health',
-        patternKey: 'token-trend-increasing',
-        rootCause: 'Possible causes: adapter results growing, insufficient ToolResultFilter thresholds, or prompt template expansion.',
-        suggestedFix: 'Review _applyTokenBudget stats, check ToolResultFilter effectiveness, audit adapter block sizes.',
-        metrics: { avgTokensEst: avgTokens, trend: 'increasing' },
-      }));
-    }
-
-    // Check 2: Error rate trend
-    if (trends.errorTrend === 'increasing') {
-      findings.push(this.recordIssue({
-        type: ReflectionType.ANOMALY_DETECTED,
-        severity: ReflectionSeverity.HIGH,
-        title: 'Error rate trending upward',
-        description: `Average error count is ${trends.avgErrorCount} and increasing. This suggests a quality regression that needs attention.`,
-        source: 'audit:health',
-        patternKey: 'error-trend-increasing',
-        rootCause: 'Possible causes: new code introducing bugs, external service degradation, or insufficient test coverage.',
-        suggestedFix: 'Review recent error details in run-metrics.json, check if specific stages are failing more often.',
-        metrics: { avgErrorCount: trends.avgErrorCount, trend: 'increasing' },
-      }));
-    }
-
-    // Check 3: Duration trend
-    if (trends.durationTrend === 'increasing' && trends.avgDurationMs > 120000) {
-      findings.push(this.recordIssue({
-        type: ReflectionType.ANOMALY_DETECTED,
-        severity: trends.avgDurationMs > 300000 ? ReflectionSeverity.HIGH : ReflectionSeverity.MEDIUM,
-        title: 'Workflow duration trending upward',
-        description: `Average duration is ${(trends.avgDurationMs / 1000).toFixed(1)}s and increasing. Runs exceeding 2 minutes may indicate unnecessary retry loops or slow adapters.`,
-        source: 'audit:health',
-        patternKey: 'duration-trend-increasing',
-        suggestedFix: 'Profile per-stage timing in run-metrics.json, check for retry loops, review adapter timeouts.',
-        metrics: { avgDurationMs: trends.avgDurationMs, trend: 'increasing' },
-      }));
-    }
-
-    // Check 4: Experience hit rate
-    const sessionsWithExp = recent.filter(h => h.expInjectedCount > 0);
-    if (sessionsWithExp.length >= 3) {
-      const totalInjected = sessionsWithExp.reduce((s, h) => s + h.expInjectedCount, 0);
-      const totalHits = sessionsWithExp.reduce((s, h) => s + (h.expHitCount || 0), 0);
-      const hitRate = totalHits / totalInjected;
-
-      if (hitRate < 0.15) {
-        findings.push(this.recordIssue({
-          type: ReflectionType.OPTIMISATION_OPP,
-          severity: ReflectionSeverity.MEDIUM,
-          title: 'Experience hit rate critically low',
-          description: `Only ${(hitRate * 100).toFixed(0)}% of injected experiences are confirmed effective. The experience store may contain too much noise, or keyword matching is too loose.`,
-          source: 'audit:health',
-          patternKey: 'exp-hit-rate-low',
-          rootCause: 'Experience store may have accumulated stale/irrelevant entries, or LLM query expansion is generating too many false positives.',
-          suggestedFix: 'Run ExperienceStore.purgeExpired(), review zombie experiences (high retrievalCount, zero hitCount), tighten keyword extraction.',
-          metrics: { hitRate: Math.round(hitRate * 100) + '%', totalInjected, totalHits },
-        }));
-      }
-    }
-
-    // Check 5: Clarification effectiveness
-    const sessionsWithClar = recent.filter(h => h.clarificationEffectiveness != null && h.clarificationRounds > 0);
-    if (sessionsWithClar.length >= 2) {
-      const avgEff = sessionsWithClar.reduce((s, h) => s + h.clarificationEffectiveness, 0) / sessionsWithClar.length;
-      if (avgEff < 30) {
-        findings.push(this.recordIssue({
-          type: ReflectionType.OPTIMISATION_OPP,
-          severity: ReflectionSeverity.MEDIUM,
-          title: 'Clarification rounds have low effectiveness',
-          description: `Average clarification effectiveness is ${avgEff.toFixed(0)}%, which means clarification is consuming LLM calls without meaningfully improving requirement quality.`,
-          source: 'audit:health',
-          patternKey: 'clarification-low-eff',
-          suggestedFix: 'Consider reducing maxClarificationRounds or improving the clarification prompt to ask more targeted questions.',
-          metrics: { avgEffectiveness: avgEff.toFixed(0) + '%' },
-        }));
-      }
-    }
-
-    // Check 6: Block telemetry — check for consistently dropped blocks
-    const sessionsWithTelemetry = recent.filter(h => h.blockTelemetrySummary);
-    if (sessionsWithTelemetry.length >= 2) {
-      for (const session of sessionsWithTelemetry.slice(0, 1)) {
-        const summary = session.blockTelemetrySummary;
-        if (summary && summary.totalDropped > summary.totalInjected * 0.4) {
-          findings.push(this.recordIssue({
-            type: ReflectionType.OPTIMISATION_OPP,
-            severity: ReflectionSeverity.MEDIUM,
-            title: 'High block drop rate indicates token budget pressure',
-            description: `${summary.totalDropped} of ${summary.totalInjected} blocks were dropped due to token budget. This means significant context is being lost.`,
-            source: 'audit:health',
-            patternKey: 'high-block-drop-rate',
-            suggestedFix: 'Review BLOCK_PRIORITY assignments, increase STAGE_TOKEN_BUDGET_CHARS, or improve ToolResultFilter compression.',
-            metrics: { totalInjected: summary.totalInjected, totalDropped: summary.totalDropped },
-          }));
-        }
-      }
-    }
-
-    // Check 7: Skill effectiveness — detect skills injected but rarely effective
-    const sessionsWithSkills = recent.filter(h => h.skillInjectedTotal > 0);
-    if (sessionsWithSkills.length >= 3) {
-      const totalInjected = sessionsWithSkills.reduce((s, h) => s + (h.skillInjectedTotal || 0), 0);
-      const totalEffective = sessionsWithSkills.reduce((s, h) => s + (h.skillEffectiveCount || 0), 0);
-      // Count unique skill names that appeared but were never effective
-      const allInjectedNames = new Set();
-      const allEffectiveNames = new Set();
-      for (const session of sessionsWithSkills) {
-        for (const name of (session.skillInjectedNames || [])) allInjectedNames.add(name);
-        for (const name of (session.skillEffectiveNames || [])) allEffectiveNames.add(name);
-      }
-      const neverEffective = [...allInjectedNames].filter(n => !allEffectiveNames.has(n));
-
-      if (neverEffective.length > 0) {
-        findings.push(this.recordIssue({
-          type: ReflectionType.OPTIMISATION_OPP,
-          severity: neverEffective.length >= 3 ? ReflectionSeverity.HIGH : ReflectionSeverity.MEDIUM,
-          title: `${neverEffective.length} skill(s) injected but never effective`,
-          description: `Skills [${neverEffective.join(', ')}] were injected across ${sessionsWithSkills.length} sessions but never contributed to a successful stage. Consider retiring or improving these skills.`,
-          source: 'audit:health',
-          patternKey: 'skill-never-effective',
-          suggestedFix: 'Review skill content quality, check if keywords are too broad (triggering on irrelevant tasks), or run retireStaleSkills() to clean up.',
-          metrics: { neverEffective, totalInjected, totalEffective },
-        }));
-      }
-
-      // Overall skill effectiveness check
-      if (totalInjected > 5) {
-        const skillHitRate = totalEffective / allInjectedNames.size;
-        if (skillHitRate < 0.2) {
-          findings.push(this.recordIssue({
-            type: ReflectionType.OPTIMISATION_OPP,
-            severity: ReflectionSeverity.MEDIUM,
-            title: 'Overall skill effectiveness is critically low',
-            description: `Only ${(skillHitRate * 100).toFixed(0)}% of unique skills injected are confirmed effective. The skill library may contain too many irrelevant or outdated skills.`,
-            source: 'audit:health',
-            patternKey: 'skill-effectiveness-low',
-            suggestedFix: 'Run SkillEvolutionEngine.retireStaleSkills() to identify and retire underperforming skills.',
-            metrics: { skillHitRate: Math.round(skillHitRate * 100) + '%', uniqueInjected: allInjectedNames.size, uniqueEffective: allEffectiveNames.size },
-          }));
-        }
-      }
-    }
-
-    // Check 8: Skill content staleness detection (Gap 4)
-    // Skills that haven't been evolved in a long time may contain outdated advice.
-    // Uses SkillEvolutionEngine registry (if available via Orchestrator) to check
-    // lastEvolvedAt timestamps against a staleness threshold.
-    try {
-      const { SkillEvolutionEngine } = require('./skill-evolution');
-      const skillEngine = new SkillEvolutionEngine();
-      const STALE_DAYS = 90; // Skills not evolved in 90 days are flagged
-      const now = Date.now();
-      const staleSkills = [];
-
-      for (const meta of skillEngine.registry.values()) {
-        if (meta.retiredAt) continue; // Already retired
-        const lastEvolved = meta.lastEvolvedAt ? new Date(meta.lastEvolvedAt).getTime() : 0;
-        const created = meta.createdAt ? new Date(meta.createdAt).getTime() : 0;
-        const latestActivity = Math.max(lastEvolved, created);
-        const daysSinceActivity = latestActivity > 0 ? (now - latestActivity) / (24 * 60 * 60 * 1000) : Infinity;
-
-        if (daysSinceActivity > STALE_DAYS && (meta.usageCount || 0) > 0) {
-          staleSkills.push({ name: meta.name, daysSinceActivity: Math.round(daysSinceActivity) });
-        }
-      }
-
-      if (staleSkills.length > 0) {
-        findings.push(this.recordIssue({
-          type: ReflectionType.OPTIMISATION_OPP,
-          severity: staleSkills.length >= 5 ? ReflectionSeverity.HIGH : ReflectionSeverity.MEDIUM,
-          title: `${staleSkills.length} skill(s) have stale content (not updated in >${STALE_DAYS} days)`,
-          description: `Skills [${staleSkills.slice(0, 5).map(s => `${s.name} (${s.daysSinceActivity}d)`).join(', ')}] haven't been evolved recently. Their content may be outdated as the project evolves.`,
-          source: 'audit:health',
-          patternKey: 'skill-content-stale',
-          suggestedFix: 'Review stale skill content against current project conventions. Re-evolve with fresh experiences or manually update.',
-          metrics: { staleSkills: staleSkills.map(s => s.name), count: staleSkills.length },
-        }));
-      }
-    } catch (_) { /* Non-fatal: SkillEvolutionEngine may not be available */ }
-
-    // Check 9: Skill keyword overlap / conflict detection (Gap 5)
-    // Two skills with heavily overlapping keywords may inject conflicting advice.
-    // Detects skill pairs where >50% of keywords overlap, which indicates either
-    // redundancy (merge candidates) or conflict risk (contradictory advice).
-    try {
-      const { ContextLoader } = require('./context-loader');
-      // Access BUILTIN_SKILL_KEYWORDS via a temporary loader or directly
-      const BUILTIN_SKILL_KEYWORDS = require('./context-loader').__test_BUILTIN_SKILL_KEYWORDS || {};
-
-      // If we can't access keywords, try reading from loaded skill files
-      const { SkillEvolutionEngine } = require('./skill-evolution');
-      const skillEngine = new SkillEvolutionEngine();
-      const skillKeywordMap = new Map();
-
-      for (const meta of skillEngine.registry.values()) {
-        if (meta.retiredAt) continue;
-        const keywords = (meta.triggers && meta.triggers.keywords) || [];
-        if (keywords.length >= 2) {
-          skillKeywordMap.set(meta.name, new Set(keywords.map(k => k.toLowerCase())));
-        }
-      }
-
-      const overlappingPairs = [];
-      const skillNames = [...skillKeywordMap.keys()];
-      for (let i = 0; i < skillNames.length; i++) {
-        for (let j = i + 1; j < skillNames.length; j++) {
-          const setA = skillKeywordMap.get(skillNames[i]);
-          const setB = skillKeywordMap.get(skillNames[j]);
-          let intersection = 0;
-          for (const kw of setA) {
-            if (setB.has(kw)) intersection++;
-          }
-          const smaller = Math.min(setA.size, setB.size);
-          const overlapRatio = smaller > 0 ? intersection / smaller : 0;
-          if (overlapRatio > 0.5 && intersection >= 2) {
-            overlappingPairs.push({
-              skillA: skillNames[i],
-              skillB: skillNames[j],
-              overlapRatio: +(overlapRatio * 100).toFixed(0),
-              sharedKeywords: [...setA].filter(k => setB.has(k)),
-            });
-          }
-        }
-      }
-
-      if (overlappingPairs.length > 0) {
-        findings.push(this.recordIssue({
-          type: ReflectionType.OPTIMISATION_OPP,
-          severity: overlappingPairs.length >= 3 ? ReflectionSeverity.HIGH : ReflectionSeverity.MEDIUM,
-          title: `${overlappingPairs.length} skill pair(s) have conflicting keyword overlap`,
-          description: `Skill pairs with >50% keyword overlap may inject contradictory advice: ${overlappingPairs.slice(0, 3).map(p => `${p.skillA}↔${p.skillB} (${p.overlapRatio}%, shared: [${p.sharedKeywords.join(',')}])`).join('; ')}`,
-          source: 'audit:health',
-          patternKey: 'skill-keyword-conflict',
-          suggestedFix: 'Review overlapping skills for content conflicts. Consider merging redundant skills or differentiating their keywords.',
-          metrics: { pairs: overlappingPairs.slice(0, 5), count: overlappingPairs.length },
-        }));
-      }
-    } catch (_) { /* Non-fatal: keyword analysis is optional */ }
-
-    const summary = findings.length === 0
-      ? '✅ Health audit passed: no anomalies detected across cross-session metrics.'
-      : `⚠️ Health audit found ${findings.length} issue(s):\n${findings.map(f => `  - [${f.severity}] ${f.title}`).join('\n')}`;
-
-    console.log(`[SelfReflection] 📊 Health audit complete: ${findings.length} finding(s) from ${history.length} sessions.`);
-    return { findings, summary };
+    return this._healthAuditor.audit();
   }
 
-  // ─── Automated Gating: Run Validation ─────────────────────────────────────
+  // ─── Automated Gating: Run Validation (delegated to QualityGate – A-1 fix) ──
 
   /**
    * Validates a completed workflow run against quality gates.
-   * Call this after Observability.flush() with the session metrics.
-   *
-   * Returns a pass/fail verdict with details on which gates were breached.
-   * Automatically records reflections for any failures.
+   * Delegates to QualityGate which encapsulates all gate evaluation logic.
    *
    * @param {object} metrics - From Observability.flush()
-   * @returns {{ passed: boolean, gates: Array<{ name: string, passed: boolean, actual: any, threshold: any, message: string }>, reflections: ReflectionEntry[] }}
+   * @returns {{ passed: boolean, gates: Array, reflections: ReflectionEntry[] }}
    */
   validateRun(metrics) {
-    if (!metrics) return { passed: true, gates: [], reflections: [] };
-
-    const gates = [];
-    const reflections = [];
-    const g = this._qualityGates;
-
-    // Gate 1: Error count
-    const errorCount = metrics.errors?.count || 0;
-    const errorGate = {
-      name: 'maxErrorCount',
-      passed: errorCount <= g.maxErrorCount,
-      actual: errorCount,
-      threshold: g.maxErrorCount,
-      message: errorCount <= g.maxErrorCount
-        ? `Errors within limit (${errorCount} ≤ ${g.maxErrorCount})`
-        : `Error count exceeded (${errorCount} > ${g.maxErrorCount})`,
-    };
-    gates.push(errorGate);
-
-    // Gate 2: Test pass rate
-    if (metrics.testResult) {
-      const { passed: tp = 0, failed: tf = 0 } = metrics.testResult;
-      const total = tp + tf;
-      const passRate = total > 0 ? tp / total : 1;
-      const testGate = {
-        name: 'minTestPassRate',
-        passed: passRate >= g.minTestPassRate,
-        actual: `${(passRate * 100).toFixed(0)}%`,
-        threshold: `${(g.minTestPassRate * 100).toFixed(0)}%`,
-        message: passRate >= g.minTestPassRate
-          ? `Test pass rate OK (${(passRate * 100).toFixed(0)}% ≥ ${(g.minTestPassRate * 100).toFixed(0)}%)`
-          : `Test pass rate too low (${(passRate * 100).toFixed(0)}% < ${(g.minTestPassRate * 100).toFixed(0)}%)`,
-      };
-      gates.push(testGate);
-    }
-
-    // Gate 3: Duration
-    const duration = metrics.totalDurationMs || 0;
-    const durationGate = {
-      name: 'maxDurationMs',
-      passed: duration <= g.maxDurationMs,
-      actual: `${(duration / 1000).toFixed(1)}s`,
-      threshold: `${(g.maxDurationMs / 1000).toFixed(1)}s`,
-      message: duration <= g.maxDurationMs
-        ? `Duration within limit (${(duration / 1000).toFixed(1)}s ≤ ${(g.maxDurationMs / 1000).toFixed(1)}s)`
-        : `Duration exceeded (${(duration / 1000).toFixed(1)}s > ${(g.maxDurationMs / 1000).toFixed(1)}s)`,
-    };
-    gates.push(durationGate);
-
-    // Gate 4: LLM call count (detect retry storms)
-    const llmCalls = metrics.llm?.totalCalls || 0;
-    const llmGate = {
-      name: 'maxLlmCalls',
-      passed: llmCalls <= g.maxLlmCalls,
-      actual: llmCalls,
-      threshold: g.maxLlmCalls,
-      message: llmCalls <= g.maxLlmCalls
-        ? `LLM calls within limit (${llmCalls} ≤ ${g.maxLlmCalls})`
-        : `LLM call count high — possible retry storm (${llmCalls} > ${g.maxLlmCalls})`,
-    };
-    gates.push(llmGate);
-
-    // Gate 5: Token waste ratio (if blockTelemetry available)
-    if (metrics.blockTelemetry?.summary) {
-      const { totalInjected = 0, totalDropped = 0 } = metrics.blockTelemetry.summary;
-      const wasteRatio = totalInjected > 0 ? totalDropped / totalInjected : 0;
-      const wasteGate = {
-        name: 'maxTokenWasteRatio',
-        passed: wasteRatio <= g.maxTokenWasteRatio,
-        actual: `${(wasteRatio * 100).toFixed(0)}%`,
-        threshold: `${(g.maxTokenWasteRatio * 100).toFixed(0)}%`,
-        message: wasteRatio <= g.maxTokenWasteRatio
-          ? `Token waste acceptable (${(wasteRatio * 100).toFixed(0)}% ≤ ${(g.maxTokenWasteRatio * 100).toFixed(0)}%)`
-          : `Token waste too high (${(wasteRatio * 100).toFixed(0)}% > ${(g.maxTokenWasteRatio * 100).toFixed(0)}%)`,
-      };
-      gates.push(wasteGate);
-    }
-
-    // Record reflections for failed gates
-    const failedGates = gates.filter(g => !g.passed);
-    for (const fg of failedGates) {
-      reflections.push(this.recordIssue({
-        type: ReflectionType.QUALITY_GATE_FAIL,
-        severity: fg.name === 'maxErrorCount' || fg.name === 'minTestPassRate'
-          ? ReflectionSeverity.HIGH
-          : ReflectionSeverity.MEDIUM,
-        title: `Quality gate breached: ${fg.name}`,
-        description: fg.message,
-        source: 'gating:validateRun',
-        patternKey: `gate-fail:${fg.name}`,
-        metrics: { actual: fg.actual, threshold: fg.threshold },
-      }));
-    }
-
-    const passed = failedGates.length === 0;
-    if (passed) {
-      console.log(`[SelfReflection] ✅ All ${gates.length} quality gates passed.`);
-    } else {
-      console.warn(`[SelfReflection] ❌ ${failedGates.length} of ${gates.length} quality gates failed: [${failedGates.map(g => g.name).join(', ')}]`);
-    }
-
-    return { passed, gates, reflections };
+    return this._qualityGate.validate(metrics);
   }
 
   // ─── Reflection Report ────────────────────────────────────────────────────
@@ -800,6 +413,21 @@ class SelfReflectionEngine {
       if (fs.existsSync(this._reflectionPath)) {
         const data = JSON.parse(fs.readFileSync(this._reflectionPath, 'utf-8'));
         this._reflections = data.reflections || [];
+
+        // P1-7 fix: Enforce maximum reflection count to prevent unbounded memory growth.
+        // Keep the most recent entries; archive fixed/deferred ones first.
+        const MAX_REFLECTIONS = 500;
+        if (this._reflections.length > MAX_REFLECTIONS) {
+          // Partition: keep all OPEN, trim FIXED/DEFERRED first
+          const open = this._reflections.filter(e => e.status === ReflectionStatus.OPEN);
+          const closed = this._reflections.filter(e => e.status !== ReflectionStatus.OPEN);
+          // Sort closed by date descending, keep only enough to fill quota
+          closed.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          const maxClosed = Math.max(0, MAX_REFLECTIONS - open.length);
+          this._reflections = [...open, ...closed.slice(0, maxClosed)].slice(0, MAX_REFLECTIONS);
+          console.log(`[SelfReflection] Trimmed reflections from ${data.reflections.length} to ${this._reflections.length} (max ${MAX_REFLECTIONS})`);
+        }
+
         // Rebuild pattern frequency map
         for (const e of this._reflections) {
           if (e.patternKey) {

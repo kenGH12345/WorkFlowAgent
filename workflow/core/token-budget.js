@@ -41,7 +41,24 @@ const _compressor = new BlockCompressor();
  * blocks are truncated first (down to their minimum useful size), then dropped
  * entirely if still over.
  */
+/**
+ * A-2 Architecture Fix: Unified Budget Constants
+ *
+ * The system has three budget layers with DIFFERENT units:
+ *   L1 – ContextLoader (context-loader.js): MAX_INJECT_TOKENS = 2800 tokens
+ *   L2 – Stage Budget  (this file):         STAGE_TOKEN_BUDGET_CHARS = 60000 chars ≈ 15000 tokens
+ *   L3 – Prompt Guard   (prompt-builder.js): HALLUCINATION_RISK_THRESHOLD = 16000 tokens
+ *
+ * L2 uses chars intentionally (avoids per-block estimateTokens() overhead). But
+ * all three layers now expose their budget in BOTH units for cross-layer diagnostics.
+ *
+ * Data flow: Content passes through L1 → L2 → L3 sequentially. Each layer
+ * operates independently, but total truncation should be monitored via
+ * getBudgetSummary() to detect double-truncation anomalies.
+ */
+const CHARS_PER_TOKEN = 4; // Must stay in sync with constants.js LLM.CHARS_PER_TOKEN
 const STAGE_TOKEN_BUDGET_CHARS = 60000; // ~15k tokens – safe margin for enrichment blocks
+const STAGE_TOKEN_BUDGET_TOKENS = Math.floor(STAGE_TOKEN_BUDGET_CHARS / CHARS_PER_TOKEN); // 15000 tokens
 
 /**
  * Priority levels for context blocks (higher = more important, kept longer).
@@ -128,10 +145,18 @@ function _applyTokenBudget(blocks, budget = STAGE_TOKEN_BUDGET_CHARS, opts = {})
   const totalBefore = active.reduce((sum, b) => sum + b.content.length, 0);
 
   if (totalBefore <= budget) {
-    // Under budget – no truncation needed
+  // Under budget – no truncation needed
     return {
       assembled: active.map(b => b.content).join('\n\n'),
-      stats: { total: totalBefore, dropped: [], truncated: [], compressionSaved, preFilterSaved },
+      stats: {
+        total: totalBefore,
+        estimatedTokens: Math.ceil(totalBefore / CHARS_PER_TOKEN),
+        dropped: [],
+        truncated: [],
+        compressionSaved,
+        preFilterSaved,
+        preFilterLabels,
+      },
     };
   }
 
@@ -181,10 +206,14 @@ function _applyTokenBudget(blocks, budget = STAGE_TOKEN_BUDGET_CHARS, opts = {})
   }
 
   // Phase 2: Drop lowest-priority blocks entirely if still over
+  // P0-4 fix: Phase 1 truncation mutated block.content (adding truncation suffix),
+  // so block.content.length is already the post-truncation length. We must use
+  // the current (post-Phase-1) content length for accurate currentTotal tracking.
   for (let i = sorted.length - 1; i >= 0 && currentTotal > budget; i--) {
     const block = sorted[i];
-    if (block.content.length === 0) continue;
-    currentTotal -= block.content.length;
+    const blockLen = block.content.length;
+    if (blockLen === 0) continue;
+    currentTotal -= blockLen;
     dropped.push(block.label);
     block.content = '';
 
@@ -209,16 +238,26 @@ function _applyTokenBudget(blocks, budget = STAGE_TOKEN_BUDGET_CHARS, opts = {})
   }
 
   // Re-sort back to original insertion order for coherent reading
+  // P1-3 fix: plugin blocks may not have _order set (undefined - undefined = NaN).
+  // Default to 999 so unordered blocks sort to the end; use index as tiebreaker for stability.
   // R5-4 audit: added trim() guard to prevent whitespace-only blocks from passing filter
   const assembled = sorted
     .filter(b => b.content && b.content.trim().length > 0)
-    .sort((a, b) => a._order - b._order)
+    .sort((a, b) => (a._order ?? 999) - (b._order ?? 999))
     .map(b => b.content)
     .join('\n\n');
 
   return {
     assembled,
-    stats: { total: currentTotal, dropped, truncated, compressionSaved, preFilterSaved },
+    stats: {
+      total: currentTotal,
+      estimatedTokens: Math.ceil(currentTotal / CHARS_PER_TOKEN),
+      dropped,
+      truncated,
+      compressionSaved,
+      preFilterSaved,
+      preFilterLabels,
+    },
   };
 }
 
@@ -466,9 +505,48 @@ class ToolResultFilter {
 }
 
 
+/**
+ * Returns a human-readable summary of all three budget layers.
+ * Call this after prompt assembly to detect double-truncation anomalies.
+ *
+ * A-2 Architecture Fix: provides the unified budget view that was previously
+ * impossible because the three layers used different units and had no
+ * cross-layer awareness.
+ *
+ * @param {object} l2Stats - stats object from _applyTokenBudget()
+ * @param {object} [l3Analysis] - noiseAnalysis from prompt-builder.js
+ * @returns {string} Human-readable budget summary
+ */
+function getBudgetSummary(l2Stats, l3Analysis = null) {
+  const lines = [
+    `── Token Budget Summary (unified view) ──`,
+    `  L2 Stage Budget  : ${l2Stats.total} chars ≈ ${l2Stats.estimatedTokens} tokens (limit: ${STAGE_TOKEN_BUDGET_CHARS} chars ≈ ${STAGE_TOKEN_BUDGET_TOKENS} tokens)`,
+  ];
+  if (l2Stats.dropped.length > 0) {
+    lines.push(`  L2 dropped       : [${l2Stats.dropped.join(', ')}]`);
+  }
+  if (l2Stats.truncated.length > 0) {
+    lines.push(`  L2 truncated     : [${l2Stats.truncated.join(', ')}]`);
+  }
+  if (l3Analysis) {
+    lines.push(`  L3 Prompt Guard  : ${l3Analysis.estimatedTokens} tokens (threshold: ${l3Analysis.isHighRisk ? '⚠️ EXCEEDED' : 'OK'})`);
+    if (l3Analysis.isHighRisk) {
+      lines.push(`  L3 risk level    : ${l3Analysis.riskLevel}`);
+    }
+  }
+  // Detect double-truncation warning
+  if (l2Stats.dropped.length > 0 && l3Analysis && l3Analysis.isHighRisk) {
+    lines.push(`  ⚠️  DOUBLE TRUNCATION: L2 dropped blocks AND L3 still exceeds threshold.`);
+    lines.push(`     Consider increasing STAGE_TOKEN_BUDGET_CHARS or reducing upstream context.`);
+  }
+  return lines.join('\n');
+}
+
 module.exports = {
   STAGE_TOKEN_BUDGET_CHARS,
+  STAGE_TOKEN_BUDGET_TOKENS,
   BLOCK_PRIORITY,
   _applyTokenBudget,
   ToolResultFilter,
+  getBudgetSummary,
 };

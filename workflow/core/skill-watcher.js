@@ -55,6 +55,11 @@ class SkillWatcher extends EventEmitter {
    * Starts watching the skills directory for changes.
    * Safe to call multiple times (idempotent).
    *
+   * P1-9 fix: fs.watch() recursive option only works on macOS/Windows.
+   * On Linux (inotify), we manually walk subdirectories and create
+   * a watcher for each. Also changed persistent to true to prevent
+   * premature event loop exit when no other handles are active.
+   *
    * @returns {boolean} true if watcher started successfully
    */
   start() {
@@ -66,18 +71,39 @@ class SkillWatcher extends EventEmitter {
     }
 
     try {
-      this._watcher = fs.watch(this._skillsDir, { persistent: false }, (eventType, filename) => {
-        if (!filename || !filename.endsWith('.md')) return;
-        this._handleChange(eventType, filename);
-      });
+      /** @type {fs.FSWatcher[]} */
+      this._watchers = [];
 
-      this._watcher.on('error', (err) => {
-        console.warn(`[SkillWatcher] ⚠️  Watch error: ${err.message}`);
-        this.emit('error', err);
-      });
+      const watchDir = (dir) => {
+        const watcher = fs.watch(dir, { persistent: true }, (eventType, filename) => {
+          if (!filename || !filename.endsWith('.md')) return;
+          this._handleChange(eventType, filename);
+        });
+
+        watcher.on('error', (err) => {
+          console.warn(`[SkillWatcher] ⚠️  Watch error on ${dir}: ${err.message}`);
+          this.emit('error', err);
+        });
+
+        this._watchers.push(watcher);
+      };
+
+      // Watch the root skills directory
+      watchDir(this._skillsDir);
+
+      // P1-9 fix: On Linux, fs.watch doesn't support recursive.
+      // Manually walk immediate subdirectories and watch each.
+      try {
+        const entries = fs.readdirSync(this._skillsDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory()) {
+            watchDir(path.join(this._skillsDir, entry.name));
+          }
+        }
+      } catch (_) { /* ignore subdir enumeration errors */ }
 
       this._running = true;
-      console.log(`[SkillWatcher] 👀 Watching skills directory: ${this._skillsDir}`);
+      console.log(`[SkillWatcher] 👀 Watching skills directory: ${this._skillsDir} (${this._watchers.length} watcher(s))`);
       this.emit('started');
       return true;
     } catch (err) {
@@ -98,6 +124,14 @@ class SkillWatcher extends EventEmitter {
     }
     this._debounceTimers.clear();
 
+    // P1-9 fix: Close all watchers (may have multiple for subdirectories)
+    if (this._watchers) {
+      for (const watcher of this._watchers) {
+        try { watcher.close(); } catch (_) {}
+      }
+      this._watchers = [];
+    }
+    // Legacy: close single watcher if present
     if (this._watcher) {
       this._watcher.close();
       this._watcher = null;

@@ -34,9 +34,9 @@ class ArchitectStage extends StageRunner {
    */
   async execute(ctx) {
     const orch = ctx.orchestrator;
-    // Delegate to the original _runArchitect function (preserved in orchestrator-stages.js)
-    // The function uses `this` to access orchestrator properties, so we bind it.
-    const { _runArchitect } = require('../orchestrator-stages');
+    // P0-2 fix: Import directly from stage-architect.js instead of the orchestrator-stages.js
+    // re-export facade to eliminate unnecessary indirection.
+    const { _runArchitect } = require('../stage-architect');
     return _runArchitect.call(orch);
   }
 }

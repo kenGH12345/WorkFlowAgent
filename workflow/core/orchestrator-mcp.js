@@ -15,6 +15,7 @@ const { MCPRegistry, TAPDAdapter, DevToolsAdapter, PackageRegistryAdapter, Secur
 const { SmartContextSelector } = require('./smart-context-selector');
 const { AdapterTelemetry } = require('./adapter-telemetry');
 const { AdapterPluginRegistry, createBuiltinPlugins } = require('./adapter-plugin-registry');
+const { detectIDEEnvironment, shouldSkipLSPAdapter } = require('./ide-detection');
 
 /**
  * Initialises all MCP-related subsystems on the Orchestrator instance.
@@ -131,15 +132,35 @@ function initMCPSubsystems(orch) {
     orch._pluginRegistry.register(plugin);
   }
 
+  // ── IDE Environment Detection ──────────────────────────────────────────────
+  // Detect whether we're running inside an IDE (Cursor, VS Code, etc.)
+  // This affects LSP adapter behavior and prompt guidance.
+  // Supports config overrides: ide.forceStandalone / ide.forceIDE
+  const ideDetection = detectIDEEnvironment({ config: orch._config });
+  orch.ideDetection = ideDetection;
+  orch.services.registerValue('ideDetection', ideDetection);
+
   // ── Logging summary ───────────────────────────────────────────────────────
   console.log(`[Orchestrator] 🔌 AdapterPluginRegistry initialised with ${builtinPlugins.length} built-in plugin(s).`);
+
+  // Show IDE-first mode status
+  if (ideDetection.isInsideIDE) {
+    console.log(`[Orchestrator] 🏠 IDE-First mode: ${ideDetection.ideName} detected. Agent prompts will prefer IDE tools.`);
+    if (ideDetection.capabilities.builtinLSP) {
+      console.log(`[Orchestrator]    LSP: IDE-native (self-spawned LSP skipped)`);
+    }
+    if (ideDetection.capabilities.codebaseSearch) {
+      console.log(`[Orchestrator]    Search: IDE codebase_search preferred over CodeGraph.search()`);
+    }
+  }
+
   const adapters = [
     cfgMcp.tapd && 'TAPD',
     cfgMcp.devtools && 'DevTools',
     cfgMcp.webSearch && `WebSearch(${cfgMcp.webSearch.provider || 'fetch'})`,
     cfgMcp.packageRegistry !== false && 'PackageRegistry',
     cfgMcp.securityCVE !== false && 'SecurityCVE(OSV.dev)',
-    cfgMcp.lsp !== false && `LSP(${(typeof cfgMcp.lsp === 'object' && cfgMcp.lsp.server) || 'auto-detect'})`,
+    cfgMcp.lsp !== false && (shouldSkipLSPAdapter() ? 'LSP(IDE-native, self-spawn skipped)' : `LSP(${(typeof cfgMcp.lsp === 'object' && cfgMcp.lsp.server) || 'auto-detect'})`),
     cfgMcp.codeQuality !== false && `CodeQuality(${(typeof cfgMcp.codeQuality === 'object' && cfgMcp.codeQuality.backend) || 'local'})`,
     cfgMcp.ciStatus !== false && 'CIStatus',
     cfgMcp.licenseCompliance !== false && 'LicenseCompliance(ClearlyDefined)',

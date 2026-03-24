@@ -363,8 +363,65 @@ function scanFiles(dirPath, extensions, maxFiles, ignoreDirs = DEFAULT_IGNORE_DI
 // ─── Experience Builder ───────────────────────────────────────────────────────
 
 /**
+ * Extracts key function/class/type signatures from a generic source file.
+ * Supports JS/TS, Python, Go, Java, Dart via regex-based extraction.
+ *
+ * @param {string} ext - File extension
+ * @param {string} content - File content
+ * @returns {{ classes: string[], functions: string[] }}
+ */
+function extractGenericSignatures(ext, content) {
+  const classes = [];
+  const functions = [];
+
+  // ── Language-specific signature patterns ──────────────────────────────────
+  const PATTERNS = {
+    '.js':   { fn: /^(?:export\s+)?(?:async\s+)?function\s+(\w+)/gm,                       cls: /^(?:export\s+)?class\s+(\w+)/gm },
+    '.ts':   { fn: /^(?:export\s+)?(?:async\s+)?function\s+(\w+)/gm,                       cls: /^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)/gm,     iface: /^(?:export\s+)?interface\s+(\w+)/gm },
+    '.py':   { fn: /^(?:async\s+)?def\s+(\w+)\s*\(/gm,                                     cls: /^class\s+(\w+)/gm },
+    '.go':   { fn: /^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(/gm,                        cls: /^type\s+(\w+)\s+struct/gm,                           iface: /^type\s+(\w+)\s+interface/gm },
+    '.java': { fn: /^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:(?:void|\w+)\s+)(\w+)\s*\(/gm, cls: /^\s*(?:public\s+)?(?:abstract\s+)?class\s+(\w+)/gm, iface: /^\s*(?:public\s+)?interface\s+(\w+)/gm },
+    '.dart': { fn: /^\s*(?:Future|void|\w+)\s+(\w+)\s*\(/gm,                               cls: /^(?:abstract\s+)?class\s+(\w+)/gm },
+  };
+
+  const patterns = PATTERNS[ext];
+  if (!patterns) return { classes, functions };
+
+  // Extract classes/structs
+  if (patterns.cls) {
+    let m;
+    while ((m = patterns.cls.exec(content)) !== null) {
+      if (classes.length < 8) classes.push(m[1]);
+    }
+  }
+  // Extract interfaces (if supported)
+  if (patterns.iface) {
+    let m;
+    while ((m = patterns.iface.exec(content)) !== null) {
+      if (classes.length < 12) classes.push(`I:${m[1]}`);
+    }
+  }
+  // Extract functions
+  if (patterns.fn) {
+    const SKIP_FN = new Set(['if', 'while', 'for', 'switch', 'return', 'new', 'try', 'catch', 'else', 'elif', 'except', 'finally', 'main', 'init', 'setup']);
+    let m;
+    while ((m = patterns.fn.exec(content)) !== null) {
+      const name = m[1];
+      if (name.length >= 2 && !SKIP_FN.has(name) && !name.startsWith('_') && functions.length < 10) {
+        functions.push(name);
+      }
+    }
+  }
+
+  return { classes, functions };
+}
+
+/**
  * Builds an experience record for any non-C#/non-Lua file extension.
  * Uses config rules for classification; falls back to a generic record.
+ *
+ * P3 Enhancement: Now extracts function/class signatures from source code
+ * to produce richer experience content that can evolve into Code Snippets.
  */
 function buildExperienceFromGeneric(ext, relativePath, content, configRules = [], defaultSkills = {}) {
   const { category, skill, tags } = classifyGenericFile(ext, relativePath, content, configRules, defaultSkills);
@@ -374,13 +431,25 @@ function buildExperienceFromGeneric(ext, relativePath, content, configRules = []
   const lines = [];
   lines.push(`**File**: \`${relativePath}\``);
 
+  // P3: Extract and include function/class signatures for richer content
+  const { classes, functions } = extractGenericSignatures(ext, content);
+  if (classes.length > 0) {
+    const ifaces = classes.filter(c => c.startsWith('I:'));
+    const types  = classes.filter(c => !c.startsWith('I:'));
+    if (types.length > 0)  lines.push(`**Types**: ${types.join(', ')}`);
+    if (ifaces.length > 0) lines.push(`**Interfaces**: ${ifaces.map(i => i.slice(2)).join(', ')}`);
+  }
+  if (functions.length > 0) {
+    lines.push(`**Key Functions**: \`${functions.join('()\`, \`')}()\``);
+  }
+
   return {
     type: ExperienceType.POSITIVE,
     category,
     title,
     content: lines.join('\n'),
     skill,
-    tags,
+    tags: [...new Set([...tags, ...classes.filter(c => !c.startsWith('I:')).slice(0, 2)])],
     sourceFile: relativePath,
   };
 }

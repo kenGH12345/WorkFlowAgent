@@ -77,7 +77,31 @@ const ExperienceQueryMixin = {
 
     if (type) results = results.filter(e => e.type === type);
     if (category) results = results.filter(e => e.category === category);
-    if (skill) results = results.filter(e => e.skill === skill);
+    // P1 fix: Skill matching with fallback to category/tags when no exact match.
+    // This handles the semantic mismatch between workflow stage names (e.g., 'code-development')
+    // and technology stack names (e.g., 'unity-csharp') stored in experiences.
+    if (skill) {
+      const exactMatches = results.filter(e => e.skill === skill);
+      if (exactMatches.length > 0) {
+        results = exactMatches;
+      } else {
+        // Fallback: try category matching (architecture-design -> ARCHITECTURE category)
+        const skillCategoryMap = {
+          'architecture-design': 'architecture',
+          'code-development': 'stable_pattern',
+          'test-report': 'pitfall',
+          'security-audit': 'performance',
+        };
+        const mappedCategory = skillCategoryMap[skill];
+        if (mappedCategory) {
+          const categoryMatches = results.filter(e => e.category === mappedCategory);
+          if (categoryMatches.length > 0) {
+            results = categoryMatches;
+          }
+          // If category match also fails, keep all results and let keyword scoring do the filtering
+        }
+      }
+    }
     if (sourceFile) results = results.filter(e => e.sourceFile && e.sourceFile.includes(sourceFile));
     if (moduleId) results = results.filter(e => e.moduleId === moduleId);
     if (tags && tags.length > 0) {
@@ -87,6 +111,10 @@ const ExperienceQueryMixin = {
     }
 
     const ZOMBIE_RETRIEVAL_THRESHOLD = 5;
+    // P1-2 fix: Pre-compute last-activity timestamps once, outside the scoring loop.
+    // Avoids creating hundreds of Date objects per search call.
+    const HALF_LIFE_DAYS = 60;
+    const nowMs = now; // already in ms
 
     if (keyword) {
       const keywords = keyword.toLowerCase().split(/\s+/).filter(Boolean);
@@ -101,9 +129,9 @@ const ExperienceQueryMixin = {
             if (tagsLower.some(t => t.includes(kw))) score += 6;
             if (contentLower.includes(kw)) score += 2;
           }
-          const lastActivity = new Date(e.updatedAt || e.createdAt).getTime();
-          const daysSinceActivity = (now - lastActivity) / 86400_000;
-          const HALF_LIFE_DAYS = 60;
+          // P1-2 fix: use cached timestamp (or compute once per experience)
+          const lastActivity = e._lastActivityTs || (e._lastActivityTs = new Date(e.updatedAt || e.createdAt).getTime());
+          const daysSinceActivity = (nowMs - lastActivity) / 86400_000;
           const recencyMultiplier = 1 / (1 + daysSinceActivity / HALF_LIFE_DAYS);
           const hitBoost = Math.log2(1 + (e.hitCount || 0));
           const finalScore = score * recencyMultiplier * (1 + hitBoost * 0.2);
@@ -116,9 +144,9 @@ const ExperienceQueryMixin = {
     } else {
       results = results
         .map(e => {
-          const lastActivity = new Date(e.updatedAt || e.createdAt).getTime();
-          const daysSinceActivity = (now - lastActivity) / 86400_000;
-          const HALF_LIFE_DAYS = 60;
+          // P1-2 fix: use cached timestamp
+          const lastActivity = e._lastActivityTs || (e._lastActivityTs = new Date(e.updatedAt || e.createdAt).getTime());
+          const daysSinceActivity = (nowMs - lastActivity) / 86400_000;
           const recencyMultiplier = 1 / (1 + daysSinceActivity / HALF_LIFE_DAYS);
           const decayedScore = (e.hitCount || 0) * recencyMultiplier;
           const isZombie = (e.retrievalCount || 0) >= ZOMBIE_RETRIEVAL_THRESHOLD && e.hitCount === 0;
@@ -134,12 +162,18 @@ const ExperienceQueryMixin = {
   /**
    * Returns a formatted context block with experience IDs.
    *
-   * @param {string} [skill]
+   * P1 fix: Enhanced skill matching to support both workflow stage names (e.g., 'code-development')
+   * and technology stack names (e.g., 'unity-csharp'). When skill is a workflow stage name,
+   * it also tries to match experiences by techStack if provided.
+   *
+   * @param {string} [skill] - Workflow stage skill name (e.g., 'architecture-design', 'code-development')
    * @param {string} [taskDescription]
    * @param {number} [limit=5]
+   * @param {object} [options]
+   * @param {string[]} [options.techStack] - Detected tech stack names for fallback matching
    * @returns {Promise<{ block: string, ids: string[] }>}
    */
-  async getContextBlockWithIds(skill = null, taskDescription = null, limit = 5) {
+  async getContextBlockWithIds(skill = null, taskDescription = null, limit = 5, options = {}) {
     const ExperienceType = require('./experience-types').ExperienceType;
     if (!skill) return { block: '', ids: [] };
 
@@ -159,8 +193,25 @@ const ExperienceQueryMixin = {
     }
 
     const perTypeLimit = Math.max(1, Math.ceil(limit / 2));
-    const positives = this.search({ type: ExperienceType.POSITIVE, skill, keyword, limit: perTypeLimit, scoreSort });
-    const negatives = this.search({ type: ExperienceType.NEGATIVE, skill, keyword, limit: perTypeLimit, scoreSort });
+    let positives = this.search({ type: ExperienceType.POSITIVE, skill, keyword, limit: perTypeLimit, scoreSort });
+    let negatives = this.search({ type: ExperienceType.NEGATIVE, skill, keyword, limit: perTypeLimit, scoreSort });
+
+    // P1 fix: If no results found and techStack is provided, try matching by tech stack skill
+    const { techStack } = options;
+    if (positives.length === 0 && negatives.length === 0 && techStack && techStack.length > 0) {
+      // Map tech stack names to skill names (e.g., 'Unity + C#' -> 'unity-csharp')
+      const techSkillNames = techStack.map(t => t.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-'));
+      for (const techSkill of techSkillNames) {
+        const techPositives = this.search({ type: ExperienceType.POSITIVE, skill: techSkill, keyword, limit: perTypeLimit, scoreSort });
+        const techNegatives = this.search({ type: ExperienceType.NEGATIVE, skill: techSkill, keyword, limit: perTypeLimit, scoreSort });
+        if (techPositives.length > 0 || techNegatives.length > 0) {
+          positives = techPositives;
+          negatives = techNegatives;
+          console.log(`[ExperienceQuery] 🔄 Fallback to tech stack skill "${techSkill}" (${positives.length}+${negatives.length} experiences)`);
+          break;
+        }
+      }
+    }
     const ids = [...positives.map(e => e.id), ...negatives.map(e => e.id)];
 
     for (const id of ids) { this.markRetrieved(id); }
@@ -215,7 +266,7 @@ const ExperienceQueryMixin = {
     const errorLower = (errorContext || '').toLowerCase();
 
     const matchedIds = ids.filter(id => {
-      const exp = this.experiences.find(e => e.id === id);
+      const exp = this._idIndex.get(id);
       if (!exp) return false;
       if (exp.type === ExperienceType.POSITIVE) return true;
 
@@ -255,12 +306,18 @@ const ExperienceQueryMixin = {
     // Step 1: Synonym Table Lookup (O(1), 0ms)
     const cacheKey = keywords.slice().sort().join('|');
     const tableEntry = this._synonymTable[cacheKey];
-    if (tableEntry && Array.isArray(tableEntry.expandedTerms) && tableEntry.expandedTerms.length > 0) {
-      const merged = [...keywords, ...tableEntry.expandedTerms].slice(0, 20);
-      tableEntry.hitCount = (tableEntry.hitCount || 0) + 1;
-      this._synonymTableDirty = true;
-      console.log(`[ExperienceStore] 📖 Synonym table HIT: [${keywords.join(', ')}] → +${tableEntry.expandedTerms.length} cached terms (hit #${tableEntry.hitCount})`);
-      return merged;
+    if (tableEntry) {
+      // P1-10 fix: If this entry was a recent failure (<10 min), skip LLM retry
+      if (tableEntry._failedAt && (Date.now() - tableEntry._failedAt) < 600_000) {
+        return keywords;
+      }
+      if (Array.isArray(tableEntry.expandedTerms) && tableEntry.expandedTerms.length > 0) {
+        const merged = [...keywords, ...tableEntry.expandedTerms].slice(0, 20);
+        tableEntry.hitCount = (tableEntry.hitCount || 0) + 1;
+        this._synonymTableDirty = true;
+        console.log(`[ExperienceStore] 📖 Synonym table HIT: [${keywords.join(', ')}] → +${tableEntry.expandedTerms.length} cached terms (hit #${tableEntry.hitCount})`);
+        return merged;
+      }
     }
 
     // Step 2: LLM Query Expansion (fallback, ~1-3s)
@@ -288,7 +345,7 @@ Output:`;
 
     try {
       const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Query expansion timeout')), 3000)
+        setTimeout(() => reject(new Error('Query expansion timeout')), 8000)
       );
       const response = await Promise.race([this._llmCall(prompt), timeoutPromise]);
 
@@ -296,6 +353,15 @@ Output:`;
       const arrayMatch = cleaned.match(/\[([^\]]+)\]/);
       if (!arrayMatch) {
         console.warn(`[ExperienceStore] ⚠️  Query expansion: could not parse LLM response as JSON array.`);
+        // P1-10 fix: cache negative result to avoid retrying on next call
+        this._synonymTable[cacheKey] = {
+          expandedTerms: [],
+          createdAt: new Date().toISOString(),
+          hitCount: 0,
+          skill: skill || null,
+          _failedAt: Date.now(),
+        };
+        this._synonymTableDirty = true;
         return keywords;
       }
 
@@ -391,6 +457,15 @@ Output:`;
     const coldEntries = entries.filter(([, e]) => (e.hitCount || 0) === 0).length;
     const coldStartPct = entryCount > 0 ? Math.round((coldEntries / entryCount) * 100) : 100;
     return { entryCount, totalHits, topEntries, coldStartPct };
+  },
+
+  /**
+   * Returns the full synonym table for use by other modules (PromptBuilder, ContextLoader).
+   * Used to expand queries with synonyms for better recall.
+   * @returns {Object} The synonym table object
+   */
+  getSynonymTable() {
+    return this._synonymTable || {};
   },
 
   importSynonymTable(externalTable) {

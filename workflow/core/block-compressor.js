@@ -166,19 +166,23 @@ function _compressPackageRegistry(content) {
 /**
  * Compresses a Security CVE block.
  * If no vulns, single-line summary. If vulns, JSON array of critical details only.
+ *
+ * P1-8 fix: the previous regex-based extraction was fragile (dependent on exact
+ * Markdown formatting from the adapter). Now uses a more lenient multi-strategy
+ * parser: tries structured header parsing first, falls back to line-by-line
+ * severity keyword scanning.
  */
 function _compressSecurityCVE(content) {
-  if (content.includes('No known vulnerabilities found')) {
+  if (content.includes('No known vulnerabilities found') ||
+      content.includes('No CVEs found') ||
+      content.includes('0 vulnerabilities')) {
     const compressed = `[SEC] No CVEs found.`;
     return { compressed, saved: content.length - compressed.length };
   }
 
-  // Extract vulnerability entries
-  const vulnBlocks = content.match(/###\s+(\S+)\s+\((\d+)\s+vuln/g);
-  if (!vulnBlocks) return { compressed: content, saved: 0 };
-
   const vulns = [];
-  // Parse each vulnerability section
+
+  // Strategy 1: Parse ### sections (structured CVE report format)
   const sections = content.split(/###\s+/).filter(Boolean);
   for (const section of sections) {
     const headerMatch = section.match(/^(\S+?)@?(\S*)\s+\((\d+)\s+vuln/);
@@ -188,7 +192,7 @@ function _compressSecurityCVE(content) {
     const ver = headerMatch[2] || '?';
     const count = parseInt(headerMatch[3], 10);
 
-    // Extract individual CVEs
+    // Extract individual CVEs with lenient patterns
     const cveMatches = [...section.matchAll(/\*\*([A-Z0-9-]+)\*\*\s*\[(\w+)\]:\s*(.*?)(?:\(fix:\s*(.*?)\))?$/gm)];
     const cves = cveMatches.slice(0, 3).map(m => ({
       id: m[1],
@@ -200,19 +204,39 @@ function _compressSecurityCVE(content) {
     vulns.push({ pkg, ver, n: count, cves });
   }
 
+  // Strategy 2: Fallback — scan for severity keywords line by line
+  if (vulns.length === 0) {
+    const severityPattern = /\b(critical|high|medium|low)\b/i;
+    const cveIdPattern = /\b(CVE-\d{4}-\d+|GHSA-[\w-]+)\b/;
+    let tempVulns = [];
+    for (const line of content.split('\n')) {
+      const sevMatch = line.match(severityPattern);
+      const cveMatch = line.match(cveIdPattern);
+      if (sevMatch || cveMatch) {
+        tempVulns.push({
+          id: cveMatch ? cveMatch[1] : '?',
+          sev: sevMatch ? sevMatch[1].charAt(0).toUpperCase() : '?',
+          sum: line.trim().slice(0, 100),
+        });
+      }
+    }
+    if (tempVulns.length > 0) {
+      vulns.push({ pkg: '?', ver: '?', n: tempVulns.length, cves: tempVulns.slice(0, 5) });
+    }
+  }
+
   if (vulns.length === 0) return { compressed: content, saved: 0 };
 
   const totalVulns = vulns.reduce((s, v) => s + v.n, 0);
   const hasCritical = vulns.some(v => v.cves.some(c => c.sev === 'C'));
 
   const compressed = [
-    `[SEC] ${totalVulns} vuln(s) in ${vulns.length} pkg(s)${hasCritical ? ' ⚠ CRITICAL' : ''}`,
+    `[SEC] ${totalVulns} vuln(s) in ${vulns.length} pkg(s)${hasCritical ? ' \u26a0 CRITICAL' : ''}`,
     JSON.stringify(vulns),
   ].join('\n');
 
   return { compressed, saved: content.length - compressed.length };
 }
-
 /**
  * Compresses a Code Quality block.
  * Metrics → JSON object, issues → abbreviated list.

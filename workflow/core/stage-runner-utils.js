@@ -71,8 +71,11 @@ async function consumeAndPrepareStage(orch, {
   const contextBlock = await buildContextBlock(orch, upstreamCtx, ...contextBlockArgs);
 
   // Record injection count to Observability for hit-rate tracking
+  // A-3 fix: contextBlock may be either { content, injectedExpIds } struct (new)
+  // or a legacy String object with ._injectedExpIds expando (old).
+  const _expIds = contextBlock.injectedExpIds || contextBlock._injectedExpIds || [];
   orch.obs.recordExpUsage({
-    injected: (contextBlock._injectedExpIds || []).length,
+    injected: _expIds.length,
   });
 
   return { inputPath, upstreamCtx, contextBlock };
@@ -137,16 +140,39 @@ function runQualityGateWithRollback(orch, {
 }
 
 /**
- * Converts a WorkflowState string to lowercase key fragment.
- * e.g. 'ARCHITECT' → 'arch', 'CODE' → 'code', 'TEST' → 'test'
+ * Converts a WorkflowState string to the lowercase key fragment used in
+ * rollback counter meta fields (e.g. `_archRollbackCount`).
+ *
+ * P0-3 fix: The original implementation only mapped 3 states (ARCHITECT, CODE,
+ * TEST). PLAN and any custom stages registered via StageRegistry would fall
+ * through to `workflowState.toLowerCase()`, producing keys like `_planRollbackCount`
+ * that are never written — causing QualityGate to silently read 0 and ignore
+ * rollback history.
+ *
+ * Fix: Added PLAN mapping and a defensive log for unknown states so that
+ * unmapped custom stages produce a visible warning instead of silent failure.
+ *
+ * @param {string} workflowState - e.g. 'ARCHITECT', 'CODE', 'TEST', 'PLAN'
+ * @returns {string} Lowercase key fragment (e.g. 'arch', 'code', 'test', 'plan')
  */
 function _stateKeyLower(workflowState) {
   const map = {
     ARCHITECT: 'arch',
     CODE: 'code',
     TEST: 'test',
+    PLAN: 'plan',
+    ANALYSE: 'analyse',
   };
-  return map[workflowState] || workflowState.toLowerCase();
+  const key = map[workflowState];
+  if (!key) {
+    console.warn(
+      `[stage-runner-utils] ⚠️  _stateKeyLower: no mapping for state "${workflowState}". ` +
+      `Using "${workflowState.toLowerCase()}". If this state uses rollback counters, ` +
+      `add a mapping to _stateKeyLower().`
+    );
+    return workflowState.toLowerCase();
+  }
+  return key;
 }
 
 // ─── 3. runEvoMapFeedback ───────────────────────────────────────────────────

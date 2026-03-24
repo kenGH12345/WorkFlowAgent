@@ -492,6 +492,11 @@ module.exports = {
       ? `## Global Goal\nThis task is part of a larger objective: ${globalGoal.slice(0, 300)}${globalGoal.length > 300 ? '...' : ''}\nEnsure your output aligns with and contributes to this overall goal.`
       : '';
 
+    // ── Progress Beacon: compact progress snapshot injected into every task ──
+    // Ensures the Agent always knows "where am I, what's done, what's left"
+    // even deep into a complex task. Cost: ~100-200 tokens for 10 tasks.
+    const progressBeacon = this._buildProgressBeacon(task.id);
+
     // Phase 2.5B: Module-Scope Injection for task-based execution
     let moduleContext = '';
     let taskModuleId = null;
@@ -526,8 +531,9 @@ module.exports = {
       }
     } catch (_) { /* non-fatal */ }
 
-    // Task-specific instruction block
+    // Task-specific instruction block (Progress Beacon prepended)
     const taskBlock = [
+      progressBeacon,
       `## Task Assignment`,
       `**Task ID**: ${task.id}`,
       `**Title**: ${task.title}`,
@@ -749,6 +755,11 @@ module.exports = {
       const result = buildAgentPrompt(role, dynamicInput);
       optimisedPrompt = result.prompt;
       console.log(`[Orchestrator] LLM call for ${role} (task: ${task.id}): ~${result.meta.estimatedTokens} tokens`);
+      // ── Skill Lifecycle: record injected skills for usage tracking ─────────────
+      if (result.meta.injectedSkillNames && result.meta.injectedSkillNames.length > 0) {
+        this.obs.recordSkillUsage(result.meta.injectedSkillNames);
+        console.log(`[Orchestrator] 📊 Skills injected for ${role}: ${result.meta.injectedSkillNames.join(', ')}`);
+      }
     } catch (err) {
       console.warn(`[Orchestrator] buildAgentPrompt failed for role "${role}" (task: ${task.id}): ${err.message}. Using raw prompt.`);
     }
@@ -875,6 +886,12 @@ module.exports = {
       console.log(`[AgentWorker:${agentId}] ✅ Re-planning complete: ${inserted} new task(s) inserted.`);
     }
   },
+
+  /**
+   * Builds a compact progress snapshot (Progress Beacon) for the current task.
+   * Delegates to the module-level helper (defined below module.exports).
+   */
+  _buildProgressBeacon,
 
   /**
    * Enhancement 1: Validates the quality of LLM-generated task decomposition.
@@ -1194,6 +1211,72 @@ module.exports = {
     return { coverageRate, covered, uncovered, failedTasks: failedTasks.map(t => t.id) };
   },
 };
+
+// ─── Progress Beacon Builder ──────────────────────────────────────────────────
+
+/**
+ * Builds a compact progress snapshot (Progress Beacon) that tells the Agent
+ * exactly where it is in the overall task plan.
+ *
+ * Example output:
+ *   ## 📍 Progress Beacon (3/10)
+ *   ✅ T-001: User auth module — DONE
+ *   ✅ T-002: Database schema — DONE
+ *   🔄 T-003: API endpoints — IN PROGRESS (current)
+ *   ⬜ T-004: Frontend routing
+ *   ⬜ T-005: Payment integration
+ *
+ * Cost: ~100-200 tokens for 10 tasks. Prevents "deep-dive amnesia".
+ *
+ * @param {string} currentTaskId - The ID of the task currently being executed
+ * @returns {string} Markdown progress beacon block
+ */
+function _buildProgressBeacon(currentTaskId) {
+  try {
+    // Access taskManager from the orchestrator context (this is mixed into prototype)
+    if (!this.taskManager) return '';
+
+    const allTasks = this.taskManager.getAllTasks();
+    if (!allTasks || allTasks.length === 0) return '';
+
+    const doneCount = allTasks.filter(t => t.status === 'done').length;
+    const totalCount = allTasks.length;
+
+    const STATUS_ICONS = {
+      done:        '✅',
+      running:     '🔄',
+      pending:     '⬜',
+      blocked:     '🚫',
+      failed:      '❌',
+      exhausted:   '💀',
+      interrupted: '⏸️',
+    };
+
+    const lines = [
+      `## 📍 Progress Beacon (${doneCount}/${totalCount} done)`,
+      '',
+    ];
+
+    for (const task of allTasks) {
+      const icon = task.id === currentTaskId
+        ? '🔄'
+        : (STATUS_ICONS[task.status] || '⬜');
+      const label = task.id === currentTaskId
+        ? 'IN PROGRESS (current)'
+        : task.status.toUpperCase();
+      const title = (task.title || '').slice(0, 60);
+      lines.push(`${icon} ${task.id}: ${title} — ${label}`);
+    }
+
+    lines.push('');
+    lines.push(`> ⚠️ You are executing task **${currentTaskId}**. After completing this task, there are **${totalCount - doneCount - 1}** remaining task(s). Do NOT forget them.`);
+
+    return lines.join('\n');
+  } catch (err) {
+    // Non-fatal: progress beacon is an enhancement, not a requirement
+    return '';
+  }
+}
 
 // ─── Module-level Stopwords (used by _validateDecomposition and _checkRequirementCoverage) ──
 

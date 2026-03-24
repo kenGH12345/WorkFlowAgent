@@ -22,12 +22,30 @@ const { PROJECT_SCALE, LLM } = require('../core/constants');
 // ─── Token Estimation ─────────────────────────────────────────────────────────
 
 /**
- * Estimates the token count of a string using a simple chars/token ratio.
+ * Estimates the token count of a string using a content-aware chars/token ratio.
+ *
+ * P1-2 fix: previously used a fixed LLM.CHARS_PER_TOKEN (4) which under-counts
+ * tokens for CJK-heavy text (Chinese ≈ 2 chars/token vs English ≈ 4 chars/token).
+ * This caused Chinese prompts to bypass the L3 hallucination threshold check.
+ *
+ * Now samples the first 200 chars to estimate CJK density and adjusts the ratio:
+ *   - CJK ratio > 30%: 2 chars/token (mostly Chinese/Japanese/Korean)
+ *   - CJK ratio > 10%: 3 chars/token (mixed content)
+ *   - Otherwise:        LLM.CHARS_PER_TOKEN (4) (mostly English/Latin)
+ *
+ * This matches the adaptive ratio used in context-loader.js _truncate().
+ *
  * @param {string} text
  * @returns {number}
  */
 function estimateTokens(text) {
-  return Math.ceil(text.length / LLM.CHARS_PER_TOKEN);
+  if (!text) return 0;
+  // Sample first 200 chars for CJK density detection
+  const sample = text.slice(0, 200);
+  const cjkCount = (sample.match(/[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/g) || []).length;
+  const cjkRatio = sample.length > 0 ? cjkCount / sample.length : 0;
+  const charsPerToken = cjkRatio > 0.3 ? 2 : (cjkRatio > 0.1 ? 3 : LLM.CHARS_PER_TOKEN);
+  return Math.ceil(text.length / charsPerToken);
 }
 
 /**

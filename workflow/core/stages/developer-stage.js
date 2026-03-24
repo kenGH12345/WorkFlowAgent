@@ -37,7 +37,9 @@ class DeveloperStage extends StageRunner {
    */
   async execute(ctx) {
     const orch = ctx.orchestrator;
-    const { _runDeveloper } = require('../orchestrator-stages');
+    // P0-2 fix: Import directly from stage-developer.js instead of the orchestrator-stages.js
+    // re-export facade to eliminate unnecessary indirection.
+    const { _runDeveloper } = require('../stage-developer');
     return _runDeveloper.call(orch);
   }
 }

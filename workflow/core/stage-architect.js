@@ -39,6 +39,14 @@ function _getRunAnalyst() {
   return _runAnalyst;
 }
 
+/**
+ * Runs the ARCHITECT stage: architecture design, review, coverage check, and quality gate.
+ *
+ * P1-2 fix: @this annotation for IDE IntelliSense and safe refactoring.
+ *
+ * @this {import('./orchestrator').Orchestrator}
+ * @returns {Promise<string>} Path to the generated architecture.md
+ */
 async function _runArchitect() {
   console.log(`\n[Orchestrator] Stage: ARCHITECT (ArchitectAgent)`);
   const inputPath = this.bus.consume(AgentRole.ARCHITECT);
@@ -113,8 +121,11 @@ async function _runArchitect() {
     console.log(`[Orchestrator] ℹ️  Requirement was clarified in ${analystMeta.clarificationRounds} round(s) (${analystMeta.signalCount} signal(s) resolved). Architect should read requirements.md carefully.`);
   }
 
-  const archExpContextWithComplaints = await buildArchitectContextBlock(this, techStackPrefix, upstreamCtxForArch);
-  this.obs.recordExpUsage({ injected: (archExpContextWithComplaints._injectedExpIds || []).length });
+  // A-3 fix: buildArchitectContextBlock now returns { content, injectedExpIds } struct
+  const archContextResult = await buildArchitectContextBlock(this, techStackPrefix, upstreamCtxForArch);
+  const archExpContext = archContextResult.content;
+  const archInjectedExpIds = archContextResult.injectedExpIds || [];
+  this.obs.recordExpUsage({ injected: archInjectedExpIds.length });
 
   // ── P2-ModuleSplit: Attempt module-aware architecture design ───────────
   // If ANALYSE produced a moduleMap with ≥2 isolatable modules, split the
@@ -128,7 +139,7 @@ async function _runArchitect() {
     const moduleSplitResult = await runModuleAwareArchitect(
       this,
       requirementContent,
-      typeof archExpContextWithComplaints === 'string' ? archExpContextWithComplaints : archExpContextWithComplaints.toString(),
+      archExpContext,
       { inputPath, outputPath: path.join(PATHS.OUTPUT_DIR, 'architecture.md') },
     );
     if (moduleSplitResult.used) {
@@ -143,7 +154,7 @@ async function _runArchitect() {
 
   // Standard single-pass fallback (or if module-split was not applicable)
   if (!outputPath) {
-    outputPath = await this.agents[AgentRole.ARCHITECT].run(inputPath, null, archExpContextWithComplaints);
+    outputPath = await this.agents[AgentRole.ARCHITECT].run(inputPath, null, archExpContext);
   }
 
   // ── Adapter Telemetry ─────────────────────────────────────────────────────
@@ -251,8 +262,11 @@ async function _runArchitect() {
   this.stateMachine.flushRisks();
 
   if (archReviewResult.failed === 0 || !archReviewResult.needsHumanReview) {
-  try {
-    const socraticDecision = this.socratic.askAsync(DECISION_QUESTIONS.ARCHITECTURE_APPROVAL, 0);
+    // P1-6 fix: Corrected indentation — the try/catch block and its inner
+    // if/else branches were misaligned (2-space vs 6-space), making the code
+    // structure appear incorrect to readers and automated formatters.
+    try {
+      const socraticDecision = this.socratic.askAsync(DECISION_QUESTIONS.ARCHITECTURE_APPROVAL, 0);
       if (socraticDecision.optionIndex === 1) {
         const abortMsg = '[SocraticEngine] User rejected architecture. Workflow aborted by user decision.';
         this.stateMachine.recordRisk('high', abortMsg);
@@ -414,7 +428,7 @@ async function _runArchitect() {
   // ── EvoMap feedback loop ────────────────────────────────────────────────
   if (archDecision.pass) {
     await runEvoMapFeedback(this, {
-      injectedExpIds: archExpContextWithComplaints._injectedExpIds || [],
+      injectedExpIds: archInjectedExpIds,
       errorContext: (archReviewResult.riskNotes || []).join(' '),
       stageLabel: 'ARCHITECT',
     });

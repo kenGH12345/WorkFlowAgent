@@ -39,7 +39,9 @@ class TesterStage extends StageRunner {
    */
   async execute(ctx) {
     const orch = ctx.orchestrator;
-    const { _runTester } = require('../orchestrator-stages');
+    // P0-2 fix: Import directly from stage-tester.js instead of the orchestrator-stages.js
+    // re-export facade to eliminate unnecessary indirection.
+    const { _runTester } = require('../stage-tester');
     return _runTester.call(orch);
   }
 }

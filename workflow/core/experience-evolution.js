@@ -92,6 +92,7 @@ function _inferDomains(exp) {
     network_protocol: 'networking',
     config_system: 'infrastructure',
     workflow_process: 'workflow',
+    code_snippet: 'patterns',
   };
 
   if (CATEGORY_TO_DOMAIN[category]) {
@@ -260,6 +261,11 @@ function _selectEvolutionSection(exp, skillMeta) {
     return 'Context Hints';
   }
 
+  // Code snippets and utility classes → Code Snippets (reusable code patterns)
+  if (category === 'code_snippet' || category === 'utility_class') {
+    return 'Code Snippets';
+  }
+
   // Stable patterns and module usage → Rules (prescriptive knowledge)
   if (category === 'stable_pattern' || category === 'module_usage') {
     return 'Rules';
@@ -278,7 +284,7 @@ const ExperienceEvolutionMixin = {
    * Increments the retrieval counter for an experience (zombie detection).
    */
   markRetrieved(expId) {
-    const exp = this.experiences.find(e => e.id === expId);
+    const exp = this._idIndex.get(expId);
     if (!exp) return;
     if (!exp.retrievalCount) exp.retrievalCount = 0;
     exp.retrievalCount += 1;
@@ -292,15 +298,21 @@ const ExperienceEvolutionMixin = {
    * @returns {boolean} true if this experience should trigger skill evolution
    */
   markUsed(expId) {
-    const exp = this.experiences.find(e => e.id === expId);
+    const exp = this._idIndex.get(expId);
     if (!exp) return false;
     exp.hitCount += 1;
     exp.updatedAt = new Date().toISOString();
 
     const threshold = _computeEvolutionThreshold(exp);
-    const shouldEvolve = exp.type === ExperienceType.POSITIVE && exp.hitCount === threshold;
+    // P0-2 fix: Use >= instead of === to prevent threshold skip when markUsed is
+    // called multiple times in the same batch (e.g. duplicate IDs in markUsedBatch).
+    // The _evolutionTriggered flag ensures evolution fires exactly once per experience.
+    const shouldEvolve = exp.type === ExperienceType.POSITIVE
+      && exp.hitCount >= threshold
+      && !exp._evolutionTriggered;
 
     if (shouldEvolve) {
+      exp._evolutionTriggered = true;
       this._save();
     } else {
       this._dirty = true;
@@ -368,7 +380,7 @@ const ExperienceEvolutionMixin = {
     let created = 0;
 
     for (const expId of triggerExpIds) {
-      const triggerExp = this.experiences.find(e => e.id === expId);
+      const triggerExp = this._idIndex.get(expId);
       if (!triggerExp) continue;
 
       let skillName = triggerExp.skill;

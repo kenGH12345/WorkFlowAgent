@@ -27,6 +27,18 @@ const {
 // Re-use the shared _getContextProfile helper
 const { _getContextProfile } = require('./context-helpers');
 
+// Recall Memory: cross-session task history injection
+let _archTaskHistoryInstance = null;
+function _getArchTaskHistory() {
+  if (!_archTaskHistoryInstance) {
+    try {
+      const { TaskHistory } = require('./task-history');
+      _archTaskHistoryInstance = new TaskHistory();
+    } catch (_) { /* task-history module not available */ }
+  }
+  return _archTaskHistoryInstance;
+}
+
 // ─── Cross-stage context injection ───────────────────────────────────────────
 
 /**
@@ -99,8 +111,10 @@ async function buildArchitectContextBlock(orch, techStackPrefix, upstreamCtx) {
   const agentsMd = orch._agentsMdContent || '';
   if (agentsMd) console.log(`[Orchestrator] 📋 AGENTS.md injected into ArchitectAgent context.`);
 
+  // P1 fix: Detect tech stack for fallback experience matching
+  const techStack = orch._detectTechStackForPreheat ? orch._detectTechStackForPreheat() : [];
   const maxExpInjected = orch._adaptiveStrategy?.maxExpInjected ?? 5;
-  const { block: expCtx, ids: injectedExpIds } = await orch.experienceStore.getContextBlockWithIds('architecture-design', orch._currentRequirement, maxExpInjected);
+  const { block: expCtx, ids: injectedExpIds } = await orch.experienceStore.getContextBlockWithIds('architecture-design', orch._currentRequirement, maxExpInjected, { techStack });
   console.log(`[Orchestrator] 📚 Experience context injected for ArchitectAgent (${expCtx.length} chars, ${injectedExpIds.length} experience(s), limit=${maxExpInjected})`);
 
   const complaints = orch.complaintWall.getOpenComplaintsFor(ComplaintTarget.SKILL, 'architecture-design');
@@ -130,7 +144,27 @@ async function buildArchitectContextBlock(orch, techStackPrefix, upstreamCtx) {
   if (pluginRegistry) {
     const pluginResult = await pluginRegistry.collectPluginBlocks(orch, 'ARCHITECT', _archProfile, 20);
     pluginBlocks = pluginResult.blocks;
+    // P2 fix: Record Tool Search stats for observability
+    if (orch.obs && typeof orch.obs.recordToolSearchStats === 'function') {
+      orch.obs.recordToolSearchStats('ARCHITECT', {
+        totalPlugins: pluginResult.blocks.length + (pluginResult.skippedByKeyword?.length || 0),
+        skippedByKeyword: pluginResult.skippedByKeyword || [],
+        executedCount: pluginResult.blocks.filter(b => b.content && b.content.length > 0).length,
+      });
+    }
   }
+
+  // ── Recall Memory: cross-session task history ──────────────────────────
+  let archRecallMemoryCtx = '';
+  try {
+    const taskHistory = _getArchTaskHistory();
+    if (taskHistory) {
+      archRecallMemoryCtx = taskHistory.getRecallBlock(5);
+      if (archRecallMemoryCtx) {
+        console.log(`[Orchestrator] 📖 Recall Memory injected for ArchitectAgent (${archRecallMemoryCtx.length} chars)`);
+      }
+    }
+  } catch (_) { /* non-fatal */ }
 
   // ── Token Budget Guard ──────────────────────────────────────────────────
   // Core blocks (non-adapter, always present) + plugin blocks (dynamic adapter data)
@@ -142,6 +176,7 @@ async function buildArchitectContextBlock(orch, techStackPrefix, upstreamCtx) {
     { label: 'Experience',          content: expCtx,                                                   priority: BLOCK_PRIORITY.EXPERIENCE, _order: 4 },
     { label: 'External Experience', content: externalExpBlock,                                         priority: BLOCK_PRIORITY.EXTERNAL_EXPERIENCE, _order: 5 },
     { label: 'Complaints',          content: complaintBlock,                                           priority: BLOCK_PRIORITY.COMPLAINTS, _order: 6 },
+    { label: 'Recall Memory',       content: archRecallMemoryCtx,                                      priority: BLOCK_PRIORITY.EXTERNAL_EXPERIENCE - 1, _order: 7 },
     // Dynamic adapter blocks from plugin registry (starts at _order: 20)
     ...pluginBlocks,
   ];
@@ -161,15 +196,19 @@ async function buildArchitectContextBlock(orch, techStackPrefix, upstreamCtx) {
   if (stats.compressionSaved > 0) {
     console.log(`[Orchestrator] 🗜️  ARCHITECT compression: saved ${stats.compressionSaved} chars.`);
   }
+  // P1 fix: Record ToolResultFilter stats for cross-session analysis
+  if (orch.obs && stats.preFilterSaved > 0) {
+    orch.obs.recordToolResultFilterStats('ARCHITECT', {
+      preFilterSaved: stats.preFilterSaved,
+      filteredLabels: stats.preFilterLabels || [],
+    });
+  }
 
-  // R2-3 audit: _applyTokenBudget returns a primitive string, which cannot hold
-  // expando properties (block._injectedExpIds would silently fail in strict mode).
-  // Wrap in a String object so downstream consumers can read ._injectedExpIds.
-  // String objects are coerced to primitives when used as strings (concatenation,
-  // template literals, agent.run() input), so this is transparent to all consumers.
-  const block = new String(assembled);
-  block._injectedExpIds = injectedExpIds;
-  return block;
+  // A-3 Architecture Fix: Return a proper struct instead of new String() hack.
+  // Previously returned `new String(assembled)` with expando `._injectedExpIds`.
+  // String objects break `typeof === 'string'` checks and `===` comparisons.
+  // Now returns { content: string, injectedExpIds: string[] } — a clean contract.
+  return { content: assembled, injectedExpIds };
 }
 
 module.exports = {

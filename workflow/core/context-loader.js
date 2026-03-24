@@ -118,6 +118,7 @@ class ContextLoader {
    * @param {string}   [options.projectRoot]     - Root of the project being worked on
    * @param {object}   [options.skillKeywords]   - Extra keyword→skill mappings from config
    * @param {string[]} [options.alwaysLoadSkills]- Skills to always inject regardless of keywords
+   * @param {object}   [options.orchestrator]    - Orchestrator instance for lazy enrichment
    */
   constructor({
     workflowRoot    = PATHS.SKILLS_DIR ? path.dirname(PATHS.SKILLS_DIR) : __dirname,
@@ -128,6 +129,7 @@ class ContextLoader {
     projectSkills   = [],    // Level 2: loaded for all tasks in the project
     retiredSkills   = null,  // Set<string> of retired skill names to exclude
     codeGraph       = null,  // P0: externally-provided CodeGraph instance (avoids re-creation)
+    orchestrator    = null,  // ADR-45: Orchestrator reference for lazy skill enrichment
   } = {}) {
     this._workflowRoot     = workflowRoot;
     this._projectRoot      = projectRoot || null;
@@ -143,6 +145,10 @@ class ContextLoader {
     this._loadedSkillsInResolve = new Set();
     /** @type {CodeGraph|null} Shared CodeGraph instance (avoids redundant disk I/O) */
     this._codeGraph        = codeGraph || null;
+    /** @type {object|null} Orchestrator reference for lazy skill enrichment (ADR-45) */
+    this._orchestrator     = orchestrator;
+    /** @type {Set<string>} Skills currently being enriched (prevent duplicate triggers) */
+    this._enrichmentInProgress = new Set();
 
     // ── File Read Cache (D1+D3 optimisation) ──────────────────────────────────
     // Caches file contents in memory to avoid redundant disk I/O within the same
@@ -151,6 +157,10 @@ class ContextLoader {
     // The cache is per-instance; when a new ContextLoader is created, it starts fresh.
     /** @type {Map<string, { content: string, mtime: number }>} */
     this._fileCache = new Map();
+
+    // P1-3 fix: Maximum file cache entries to prevent unbounded memory growth.
+    // 200 entries ≈ 200 skill/doc files × ~5KB avg = ~1MB max cache footprint.
+    this._fileCacheMaxSize = 200;
 
     // ── Direction 3: Enrichment Section Cache ─────────────────────────────────
     // Caches the processed sections (Markdown output) for role-mandatory docs,
@@ -185,6 +195,11 @@ class ContextLoader {
         return cached.content;
       }
       const content = fs.readFileSync(filePath, 'utf-8');
+      // P1-3 fix: evict oldest entries when cache exceeds max size
+      if (this._fileCache.size >= this._fileCacheMaxSize) {
+        const firstKey = this._fileCache.keys().next().value;
+        this._fileCache.delete(firstKey);
+      }
       this._fileCache.set(filePath, { content, mtime: stat.mtimeMs });
       return content;
     } catch {
@@ -208,6 +223,20 @@ class ContextLoader {
     const sections = [];
     const sources  = [];
     let   budget   = MAX_INJECT_TOKENS;
+
+    // P1-5 fix: Reserve minimum budget for higher-priority tiers.
+    // This ensures that even if Level 1-2 skills are large, there's always
+    // space left for task-matched dynamic skills (Level 3). The reserved
+    // amounts are soft caps — if a tier doesn't use its reservation, the
+    // surplus is available for subsequent tiers.
+    const TIER_RESERVATIONS = {
+      MANDATORY_DOCS: Math.floor(MAX_INJECT_TOKENS * 0.35),  // 35% for role-mandatory docs
+      GLOBAL_SKILLS:  Math.floor(MAX_INJECT_TOKENS * 0.20),  // 20% for global skills
+      PROJECT_SKILLS: Math.floor(MAX_INJECT_TOKENS * 0.20),  // 20% for project skills
+      TASK_SKILLS:    Math.floor(MAX_INJECT_TOKENS * 0.25),  // 25% for task-matched skills
+    };
+    // Remaining budget after mandatory docs + global + project = reserved for task skills
+    const taskSkillReserve = TIER_RESERVATIONS.TASK_SKILLS;
 
     // ── Direction 3: Try enrichment cache for static layers (1-4) ──────────
     // Layers 1-4 (role-mandatory docs, global/project/always-load skills) don't
@@ -342,6 +371,11 @@ class ContextLoader {
     } // end of cache-miss block
 
     // 5. Level 3 – Task skills (keyword-matched from task text)
+    // P1-5 fix: ensure task skills get at least `taskSkillReserve` tokens.
+    // If upper tiers consumed heavily, restore budget to at least the reserve.
+    if (budget < taskSkillReserve) {
+      budget = Math.min(taskSkillReserve, MAX_INJECT_TOKENS);
+    }
     const matchedSkills = this._matchSkills(taskText, role);
     for (const skillName of matchedSkills) {
       if (budget <= 0) break;
@@ -374,7 +408,12 @@ class ContextLoader {
    * @private
    */
   _resolveStaticLayersCached(role, taskText) {
-    const cacheKey = `static:${role}`;
+    // P0-3 fix: include retiredSkills count in cache key so retiring a skill
+    // correctly invalidates the cached static layers. Without this, a newly
+    // retired skill would continue appearing in prompts until the cache expired
+    // due to a file mtime change (which might never happen).
+    const retiredCount = this._retiredSkills ? this._retiredSkills.size : 0;
+    const cacheKey = `static:${role}:retired=${retiredCount}`;
     const cached = this._enrichmentCache.get(cacheKey);
     if (!cached) {
       this._enrichmentCacheMisses++;
@@ -433,7 +472,8 @@ class ContextLoader {
    * @private
    */
   _storeStaticLayersCache(role, sections, sources, tokens) {
-    const cacheKey = `static:${role}`;
+    const retiredCount = this._retiredSkills ? this._retiredSkills.size : 0;
+    const cacheKey = `static:${role}:retired=${retiredCount}`;
 
     // Collect mtimes for all source files in the file cache
     const mtimes = new Map();
@@ -711,8 +751,13 @@ class ContextLoader {
     const content = this._readFileCached(skillPath);
     if (!content) return null;
 
-    // Skip empty/placeholder skills (no real content yet)
-    if (this._isPlaceholderSkill(content)) return null;
+    // ADR-45: Lazy enrichment trigger for placeholder skills.
+    // When a placeholder skill is detected during loading, trigger async enrichment
+    // in fire-and-forget mode. The skill will be populated for subsequent loads.
+    if (this._isPlaceholderSkill(content)) {
+      this._triggerLazyEnrichment(skillName);
+      return null;  // Skip this load; enrichment will populate for next time
+    }
 
     // Parse frontmatter for metadata
     const { meta, body } = this._parseFrontmatter(content);
@@ -773,6 +818,55 @@ class ContextLoader {
       .filter(l => l.trim() && !l.startsWith('#') && !l.startsWith('>') && !l.startsWith('|') && !l.startsWith('---'))
       .filter(l => !placeholderPhrases.some(p => l.includes(p)));
     return nonPlaceholderLines.length < 3;
+  }
+
+  /**
+   * ADR-45: Triggers lazy enrichment for a placeholder skill.
+   * Called when ContextLoader first detects a placeholder skill during loading.
+   * The enrichment runs asynchronously in fire-and-forget mode.
+   *
+   * @param {string} skillName - Name of the skill to enrich
+   * @private
+   */
+  _triggerLazyEnrichment(skillName) {
+    // Prevent duplicate enrichment triggers for the same skill
+    if (this._enrichmentInProgress.has(skillName)) {
+      return;
+    }
+
+    // Require orchestrator reference for enrichment
+    if (!this._orchestrator) {
+      console.log(`[ContextLoader] ⚠️ Cannot enrich "${skillName}": no orchestrator reference`);
+      return;
+    }
+
+    // Mark as in-progress
+    this._enrichmentInProgress.add(skillName);
+
+    // Import enrichment function lazily to avoid circular dependencies
+    const { enrichSkillFromExternalKnowledge } = require('./context-budget-manager');
+
+    // Fire-and-forget enrichment
+    console.log(`[ContextLoader] 🔄 Triggering lazy enrichment for "${skillName}"...`);
+
+    enrichSkillFromExternalKnowledge(this._orchestrator, skillName, { maxSearchResults: 3, maxFetchPages: 2 })
+      .then(r => {
+        if (r.success) {
+          console.log(`[ContextLoader] ✅ Lazy enrichment completed for "${skillName}": ${r.sectionsAdded} entries from ${r.sources.length} source(s)`);
+          // Invalidate file cache so next load gets fresh content
+          const skillPath = path.join(this._skillsDir, `${skillName}.md`);
+          this._fileCache.delete(skillPath);
+        } else {
+          console.log(`[ContextLoader] ⚠️ Lazy enrichment failed for "${skillName}": ${r.error || 'unknown error'}`);
+        }
+      })
+      .catch(err => {
+        console.log(`[ContextLoader] ⚠️ Lazy enrichment error for "${skillName}": ${err.message}`);
+      })
+      .finally(() => {
+        // Always remove from in-progress set
+        this._enrichmentInProgress.delete(skillName);
+      });
   }
 
   // ─── Gap 2: Skill Content Structure Validation ──────────────────────────

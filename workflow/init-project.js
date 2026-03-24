@@ -30,6 +30,7 @@ const { TECH_PROFILES, detectTechStack } = require('./core/tech-profiles');
 const { generateConfigFromProfile, _generateInitSh, _generateFeatureListTemplate, _runCliInit } = require('./core/project-generators');
 const { _copyProjectTemplates } = require('./core/project-template');
 const { ProjectProfiler } = require('./core/project-profiler');
+const { generateIDEAgents } = require('./core/agent-generator');
 
 // ─── CLI Args ─────────────────────────────────────────────────────────────────
 
@@ -221,7 +222,7 @@ How it works:
   }
 
   // ── Step 0: Copy project-init-template files ──────────────────────────────
-  console.log(`[0/5] Copying project knowledge templates...`);
+  console.log(`[1/7] Copying project knowledge templates...`);
   if (!args.dryRun) {
     _copyProjectTemplates(projectRoot, config);
   } else {
@@ -231,7 +232,7 @@ How it works:
   // ── Step 0.5: Run CLI init to scaffold project structure ─────────────────
   const detectedProfile = TECH_PROFILES.find(p => p.techStack === config.techStack);
   if (detectedProfile && detectedProfile.cliInitCommand) {
-    console.log(`[0.5/5] Running CLI scaffolding for ${detectedProfile.name}...`);
+  console.log(`[1.5/7] Running CLI scaffolding for ${detectedProfile.name}...`);
     const cliResult = _runCliInit(projectRoot, detectedProfile, config.projectName || 'app', { dryRun: args.dryRun });
     console.log(`      Command: ${cliResult.command}`);
     if (cliResult.success) {
@@ -245,10 +246,17 @@ How it works:
   }
 
   // ── Step 0.7: Run ProjectProfiler (deep architecture analysis) ────────────
-  console.log(`[0.7/6] Running ProjectProfiler (deep architecture analysis)...`);
+  console.log(`[2/7] Running ProjectProfiler (deep architecture analysis)...`);
   if (!args.dryRun) {
     try {
-      const profiler = new ProjectProfiler(projectRoot, { ignoreDirs: config.ignoreDirs });
+      // P2-3: Pass user-defined custom detection rules if configured
+      const customRules = config.customDetectionRules || {};
+      const profiler = new ProjectProfiler(projectRoot, {
+        ignoreDirs: config.ignoreDirs,
+        customFrameworkRules: customRules.frameworks,
+        customDataLayerRules: customRules.dataLayer,
+        customTestRules:      customRules.testFrameworks,
+      });
 
       // Attempt LSP-enhanced analysis first; fallback to baseline file-detection
       let projectProfile, profileMdPath;
@@ -312,7 +320,7 @@ How it works:
   console.log('');
 
   // ── Step 1: Build AGENTS.md ────────────────────────────────────────────────
-  console.log(`[1/5] Building AGENTS.md (global project context)...`);
+  console.log(`[3/7] Building AGENTS.md (global project context)...`);
   if (!args.dryRun) {
     try {
       const memory = new MemoryManager(projectRoot);
@@ -326,7 +334,7 @@ How it works:
   }
 
   // ── Step 2: Generate experiences from source files ─────────────────────────
-  console.log(`[2/5] Generating experience store from source files...`);
+  console.log(`[4/7] Generating experience store from source files...`);
   if (!args.dryRun) {
     try {
       // Dynamically require gen-experiences to avoid circular deps
@@ -346,7 +354,7 @@ How it works:
   }
 
   // ── Step 3: Register built-in skills ──────────────────────────────────────
-  console.log(`[3/5] Registering built-in skills...`);
+  console.log(`[4.5/7] Registering built-in skills...`);
   if (!args.dryRun) {
     try {
       const skillEngine = new SkillEvolutionEngine();
@@ -372,7 +380,7 @@ How it works:
   }
 
   // ── Step 4: Generate init.sh (long-running agent pattern) ─────────────────
-  console.log(`[4/6] Generating init.sh (dev server startup script)...`);
+  console.log(`[5/7] Generating init.sh (dev server startup script)...`);
   const initShPath = path.join(projectRoot, 'init.sh');
   if (!args.dryRun) {
     if (fs.existsSync(initShPath)) {
@@ -393,7 +401,7 @@ How it works:
   }
 
   // ── Step 5: Generate feature-list.json template ────────────────────────────
-  console.log(`[5/6] Generating feature-list.json template...`);
+  console.log(`[5.5/7] Generating feature-list.json template...`);
   const outputDir = path.join(projectRoot, 'output');
   const featureListPath = path.join(outputDir, 'feature-list.json');
   if (!args.dryRun) {
@@ -414,8 +422,30 @@ How it works:
     console.log(`      [dry-run] Would generate: ${featureListPath}\n`);
   }
 
+  // ── Step 5.5: Generate IDE Agent definitions ────────────────────────────────
+  console.log(`[5.5/7] Generating IDE Agent definitions (CodeBuddy, Cursor, Claude Code)...`);
+  if (!args.dryRun) {
+    try {
+      const agentResult = generateIDEAgents(projectRoot, config, { dryRun: false, force: false });
+      if (agentResult.generated.length > 0) {
+        agentResult.generated.forEach(g => console.log(`      ✅ ${g}`));
+      }
+      if (agentResult.skipped.length > 0) {
+        agentResult.skipped.forEach(s => console.log(`      ⏭️  ${s}`));
+      }
+      if (agentResult.errors.length > 0) {
+        agentResult.errors.forEach(e => console.warn(`      ⚠️  ${e}`));
+      }
+    } catch (err) {
+      console.warn(`      ⚠️  IDE Agent generation warning (non-fatal): ${err.message}`);
+    }
+  } else {
+    console.log(`      [dry-run] Would generate IDE Agent definitions for: CodeBuddy, Cursor, Claude Code`);
+  }
+  console.log('');
+
   // ── Step 6: Build initial code graph ──────────────────────────────────────
-  console.log(`[6/6] Building initial code graph (symbol index + call relationships)...`);
+  console.log(`[7/7] Building initial code graph (symbol index + call relationships)...`);
   if (!args.dryRun) {
     try {
       const { CodeGraph } = require('./core/code-graph');
@@ -464,6 +494,10 @@ How it works:
   console.log(`    • output/code-graph.json     – Structured symbol index + call graph (auto-updated)`);
   console.log(`    • output/code-graph.md       – Human-readable code graph summary`);
   console.log(`    • output/project-profile.md  – Deep architecture profile (frameworks, layers, data, infra)`);
+  console.log(`  IDE Agent definitions:`);
+  console.log(`    • .codebuddy/agents/workflow-agent.md  – CodeBuddy custom Agent (select in mode dropdown)`);
+  console.log(`    • .cursor/rules/workflow-agent.mdc     – Cursor Agent rule`);
+  console.log(`    • .claude/agents/workflow-agent.md     – Claude Code Agent`);
   console.log(`  You can now run: node workflow/index.js\n`);
 }
 

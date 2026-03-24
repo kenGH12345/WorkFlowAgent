@@ -58,6 +58,8 @@ function registerWorkflowCommands(registerCommand) {
           ``,
           `Default behaviour:`,
   `  • /wf <requirement> runs the FULL sequential pipeline: ANALYSE → ARCHITECT → PLAN → CODE → TEST`,
+          `  • RequestTriage auto-evaluates complexity — simple tasks will suggest using IDE directly`,
+          `  • Use --force to bypass RequestTriage and force workflow execution`,
           `  • Use --auto to let the LLM decide whether to run sequentially or in parallel`,
           `  • Use --parallel to force parallel task-based execution`,
           ``,
@@ -160,6 +162,56 @@ function registerWorkflowCommands(registerCommand) {
         return `[Error] No orchestrator in context. Cannot start workflow.`;
       }
 
+      // ── RequestTriage: auto-detect complexity & enforce best practices ─────
+      // Zero LLM calls — pure rule engine, <1ms. Overridable with --force.
+      const forceWorkflow = trimmedArgs.includes('--force');
+      if (!forceWorkflow) {
+        try {
+          const { RequestTriage } = require('../core/request-triage');
+          const triage = new RequestTriage();
+          const projectRoot = context.orchestrator?.projectRoot || process.cwd();
+          const triageResult = triage.triage(trimmedArgs, { projectRoot });
+
+          // InitStateGuard: block if project not initialized
+          if (triageResult.requiresInit) {
+            return [
+              `❌ **Project Not Initialized**`,
+              ``,
+              triageResult.initState.reason,
+              ``,
+              `Please run \`/wf init\` or \`/wf init --path <project-dir>\` first.`,
+            ].join('\n');
+          }
+
+          // StalenessDetector: warn if artifacts are outdated
+          if (triageResult.staleness && triageResult.staleness.isStale) {
+            for (const w of triageResult.staleness.warnings) {
+              console.log(`[wf] ${w.message}`);
+            }
+          }
+
+          // Simple task routing: suggest IDE direct handling
+          if (!triageResult.shouldProceed) {
+            console.log(`[wf] RequestTriage: score=${triageResult.score}, suggestion=${triageResult.suggestion}`);
+            const displayMsg = triage.formatTriageResult(triageResult);
+            return [
+              displayMsg,
+              ``,
+              `To force workflow execution, add \`--force\`:`,
+              `  /wf ${trimmedArgs} --force`,
+            ].join('\n');
+          }
+
+          // Log triage result for moderate/complex tasks
+          console.log(`[wf] RequestTriage: score=${triageResult.score}, suggestion=${triageResult.suggestion}, signals=[${triageResult.matchedRules.map(r => r.tag).join(',')}]`);
+        } catch (triageErr) {
+          // Triage failure is non-fatal — continue with workflow
+          console.warn(`[wf] RequestTriage failed (non-fatal): ${triageErr.message}`);
+        }
+      } else {
+        console.log(`[wf] --force flag detected. Skipping RequestTriage.`);
+      }
+
       // ── Input length guard ────────────────────────────────────────────────
       // Prevent excessively long requirements from blowing up the LLM token budget.
       // 8000 chars ≈ ~2000 tokens, which is a reasonable upper bound for a requirement.
@@ -189,6 +241,7 @@ function registerWorkflowCommands(registerCommand) {
         .replace(/--sequential/g, '')
         .replace(/--parallel/g, '')
         .replace(/--auto/g, '')
+        .replace(/--force/g, '')
         .replace(/--concurrency\s+\d+/g, '')
         .trim();
 
@@ -199,6 +252,7 @@ function registerWorkflowCommands(registerCommand) {
           `  /wf <requirement> --auto                  – Smart auto-dispatch (LLM decides)`,
           `  /wf <requirement> --sequential            – Force sequential mode (same as default)`,
           `  /wf <requirement> --parallel              – Force parallel mode (LLM decomposes tasks)`,
+          `  /wf <requirement> --force                 – Bypass RequestTriage (skip complexity check)`,
           `  /wf <requirement> --parallel --concurrency <n>  – Parallel with custom concurrency`,
           `  /wf init [--path <dir>]                   – Initialise the workflow for a project`,
           `  /wf analyze [--no-lsp] [--max-files <N>]  – Re-analyze project architecture`,

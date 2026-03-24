@@ -635,7 +635,7 @@ module.exports = { StageContextStore };
 
 // ─── Module-level helpers (Defect D fix) ──────────────────────────────────────
 
-const { WorkflowState } = require('./types');
+const { WorkflowState, STATE_ORDER } = require('./types');
 
 /**
  * Defect D fix: Computes proximity between two stages in the pipeline.
@@ -643,21 +643,24 @@ const { WorkflowState } = require('./types');
  *
  * P2-a: Uses WorkflowState enum instead of string literals.
  *
+ * P1-3 fix: Replaced hardcoded 4-stage ORDER map with STATE_ORDER-based lookup.
+ * The original implementation only mapped ANALYSE/ARCHITECT/CODE/TEST, causing
+ * PLAN and any custom stages registered via StageRegistry to always receive the
+ * fallback 0.3 score — making the relevance algorithm blind to their position.
+ *
+ * Now uses the canonical STATE_ORDER (which includes PLAN and is extensible via
+ * buildStateOrder()) to compute true positional distance.
+ *
  * @param {string} sourceStageName  - The upstream stage
  * @param {string} targetStageName  - The current stage
  * @returns {number} 0-1 proximity score
  */
 function _stageProximity(sourceStageName, targetStageName) {
-  const ORDER = {
-    [WorkflowState.ANALYSE]: 0,
-    [WorkflowState.ARCHITECT]: 1,
-    [WorkflowState.CODE]: 2,
-    [WorkflowState.TEST]: 3,
-  };
-  const srcIdx = ORDER[sourceStageName];
-  const tgtIdx = ORDER[targetStageName];
+  // Exclude INIT and FINISHED — they are bookend states, not real stages
+  const srcIdx = STATE_ORDER.indexOf(sourceStageName);
+  const tgtIdx = STATE_ORDER.indexOf(targetStageName);
 
-  if (srcIdx == null || tgtIdx == null) return 0.3; // unknown stage → moderate score
+  if (srcIdx === -1 || tgtIdx === -1) return 0.3; // unknown stage → moderate score
   if (srcIdx >= tgtIdx) return 0.1; // downstream or same stage → low score
 
   const distance = tgtIdx - srcIdx;

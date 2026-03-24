@@ -19,7 +19,7 @@ const path = require('path');
 const { BaseAgent } = require('./base-agent');
 const { AgentRole } = require('../core/types');
 const { PATHS } = require('../core/constants');
-const { buildJsonBlockInstruction } = require('../core/agent-output-schema');
+const { buildJsonBlockInstruction, extractJsonBlock, validateJsonBlock } = require('../core/agent-output-schema');
 
 class TesterAgent extends BaseAgent {
   constructor(llmCall, hookEmitter, opts = {}) {
@@ -45,8 +45,8 @@ class TesterAgent extends BaseAgent {
     // Inject requirements.md and architecture.md so the tester can verify
     // acceptance criteria coverage and architecture compliance – without these,
     // the "Coverage Analysis" section would be based on guesswork.
-    const requirementsPath = path.join(PATHS.OUTPUT_DIR, 'requirements.md');
-    const architecturePath = path.join(PATHS.OUTPUT_DIR, 'architecture.md');
+    const requirementsPath = path.join(this._outputDir, 'requirements.md');
+    const architecturePath = path.join(this._outputDir, 'architecture.md');
 
     const requirementsContent = fs.existsSync(requirementsPath)
       ? fs.readFileSync(requirementsPath, 'utf-8')
@@ -65,7 +65,7 @@ class TesterAgent extends BaseAgent {
     // Inject pre-generated test cases if available
     // Cap at 12000 chars to avoid token overflow (large test suites can be very long)
     const TEST_CASES_TOKEN_CAP = 12000;
-    const testCasesPath = path.join(PATHS.OUTPUT_DIR, 'test-cases.md');
+    const testCasesPath = path.join(this._outputDir, 'test-cases.md');
     const testCasesRaw = fs.existsSync(testCasesPath)
       ? fs.readFileSync(testCasesPath, 'utf-8')
       : null;
@@ -157,8 +157,7 @@ Pay special attention to Coverage Analysis – every acceptance criterion must b
    * @returns {string}
    */
   parseResponse(llmResponse) {
-    // P0-NEW-1: validate JSON block presence
-    const { extractJsonBlock, validateJsonBlock } = require('../core/agent-output-schema');
+    // P0-NEW-1: validate JSON block presence (imports hoisted to file top – P1-1 fix)
     const jsonBlock = extractJsonBlock(llmResponse);
     if (!jsonBlock) {
       console.warn(`[TesterAgent] ⚠️  No structured JSON block found in output. Downstream agents will use regex-based extraction (degraded mode).`);
@@ -171,26 +170,35 @@ Pay special attention to Coverage Analysis – every acceptance criterion must b
       }
     }
 
-    const requiredSections = ['Test Summary', 'Defects Found', 'Recommendations'];
-    const missingSections = requiredSections.filter(s => !llmResponse.includes(s));
+    // P1-4: bilingual section name support
+    const requiredSections = [
+      { en: 'Test Summary', zh: '测试总结' },
+      { en: 'Defects Found', zh: '发现的缺陷' },
+      { en: 'Recommendations', zh: '建议' },
+    ];
+    const missingSections = requiredSections.filter(s => !llmResponse.includes(s.en) && !llmResponse.includes(s.zh));
     if (missingSections.length > 0) {
-      console.warn(`[TesterAgent] WARNING: Test report missing sections: ${missingSections.join(', ')}`);
+      console.warn(`[TesterAgent] WARNING: Test report missing sections: ${missingSections.map(s => s.en).join(', ')}`);
     }
 
-    // ── Mandatory section compliance check ────────────────────────────────────
-    const mandatorySections = ['Architecture Design', 'Execution Plan'];
-    const missingMandatory = mandatorySections.filter(s => !llmResponse.includes(s));
+    // ── Mandatory section compliance check (P1-4: bilingual support) ─────────
+    const mandatorySections = [
+      { en: 'Architecture Design', zh: '架构设计' },
+      { en: 'Execution Plan', zh: '执行计划' },
+    ];
+    const missingMandatory = mandatorySections.filter(s => !llmResponse.includes(s.en) && !llmResponse.includes(s.zh));
     if (missingMandatory.length > 0) {
-      console.warn(`[TesterAgent] ⚠️  COMPLIANCE: Missing mandatory section(s): ${missingMandatory.join(', ')}. The agent output specification requires these sections.`);
+      console.warn(`[TesterAgent] ⚠️  COMPLIANCE: Missing mandatory section(s): ${missingMandatory.map(s => s.en).join(', ')}. The agent output specification requires these sections.`);
     } else {
       console.log(`[TesterAgent] ✅ Mandatory sections present: Architecture Design, Execution Plan.`);
     }
 
     // Verify that pre-planned test case IDs appear in the report
     // This catches cases where the LLM ignored the test cases checklist
-    const testCasesPath = require('path').join(require('../core/constants').PATHS.OUTPUT_DIR, 'test-cases.md');
-    if (require('fs').existsSync(testCasesPath)) {
-      const testCasesContent = require('fs').readFileSync(testCasesPath, 'utf-8');
+    // P1-2 fix: use top-level fs/path imports; P0-1 fix: use this._outputDir
+    const verifyTestCasesPath = path.join(this._outputDir, 'test-cases.md');
+    if (fs.existsSync(verifyTestCasesPath)) {
+      const testCasesContent = fs.readFileSync(verifyTestCasesPath, 'utf-8');
       const plannedIds = (testCasesContent.match(/"case_id"\s*:\s*"([^"]+)"/g) || [])
         .map(m => m.match(/"([^"]+)"$/)[1]);
       if (plannedIds.length > 0) {

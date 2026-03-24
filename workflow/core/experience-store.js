@@ -16,7 +16,7 @@
 const fs = require('fs');
 const path = require('path');
 const { PATHS, EXPERIENCE } = require('./constants');
-const { ExperienceType, ExperienceCategory, UNIVERSAL_CATEGORIES } = require('./experience-types');
+const { ExperienceType, ExperienceCategory, UNIVERSAL_CATEGORIES, KnowledgeLayer, getLayerForCategory } = require('./experience-types');
 const { extractKeywords, ExperienceQueryMixin, STOPWORDS, SHORT_WORD_WHITELIST } = require('./experience-query');
 const { ExperienceEvolutionMixin } = require('./experience-evolution');
 const { ExperienceTransferMixin } = require('./experience-transfer');
@@ -35,6 +35,8 @@ class ExperienceStore {
     this._dirty = false;
     /** @type {Set<string>} */
     this._titleIndex = new Set();
+    /** @type {Map<string, Experience>} O(1) lookup by ID (A-3 architecture fix) */
+    this._idIndex = new Map();
     /** @type {object|null} */
     this._complaintWall = null;
     /** @type {Function|null} */
@@ -87,6 +89,7 @@ class ExperienceStore {
     };
     this.experiences.push(exp);
     this._titleIndex.add(exp.title);
+    this._idIndex.set(exp.id, exp);
 
     // Defect F fix: auto-file complaint from negative experience
     if (exp.type === ExperienceType.NEGATIVE && this._complaintWall) {
@@ -176,7 +179,7 @@ class ExperienceStore {
       const expiresAt = ttlDays != null
         ? new Date(Date.now() + ttlDays * 86400_000).toISOString()
         : null;
-      this.experiences.push({
+      const exp = {
         id, type, category, title, content, taskId, skill, tags, codeExample,
         sourceFile: item.sourceFile || null,
         namespace: item.namespace || null,
@@ -185,7 +188,9 @@ class ExperienceStore {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         expiresAt,
-      });
+      };
+      this.experiences.push(exp);
+      this._idIndex.set(id, exp);
       added++;
     }
     if (added > 0) this._save();
@@ -202,6 +207,7 @@ class ExperienceStore {
     const before = this.experiences.length;
     this.experiences = this.experiences.filter(e => !e.expiresAt || new Date(e.expiresAt).getTime() > now);
     this._titleIndex = new Set(this.experiences.map(e => e.title));
+    this._rebuildIdIndex();
     const purged = before - this.experiences.length;
     if (purged > 0) {
       this._save();
@@ -234,6 +240,78 @@ class ExperienceStore {
     return { total: this.experiences.length, positive, negative, totalEvolutions, byCategory };
   }
 
+  // ─── ADR-43: Knowledge Layer Methods ─────────────────────────────────────
+
+  /**
+   * Get experiences filtered by knowledge layer.
+   * ADR-43: Enables layer-aware experience retrieval.
+   *
+   * @param {string} layer - KnowledgeLayer value (PLATFORM, DOMAIN, PRACTICE)
+   * @returns {Experience[]}
+   */
+  getByLayer(layer) {
+    return this.experiences.filter(exp => {
+      const expLayer = getLayerForCategory(exp.category);
+      return expLayer === layer;
+    });
+  }
+
+  /**
+   * Get statistics grouped by knowledge layer.
+   * Useful for understanding the composition of the experience store.
+   *
+   * @returns {{ byLayer: object, practiceRatio: number }}
+   */
+  getLayerStats() {
+    const byLayer = {
+      [KnowledgeLayer.PLATFORM]: 0,
+      [KnowledgeLayer.DOMAIN]: 0,
+      [KnowledgeLayer.PRACTICE]: 0,
+    };
+
+    for (const exp of this.experiences) {
+      const layer = getLayerForCategory(exp.category);
+      byLayer[layer] = (byLayer[layer] || 0) + 1;
+    }
+
+    const total = this.experiences.length;
+    const practiceRatio = total > 0 ? byLayer[KnowledgeLayer.PRACTICE] / total : 0;
+
+    return { byLayer, practiceRatio, total };
+  }
+
+  /**
+   * Check if the experience store has too many non-PRACTICE layer experiences.
+   * ADR-43: Quality gate to prevent experience store pollution.
+   *
+   * @param {number} [threshold=0.5] - Minimum PRACTICE ratio threshold
+   * @returns {{ healthy: boolean, practiceRatio: number, recommendation: string }}
+   */
+  checkLayerHealth(threshold = 0.5) {
+    const { byLayer, practiceRatio, total } = this.getLayerStats();
+
+    if (total < 10) {
+      return {
+        healthy: true,
+        practiceRatio,
+        recommendation: 'Not enough experiences to assess layer health',
+      };
+    }
+
+    const healthy = practiceRatio >= threshold;
+    let recommendation = '';
+
+    if (!healthy) {
+      const nonPractice = byLayer[KnowledgeLayer.PLATFORM] + byLayer[KnowledgeLayer.DOMAIN];
+      recommendation = `PRACTICE layer ratio (${(practiceRatio * 100).toFixed(1)}%) below threshold (${(threshold * 100)}%). ` +
+        `Consider purging ${nonPractice} PLATFORM/DOMAIN experiences or capturing more PRACTICE experiences.`;
+    } else {
+      recommendation = `Layer health is good: ${(practiceRatio * 100).toFixed(1)}% PRACTICE experiences`;
+    }
+
+    return { healthy, practiceRatio, recommendation, byLayer };
+  }
+
   /**
    * Sets the ComplaintWall reference for bidirectional sync.
    *
@@ -250,6 +328,7 @@ class ExperienceStore {
       if (fs.existsSync(this.storePath)) {
         this.experiences = JSON.parse(fs.readFileSync(this.storePath, 'utf-8'));
         this._titleIndex = new Set(this.experiences.map(e => e.title));
+        this._rebuildIdIndex();
         console.log(`[ExperienceStore] Loaded ${this.experiences.length} experiences`);
 
         // P2-1 fix: auto-purge expired on load
@@ -261,6 +340,7 @@ class ExperienceStore {
         const purged = beforePurge - this.experiences.length;
         if (purged > 0) {
           this._titleIndex = new Set(this.experiences.map(e => e.title));
+          this._rebuildIdIndex();
           console.log(`[ExperienceStore] Auto-purged ${purged} expired experience(s) on load. Remaining: ${this.experiences.length}`);
         }
 
@@ -281,6 +361,7 @@ class ExperienceStore {
           const evicted = this.experiences.length - MAX_CAPACITY;
           this.experiences = this.experiences.slice(evicted);
           this._titleIndex = new Set(this.experiences.map(e => e.title));
+          this._rebuildIdIndex();
           console.log(`[ExperienceStore] Capacity cap enforced: evicted ${evicted} low-value experience(s). Remaining: ${this.experiences.length}`);
           this._save();
         }
@@ -290,25 +371,35 @@ class ExperienceStore {
     }
   }
 
-  _save() {
-    // P2-NEW-3 fix: serialise concurrent writes via promise-chain queue
-    if (!this._saveQueue) {
-      this._saveQueue = Promise.resolve();
+  /**
+   * Rebuilds the _idIndex Map from the current experiences array.
+   * Called after any operation that mutates the experiences array (load, purge, eviction).
+   * A-3 architecture fix: enables O(1) lookup by experience ID across all Mixins.
+   */
+  _rebuildIdIndex() {
+    this._idIndex = new Map();
+    for (const exp of this.experiences) {
+      this._idIndex.set(exp.id, exp);
     }
-    this._saveQueue = this._saveQueue.then(() => {
-      try {
-        const dir = path.dirname(this.storePath);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        // N37 fix: atomic write (tmp + rename)
-        const tmpPath = this.storePath + '.tmp';
-        fs.writeFileSync(tmpPath, JSON.stringify(this.experiences, null, 2), 'utf-8');
-        fs.renameSync(tmpPath, this.storePath);
-        this._dirty = false;
-      } catch (err) {
-        console.warn(`[ExperienceStore] Could not save experiences: ${err.message}`);
-      }
-    });
-    return this._saveQueue;
+  }
+
+  _save() {
+    // P0-1 fix: Switched from async Promise-chain queue to synchronous write.
+    // The original async queue caused data loss risk: callers (record(), purgeExpired(), etc.)
+    // did not await the returned Promise, so process crashes could lose unflushed writes.
+    // Since we already use atomic write (tmp + rename), synchronous writeFileSync is safe
+    // and guarantees data is on disk when _save() returns.
+    try {
+      const dir = path.dirname(this.storePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // N37 fix: atomic write (tmp + rename)
+      const tmpPath = this.storePath + '.tmp';
+      fs.writeFileSync(tmpPath, JSON.stringify(this.experiences, null, 2), 'utf-8');
+      fs.renameSync(tmpPath, this.storePath);
+      this._dirty = false;
+    } catch (err) {
+      console.warn(`[ExperienceStore] Could not save experiences: ${err.message}`);
+    }
   }
 }
 

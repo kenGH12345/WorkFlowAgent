@@ -111,13 +111,23 @@ function createHistoryEntry(fromState, toState, artifactPath = null, note = '') 
  * Input/output are always FILE PATHS, never raw content.
  * This enforces the file-reference communication protocol (Requirement 3).
  *
+ * IMPORTANT — inputFilePath / outputFilePath semantics (Arch-Fix-1):
+ *   • `outputFilePath` is ENFORCED at runtime — BaseAgent._writeOutput() uses it
+ *     to construct the actual file path.
+ *   • `inputFilePath` is ADVISORY (documentation-only) — it declares the
+ *     *canonical* upstream artifact this agent expects. At runtime, the Stage
+ *     layer may pass an enriched temp file (containing the canonical content
+ *     plus cross-stage context) via agent.run(dynamicPath, ...).
+ *     BaseAgent.run() logs a diagnostic when the runtime path diverges from
+ *     the canonical declaration.
+ *
  * @typedef {Object} AgentContract
- * @property {string}   role            - One of AgentRole values
- * @property {string}   inputFilePath   - Path to the file this agent reads
- * @property {string}   outputFilePath  - Path to the file this agent writes
- * @property {string[]} allowedActions  - Whitelist of permitted operations
- * @property {string[]} forbiddenActions - Operations this agent must never perform
- * @property {Function} run             - async (inputFilePath: string) => outputFilePath: string
+ * @property {string}        role             - One of AgentRole values
+ * @property {string|null}   inputFilePath    - ADVISORY: canonical upstream artifact path (null for analyst)
+ * @property {string}        outputFilePath   - ENFORCED: output file path (relative to output dir)
+ * @property {string[]}      allowedActions   - Whitelist of permitted operations
+ * @property {string[]}      forbiddenActions - Operations this agent must never perform
+ * @property {Function}      run              - async (inputFilePath: string) => outputFilePath: string
  */
 
 /**
@@ -141,35 +151,37 @@ const AGENT_CONTRACTS = {
     AgentRole.ANALYST,
     null,                          // Receives raw user requirement string
     'output/requirement.md',
-    ['read_user_input', 'write_requirement_md'],
+    ['run', 'read_user_input', 'write_requirement_md'],
     ['write_code', 'write_architecture_md', 'write_test_report', 'modify_manifest'],
   ),
   [AgentRole.ARCHITECT]: createAgentContract(
     AgentRole.ARCHITECT,
     'output/requirement.md',
     'output/architecture.md',
-    ['read_requirement_md', 'write_architecture_md'],
+    ['run', 'read_requirement_md', 'write_architecture_md'],
     ['write_code', 'write_test_report', 'modify_requirement_md', 'modify_manifest'],
   ),
   [AgentRole.PLANNER]: createAgentContract(
     AgentRole.PLANNER,
     'output/architecture.md',
     'output/execution-plan.md',
-    ['read_architecture_md', 'write_execution_plan_md'],
+    ['run', 'read_architecture_md', 'write_execution_plan_md'],
     ['write_code', 'write_test_report', 'modify_requirement_md', 'modify_architecture_md', 'modify_manifest'],
   ),
+  // P0-3 fix: Developer actually reads execution-plan.md (enriched with architecture context),
+  // not architecture.md directly. Updated inputFilePath and allowedActions accordingly.
   [AgentRole.DEVELOPER]: createAgentContract(
     AgentRole.DEVELOPER,
-    'output/architecture.md',
+    'output/execution-plan.md',
     'output/code.diff',
-    ['read_architecture_md', 'write_code_diff', 'read_existing_code'],
+    ['run', 'read_architecture_md', 'read_execution_plan_md', 'write_code_diff', 'read_existing_code'],
     ['modify_requirement_md', 'modify_architecture_md', 'write_test_report', 'modify_manifest'],
   ),
   [AgentRole.TESTER]: createAgentContract(
     AgentRole.TESTER,
     'output/code.diff',
     'output/test-report.md',
-    ['read_code_diff', 'run_tests', 'write_test_report'],
+    ['run', 'read_code_diff', 'run_tests', 'write_test_report'],
     ['modify_requirement_md', 'modify_architecture_md', 'modify_code', 'modify_manifest'],
   ),
 };
